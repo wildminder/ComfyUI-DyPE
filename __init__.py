@@ -142,6 +142,18 @@ class DyPE_QWEN(io.ComfyNode):
                     optional=True,
                     tooltip="Advanced: Max shift for the noise schedule (mu) at high resolutions. Default is 1.15."
                 ),
+                io.Float.Input(
+                    "editing_strength",
+                    default=0.6, min=0.0, max=1.0, step=0.1,
+                    optional=True,
+                    tooltip="DyPE strength multiplier for image editing (0.0-1.0). Lower values preserve more original structure. Default 0.6 balances editing and quality. Set to 1.0 for pure generation."
+                ),
+                io.Combo.Input(
+                    "editing_mode",
+                    options=["adaptive", "timestep_aware", "resolution_aware", "minimal", "full"],
+                    default="adaptive",
+                    tooltip="Editing mode strategy: 'adaptive' (recommended) - timestep-aware scaling, 'timestep_aware' - more DyPE early/less late, 'resolution_aware' - only reduce at high res, 'minimal' - minimal DyPE for editing, 'full' - always full DyPE."
+                ),
             ],
             outputs=[
                 io.Model.Output(
@@ -152,7 +164,7 @@ class DyPE_QWEN(io.ComfyNode):
         )
 
     @classmethod
-    def execute(cls, model, width: int, height: int, method: str, enable_dype: bool, dype_exponent: float = 2.0, base_shift: float = 0.5, max_shift: float = 1.15) -> io.NodeOutput:
+    def execute(cls, model, width: int, height: int, method: str, enable_dype: bool, dype_exponent: float = 2.0, base_shift: float = 0.5, max_shift: float = 1.15, editing_strength: float = 0.6, editing_mode: str = "adaptive") -> io.NodeOutput:
         """
         Clones the model and applies the DyPE patch for both the noise schedule and positional embeddings.
         """
@@ -161,7 +173,7 @@ class DyPE_QWEN(io.ComfyNode):
         if not has_transformer:
             raise ValueError("This node is only compatible with Qwen-Image models.")
         
-        patched_model = apply_dype_to_qwen(model, width, height, method, enable_dype, dype_exponent, base_shift, max_shift)
+        patched_model = apply_dype_to_qwen(model, width, height, method, enable_dype, dype_exponent, base_shift, max_shift, editing_strength, editing_mode)
         return io.NodeOutput(patched_model)
 
 class DyPEExtension(ComfyExtension):
