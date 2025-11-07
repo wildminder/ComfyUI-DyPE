@@ -89,7 +89,7 @@ def apply_dype_to_flux(model: ModelPatcher, width: int, height: int, method: str
     except AttributeError:
         raise ValueError("The provided model is not a compatible FLUX model.")
 
-    new_pe_embedder = FluxPosEmbed(theta, axes_dim, method, enable_dype, dype_exponent)
+    new_pe_embedder = FluxPosEmbed(theta, axes_dim, method, dype=enable_dype, dype_exponent=dype_exponent)
     m.add_object_patch("diffusion_model.pe_embedder", new_pe_embedder)
     
     sigma_max = m.model.model_sampling.sigma_max.item()
@@ -105,6 +105,284 @@ def apply_dype_to_flux(model: ModelPatcher, width: int, height: int, method: str
         
         input_x, c = args_dict.get("input"), args_dict.get("c", {})
         return model_function(input_x, args_dict.get("timestep"), **c)
+
+    m.set_model_unet_function_wrapper(dype_wrapper_function)
+    
+    return m
+
+
+class QwenPosEmbed(nn.Module):
+    """
+    Qwen-Image specific positional embedding with DyPE support.
+    Optimized for Qwen's MMDiT architecture and MSRoPE implementation.
+    """
+    def __init__(self, theta: int, axes_dim: list[int], method: str = 'yarn', dype: bool = True, dype_exponent: float = 2.0, base_resolution: int = 1024, patch_size: int = 2):
+        super().__init__()
+        self.theta = theta
+        self.axes_dim = axes_dim
+        self.method = method
+        self.dype = dype if method != 'base' else False
+        self.dype_exponent = dype_exponent
+        self.current_timestep = 1.0
+        self.base_resolution = base_resolution
+        self.patch_size = patch_size
+        # Qwen-Image uses 8x VAE downsampling, then patches are further divided by patch_size
+        # For Qwen, base_patches calculation: (base_resolution // 8) // patch_size
+        self.base_patches = (self.base_resolution // 8) // patch_size
+
+    def set_timestep(self, timestep: float):
+        """Set current timestep for DyPE. Timestep normalized to [0, 1] where 1 is pure noise."""
+        self.current_timestep = timestep
+
+    def forward(self, ids: torch.Tensor) -> torch.Tensor:
+        """
+        Forward pass for Qwen positional embeddings.
+        Returns embeddings in the format expected by Qwen's attention mechanism.
+        """
+        n_axes = ids.shape[-1]
+        emb_parts = []
+        pos = ids.float()
+        
+        # Qwen models typically use bfloat16 for better performance
+        # Check device type for optimal dtype selection
+        is_mps = ids.device.type == "mps"
+        is_npu = ids.device.type == "npu"
+        freqs_dtype = torch.float32 if (is_mps or is_npu) else torch.bfloat16
+
+        for i in range(n_axes):
+            axis_pos = pos[..., i]
+            axis_dim = self.axes_dim[i]
+            
+            common_kwargs = {
+                'dim': axis_dim, 
+                'pos': axis_pos, 
+                'theta': self.theta, 
+                'repeat_interleave_real': True, 
+                'use_real': True, 
+                'freqs_dtype': freqs_dtype
+            }
+            
+            # Pass the exponent to the RoPE function
+            dype_kwargs = {
+                'dype': self.dype, 
+                'current_timestep': self.current_timestep, 
+                'dype_exponent': self.dype_exponent
+            }
+
+            if i > 0:  # Spatial dimensions (height, width)
+                max_pos = axis_pos.max().item()
+                current_patches = int(max_pos + 1)
+
+                if self.method == 'yarn' and current_patches > self.base_patches:
+                    max_pe_len = torch.tensor(current_patches, dtype=freqs_dtype, device=pos.device)
+                    cos, sin = get_1d_rotary_pos_embed(
+                        **common_kwargs, 
+                        yarn=True, 
+                        max_pe_len=max_pe_len, 
+                        ori_max_pe_len=self.base_patches, 
+                        **dype_kwargs
+                    )
+                elif self.method == 'ntk' and current_patches > self.base_patches:
+                    base_ntk_scale = (current_patches / self.base_patches)
+                    cos, sin = get_1d_rotary_pos_embed(
+                        **common_kwargs, 
+                        ntk_factor=base_ntk_scale, 
+                        **dype_kwargs
+                    )
+                else:
+                    cos, sin = get_1d_rotary_pos_embed(**common_kwargs)
+            else:  # Channel dimension (typically not extrapolated)
+                cos, sin = get_1d_rotary_pos_embed(**common_kwargs)
+
+            # Qwen's attention expects cos/sin format, convert to rotation matrix
+            cos_reshaped = cos.view(*cos.shape[:-1], -1, 2)[..., :1]
+            sin_reshaped = sin.view(*sin.shape[:-1], -1, 2)[..., :1]
+            row1 = torch.cat([cos_reshaped, -sin_reshaped], dim=-1)
+            row2 = torch.cat([sin_reshaped, cos_reshaped], dim=-1)
+            matrix = torch.stack([row1, row2], dim=-2)
+            emb_parts.append(matrix)
+
+        emb = torch.cat(emb_parts, dim=-3)
+        return emb.unsqueeze(1).to(ids.device)
+
+
+def _detect_qwen_model_structure(model: ModelPatcher):
+    """
+    Detect Qwen-Image model structure and extract key parameters.
+    Returns a dictionary with detected attributes.
+    """
+    structure = {
+        'transformer': None,
+        'transformer_path': None,
+        'pos_embed': None,
+        'pos_embed_path': None,
+        'patch_size': 2,  # Default for MMDiT models
+        'vae_scale_factor': 8,  # Default VAE downsampling
+        'base_resolution': 1024,  # Qwen-Image base training resolution
+    }
+    
+    # Try to find transformer
+    if hasattr(model.model, "transformer"):
+        structure['transformer'] = model.model.transformer
+        structure['transformer_path'] = "transformer"
+    elif hasattr(model.model, "diffusion_model"):
+        structure['transformer'] = model.model.diffusion_model
+        structure['transformer_path'] = "diffusion_model"
+    else:
+        return None
+    
+    transformer = structure['transformer']
+    
+    # Try to find positional embedder
+    if hasattr(transformer, "pos_embed"):
+        structure['pos_embed'] = transformer.pos_embed
+        structure['pos_embed_path'] = f"{structure['transformer_path']}.pos_embed"
+    elif hasattr(transformer, "pe_embedder"):
+        structure['pos_embed'] = transformer.pe_embedder
+        structure['pos_embed_path'] = f"{structure['transformer_path']}.pe_embedder"
+    else:
+        return None
+    
+    # Extract patch_size if available
+    if hasattr(transformer, "patch_size"):
+        structure['patch_size'] = transformer.patch_size
+    elif hasattr(transformer, "config") and hasattr(transformer.config, "patch_size"):
+        structure['patch_size'] = transformer.config.patch_size
+    
+    # Extract VAE scale factor if available
+    if hasattr(model.model, "vae_scale_factor"):
+        structure['vae_scale_factor'] = model.model.vae_scale_factor
+    elif hasattr(model.model, "vae") and hasattr(model.model.vae, "scale_factor"):
+        structure['vae_scale_factor'] = model.model.vae.scale_factor
+    
+    # Try to detect base resolution from config
+    if hasattr(transformer, "config"):
+        config = transformer.config
+        if hasattr(config, "sample_size"):
+            # sample_size is typically the latent size, multiply by 8 for image size
+            structure['base_resolution'] = config.sample_size * 8
+        elif hasattr(config, "base_resolution"):
+            structure['base_resolution'] = config.base_resolution
+    
+    return structure
+
+
+def apply_dype_to_qwen(model: ModelPatcher, width: int, height: int, method: str, enable_dype: bool, dype_exponent: float, base_shift: float, max_shift: float) -> ModelPatcher:
+    """
+    Apply DyPE to a Qwen-Image model with architecture-specific optimizations.
+    """
+    m = model.clone()
+    
+    # Detect Qwen model structure
+    structure = _detect_qwen_model_structure(m)
+    if structure is None:
+        raise ValueError("Could not detect Qwen-Image model structure. This node is only compatible with Qwen-Image models.")
+    
+    transformer = structure['transformer']
+    patch_size = structure['patch_size']
+    vae_scale_factor = structure['vae_scale_factor']
+    base_resolution = structure['base_resolution']
+    
+    # Patch noise schedule if available (Qwen may use FlowMatch or similar schedulers)
+    if not hasattr(m.model.model_sampling, "_dype_patched"):
+        model_sampler = m.model.model_sampling
+        
+        # Check if it's a compatible sampler
+        if hasattr(model_sampler, "sigma_max"):
+            # Calculate sequence length based on Qwen's architecture
+            latent_h, latent_w = height // vae_scale_factor, width // vae_scale_factor
+            # Qwen uses patch_size for further downsampling
+            padded_h = math.ceil(latent_h / patch_size) * patch_size
+            padded_w = math.ceil(latent_w / patch_size) * patch_size
+            image_seq_len = (padded_h // patch_size) * (padded_w // patch_size)
+            
+            # Qwen-specific sequence length parameters
+            base_seq_len, max_seq_len = 256, 4096
+            slope = (max_shift - base_shift) / (max_seq_len - base_seq_len)
+            intercept = base_shift - slope * base_seq_len
+            dype_shift = image_seq_len * slope + intercept
+
+            def patched_sigma_func(self, timestep):
+                # Try to use flux_time_shift if available (Qwen may use similar schedulers)
+                try:
+                    return model_sampling.flux_time_shift(dype_shift, 1.0, timestep)
+                except AttributeError:
+                    # Fallback for other scheduler types (FlowMatch, etc.)
+                    # Apply shift proportionally to timestep
+                    if hasattr(self, "sigma"):
+                        original_sigma = self.sigma.__func__(self, timestep) if hasattr(self.sigma, "__func__") else timestep
+                        return original_sigma * (1.0 + dype_shift * 0.1)  # Conservative scaling
+                    return timestep
+
+            model_sampler.sigma = types.MethodType(patched_sigma_func, model_sampler)
+            model_sampler._dype_patched = True
+
+    # Find and extract positional embedder parameters
+    orig_embedder = structure['pos_embed']
+    
+    # Extract theta and axes_dim from the original embedder
+    if hasattr(orig_embedder, "theta") and hasattr(orig_embedder, "axes_dim"):
+        theta, axes_dim = orig_embedder.theta, orig_embedder.axes_dim
+    elif hasattr(orig_embedder, "theta") and hasattr(orig_embedder, "axes_dims_rope"):
+        theta, axes_dim = orig_embedder.theta, orig_embedder.axes_dims_rope
+    elif hasattr(orig_embedder, "theta"):
+        # If only theta is available, use Qwen-Image defaults
+        theta = orig_embedder.theta
+        # Qwen-Image typically uses (16, 56, 56) for axes_dims_rope
+        axes_dim = [16, 56, 56]
+    else:
+        # Fallback to Qwen-Image defaults
+        theta = 10000
+        axes_dim = [16, 56, 56]  # Default for Qwen-Image MMDiT models
+
+    # Create new positional embedder with Qwen-specific parameters
+    new_pe_embedder = QwenPosEmbed(
+        theta=theta, 
+        axes_dim=axes_dim, 
+        method=method, 
+        dype=enable_dype,  # Note: parameter is 'dype' not 'enable_dype'
+        dype_exponent=dype_exponent,
+        base_resolution=base_resolution,
+        patch_size=patch_size
+    )
+    
+    # Patch the positional embedder using the detected path
+    m.add_object_patch(structure['pos_embed_path'], new_pe_embedder)
+    
+    # Get sigma_max for timestep normalization
+    sigma_max = 1.0
+    if hasattr(m.model.model_sampling, "sigma_max"):
+        sigma_max_val = m.model.model_sampling.sigma_max
+        if hasattr(sigma_max_val, "item"):
+            sigma_max = sigma_max_val.item()
+        else:
+            sigma_max = float(sigma_max_val)
+        if sigma_max <= 0:
+            sigma_max = 1.0
+
+    def dype_wrapper_function(model_function, args_dict):
+        """
+        Wrapper function to update timestep for DyPE during inference.
+        Optimized for Qwen's forward pass signature.
+        """
+        if enable_dype:
+            timestep_tensor = args_dict.get("timestep")
+            if timestep_tensor is not None:
+                # Handle both tensor and scalar timestep values
+                if hasattr(timestep_tensor, "numel") and timestep_tensor.numel() > 0:
+                    current_sigma = timestep_tensor.item() if hasattr(timestep_tensor, "item") else float(timestep_tensor)
+                else:
+                    current_sigma = float(timestep_tensor) if not isinstance(timestep_tensor, (int, float)) else timestep_tensor
+                
+                if sigma_max > 0:
+                    normalized_timestep = min(max(current_sigma / sigma_max, 0.0), 1.0)
+                    new_pe_embedder.set_timestep(normalized_timestep)
+        
+        # Forward pass with original arguments
+        input_x = args_dict.get("input")
+        timestep = args_dict.get("timestep")
+        c = args_dict.get("c", {})
+        return model_function(input_x, timestep, **c)
 
     m.set_model_unet_function_wrapper(dype_wrapper_function)
     

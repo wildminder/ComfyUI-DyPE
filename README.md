@@ -83,7 +83,7 @@ Using the node is straightforward and designed for minimal workflow disruption.
 6.  **Generate!** That's it. Your workflow is now DyPE-enabled.
 
 > [!NOTE]
-> This node specifically patches the **diffusion model (UNet)**. It does not modify the CLIP or VAE models. It is designed exclusively for **FLUX-based** architectures.
+> This node specifically patches the **diffusion model (UNet)**. It does not modify the CLIP or VAE models. It is designed for **FLUX-based** architectures, with enhanced support for **Qwen-Image** models through intelligent model structure detection and architecture-specific optimizations.
 
 ### Node Inputs
 
@@ -130,7 +130,7 @@ Beyond the code, I believe in the power of community and continuous learning. I 
 <p align="center">══════════════════════════════════</p>
 
 ## ⚠️ Known Issues and Limitations
-*   **FLUX Only:** This implementation is highly specific to the architecture of the FLUX model and will not work on standard U-Net models (like SD 1.5/SDXL) or other Diffusion Transformers.
+*   **Supported Models:** This implementation is optimized for **FLUX-based** architectures and **Qwen-Image** models. It will not work on standard U-Net models (like SD 1.5/SDXL) or other Diffusion Transformers. For Qwen-Image models, the node automatically detects model structure and applies architecture-specific optimizations (see `IMPROVEMENTS.md` for details).
 *   **Parameter Tuning:** The optimal `dype_exponent` can vary based on your target resolution. Experimentation is key to finding the best setting for your use case. The default of `2.0` is optimized for 4K.
 
 <p align="right">(<a href="#readme-top">back to top</a>)</p>
