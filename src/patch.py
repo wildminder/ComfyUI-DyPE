@@ -116,7 +116,7 @@ class QwenPosEmbed(nn.Module):
     Qwen-Image specific positional embedding with DyPE support.
     Optimized for Qwen's MMDiT architecture and MSRoPE implementation.
     """
-    def __init__(self, theta: int, axes_dim: list[int], method: str = 'yarn', dype: bool = True, dype_exponent: float = 2.0, base_resolution: int = 1024, patch_size: int = 2, editing_strength: float = 0.6, editing_mode: str = "adaptive"):
+    def __init__(self, theta: int, axes_dim: list[int], method: str = 'yarn', dype: bool = True, dype_exponent: float = 3.0, base_resolution: int = 1024, patch_size: int = 2, editing_strength: float = 0.0, editing_mode: str = "adaptive"):
         super().__init__()
         self.theta = theta
         self.axes_dim = axes_dim
@@ -333,7 +333,7 @@ def _detect_qwen_model_structure(model: ModelPatcher):
     return structure
 
 
-def apply_dype_to_qwen(model: ModelPatcher, width: int, height: int, method: str, enable_dype: bool, dype_exponent: float, base_shift: float, max_shift: float, editing_strength: float = 0.6, editing_mode: str = "adaptive") -> ModelPatcher:
+def apply_dype_to_qwen(model: ModelPatcher, width: int, height: int, method: str, enable_dype: bool, dype_exponent: float, base_shift: float, max_shift: float, editing_strength: float = 0.0, editing_mode: str = "adaptive") -> ModelPatcher:
     """
     Apply DyPE to a Qwen-Image model with architecture-specific optimizations.
     """

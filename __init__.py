@@ -126,15 +126,15 @@ class DyPE_QWEN(io.ComfyNode):
                 ),
                 io.Float.Input(
                     "dype_exponent",
-                    default=2.0, min=0.0, max=4.0, step=0.1,
+                    default=3.0, min=0.0, max=4.0, step=0.1,
                     optional=True,
-                    tooltip="Controls DyPE strength over time (λt). 2.0=Exponential (best for 4K+), 1.0=Linear, 0.5=Sub-linear (better for ~2K)."
+                    tooltip="Controls DyPE strength over time (λt). 3.0=Very aggressive (best for 4K+), 2.0=Exponential, 1.0=Linear, 0.5=Sub-linear (better for ~2K)."
                 ),
                 io.Float.Input(
                     "base_shift",
-                    default=0.5, min=0.0, max=10.0, step=0.01,
+                    default=0.10, min=0.0, max=10.0, step=0.01,
                     optional=True,
-                    tooltip="Advanced: Base shift for the noise schedule (mu). Default is 0.5."
+                    tooltip="Advanced: Base shift for the noise schedule (mu). Default is 0.10."
                 ),
                 io.Float.Input(
                     "max_shift",
@@ -144,9 +144,9 @@ class DyPE_QWEN(io.ComfyNode):
                 ),
                 io.Float.Input(
                     "editing_strength",
-                    default=0.6, min=0.0, max=1.0, step=0.1,
+                    default=0.0, min=0.0, max=1.0, step=0.1,
                     optional=True,
-                    tooltip="DyPE strength multiplier for image editing (0.0-1.0). Lower values preserve more original structure. Default 0.6 balances editing and quality. Set to 1.0 for pure generation."
+                    tooltip="DyPE strength multiplier for image editing (0.0-1.0). Lower values preserve more original structure. Default 0.0 for maximum preservation. Set to 1.0 for pure generation."
                 ),
                 io.Combo.Input(
                     "editing_mode",
@@ -164,7 +164,7 @@ class DyPE_QWEN(io.ComfyNode):
         )
 
     @classmethod
-    def execute(cls, model, width: int, height: int, method: str, enable_dype: bool, dype_exponent: float = 2.0, base_shift: float = 0.5, max_shift: float = 1.15, editing_strength: float = 0.6, editing_mode: str = "adaptive") -> io.NodeOutput:
+    def execute(cls, model, width: int, height: int, method: str, enable_dype: bool, dype_exponent: float = 3.0, base_shift: float = 0.10, max_shift: float = 1.15, editing_strength: float = 0.0, editing_mode: str = "adaptive") -> io.NodeOutput:
         """
         Clones the model and applies the DyPE patch for both the noise schedule and positional embeddings.
         """
