@@ -39,11 +39,12 @@ It works by taking advantage of the spectral progression inherent to the diffusi
       <p><sub><i>A simple, single-node integration to patch your FLUX model for high-resolution generation.</i></sub></p>
   </div>
   
-This node provides a seamless, "plug-and-play" integration of DyPE into any FLUX-based workflow.
+This node provides a seamless, "plug-and-play" integration of DyPE into FLUX-based and Qwen-Image workflows. Two specialized nodes are available: `DyPE for FLUX` for FLUX models and `DyPE for Qwen-Image` for Qwen-Image models, each optimized for their respective architectures.
 
 **✨ Key Features:**
-*   **True High-Resolution Generation:** Push FLUX models to 4096x4096 and beyond while maintaining global coherence and fine detail.
-*   **Single-Node Integration:** Simply place the `DyPE for FLUX` node after your model loader to patch the model. No complex workflow changes required.
+*   **True High-Resolution Generation:** Push FLUX and Qwen-Image models to 4096x4096 and beyond while maintaining global coherence and fine detail.
+*   **Dual Node Support:** Two specialized nodes available - `DyPE for FLUX` and `DyPE for Qwen-Image` - each optimized for their respective architectures.
+*   **Single-Node Integration:** Simply place the appropriate DyPE node after your model loader to patch the model. No complex workflow changes required.
 *   **Full Compatibility:** Works seamlessly with your existing ComfyUI workflows, samplers, schedulers, and other optimization nodes like Self-Attention or quantization.
 *   **Fine-Grained Control:** Exposes key DyPE hyperparameters, allowing you to tune the algorithm's strength and behavior for optimal results at different target resolutions.
 *   **Zero Inference Overhead:** DyPE's adjustments happen on-the-fly with negligible performance impact.
@@ -75,6 +76,8 @@ Alternatively, to install manually:
 
 Using the node is straightforward and designed for minimal workflow disruption.
 
+### For FLUX Models
+
 1.  **Load Your FLUX Model:** Use a standard `Load Checkpoint` node to load your FLUX model (e.g., `FLUX.1-Krea-dev`).
 2.  **Add the DyPE Node:** Add the `DyPE for FLUX` node to your graph (found under `model_patches/unet`).
 3.  **Connect the Model:** Connect the `MODEL` output from your loader to the `model` input of the DyPE node.
@@ -82,8 +85,23 @@ Using the node is straightforward and designed for minimal workflow disruption.
 5.  **Connect to KSampler:** Use the `MODEL` output from the DyPE node as the input for your `KSampler`.
 6.  **Generate!** That's it. Your workflow is now DyPE-enabled.
 
+### For Qwen-Image Models
+
+1.  **Load Your Qwen-Image Model:** Use a standard `Load Checkpoint` node to load your Qwen-Image model.
+2.  **Add the DyPE Node:** Add the `DyPE for Qwen-Image` node to your graph (found under `model_patches/unet`).
+3.  **Connect the Model:** Connect the `MODEL` output from your loader to the `model` input of the DyPE node.
+4.  **Set Resolution:** Set the `width` and `height` on the DyPE node to match the resolution of your `Empty Latent Image`.
+5.  **Connect to KSampler:** Use the `MODEL` output from the DyPE node as the input for your `KSampler`.
+6.  **Generate!** The node will automatically detect your Qwen-Image model structure and apply architecture-specific optimizations.
+
+### Example Workflows
+
+Ready-to-use example workflows are available in the [`example_workflows`](example_workflows) folder:
+*   **[DyPE-Flux-workflow.json](example_workflows/DyPE-Flux-workflow.json)** - Example workflow for FLUX models
+*   **[DyPE-Qwen-workflow.json](example_workflows/DyPE-Qwen-workflow.json)** - Example workflow for Qwen-Image models
+
 > [!NOTE]
-> This node specifically patches the **diffusion model (UNet)**. It does not modify the CLIP or VAE models. It is designed exclusively for **FLUX-based** architectures.
+> This node specifically patches the **diffusion model (UNet)**. It does not modify the CLIP or VAE models. It is designed for **FLUX-based** architectures, with enhanced support for **Qwen-Image** models through intelligent model structure detection and architecture-specific optimizations.
 
 ### Node Inputs
 
@@ -130,7 +148,7 @@ Beyond the code, I believe in the power of community and continuous learning. I 
 <p align="center">══════════════════════════════════</p>
 
 ## ⚠️ Known Issues and Limitations
-*   **FLUX Only:** This implementation is highly specific to the architecture of the FLUX model and will not work on standard U-Net models (like SD 1.5/SDXL) or other Diffusion Transformers.
+*   **Supported Models:** This implementation is optimized for **FLUX-based** architectures and **Qwen-Image** models. It will not work on standard U-Net models (like SD 1.5/SDXL) or other Diffusion Transformers. For Qwen-Image models, the node automatically detects model structure and applies architecture-specific optimizations (see `IMPROVEMENTS.md` for details).
 *   **Parameter Tuning:** The optimal `dype_exponent` can vary based on your target resolution. Experimentation is key to finding the best setting for your use case. The default of `2.0` is optimized for 4K.
 
 <p align="right">(<a href="#readme-top">back to top</a>)</p>
