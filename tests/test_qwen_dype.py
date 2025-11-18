@@ -311,6 +311,7 @@ def test_apply_dype_reports_structure_when_missing_transformer(caplog):
     message = str(exc_info.value)
     assert "clip (" in message
     assert "cond_stage_model" in message
+    assert "key types: cond_stage_model" in message
     assert "transformer" in message
     assert any(
         "Structure snapshot" in record.message for record in caplog.records

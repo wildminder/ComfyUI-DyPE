@@ -41,32 +41,64 @@ def _describe_clip_structure(clip: Any) -> str:
     Build a human-readable summary of key attributes for debugging.
     """
     parts: list[str] = []
+    visited: set[int] = set()
 
     def _type_string(obj: Any) -> str:
         if obj is None:
             return "None"
         return f"{type(obj).__module__}.{type(obj).__name__}"
 
-    clip_attrs = _safe_attribute_names(clip)
-    parts.append(
-        f"clip ({_type_string(clip)}): attrs={clip_attrs}"
-    )
+    # Attributes we attempt to expand recursively.
+    expansion_candidates = [
+        "cond_stage_model",
+        "clip",
+        "clip_model",
+        "transformer",
+        "model",
+        "text_model",
+        "language_model",
+        "vision_model",
+        "encoder",
+        "text_encoder",
+    ]
 
-    cond_stage_model = getattr(clip, "cond_stage_model", None)
-    cond_attrs = _safe_attribute_names(cond_stage_model)
-    parts.append(
-        f"  cond_stage_model ({_type_string(cond_stage_model)}): attrs={cond_attrs}"
-    )
+    def _summarize(path: str, obj: Any, depth: int) -> None:
+        indent = "  " * depth
+        if obj is None:
+            parts.append(f"{indent}{path} (None)")
+            return
 
-    transformer = getattr(cond_stage_model, "transformer", None) if cond_stage_model else None
-    transformer_attrs = _safe_attribute_names(transformer)
-    parts.append(
-        f"    transformer ({_type_string(transformer)}): attrs={transformer_attrs}"
-    )
+        obj_id = id(obj)
+        if obj_id in visited:
+            parts.append(f"{indent}{path} ({_type_string(obj)} - already visited)")
+            return
+        visited.add(obj_id)
 
-    if transformer is not None and not hasattr(transformer, "model"):
-        parts.append("    transformer missing 'model' attribute.")
+        attrs = _safe_attribute_names(obj)
+        parts.append(f"{indent}{path} ({_type_string(obj)}): attrs={attrs}")
 
+        candidate_summaries: list[str] = []
+        expansions: list[tuple[str, Any]] = []
+
+        for candidate in expansion_candidates:
+            try:
+                value = getattr(obj, candidate)
+            except AttributeError:
+                continue
+            except Exception as err:  # pragma: no cover - defensive diagnostics
+                candidate_summaries.append(f"{candidate}=<error: {err}>")
+                continue
+
+            candidate_summaries.append(f"{candidate}={_type_string(value)}")
+            expansions.append((f"{path}.{candidate}", value))
+
+        if candidate_summaries:
+            parts.append(f"{indent}  key types: {', '.join(candidate_summaries)}")
+
+        for next_path, value in expansions:
+            _summarize(next_path, value, depth + 1)
+
+    _summarize("clip", clip, 0)
     return "\n".join(parts)
 
 
