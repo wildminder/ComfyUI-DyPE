@@ -152,7 +152,7 @@ def _iter_expansion_targets(obj: Any) -> Iterable[tuple[str, Any]]:
             yield f"_modules['{name}']", submodule
 
 
-def _locate_transformer_components(root: Any) -> tuple[Any, Any] | None:
+def _locate_transformer_components(root: Any) -> tuple[Any, Any, str] | None:
     visited: set[int] = set()
     queue = deque([(root, "cond_stage_model", 0)])
     max_depth = 6
@@ -170,16 +170,14 @@ def _locate_transformer_components(root: Any) -> tuple[Any, Any] | None:
             if model is not None and hasattr(model, "config") and hasattr(
                 model.config, "rope_theta"
             ):
-                logger.debug("Found transformer via %s", f"{path}.transformer")
-                return transformer, model
+                return transformer, model, f"{path}.transformer"
 
         if hasattr(obj, "model"):
             model_candidate = getattr(obj, "model")
             if model_candidate is not None and hasattr(
                 model_candidate, "config"
             ) and hasattr(model_candidate.config, "rope_theta"):
-                logger.debug("Found model via %s", f"{path}.model")
-                return obj, model_candidate
+                return obj, model_candidate, f"{path}.model"
 
         if depth >= max_depth:
             continue
@@ -373,12 +371,13 @@ def apply_dype_to_qwen_clip(
 
     transformer = getattr(clone.cond_stage_model, "transformer", None)
     core_model = None
+    transformer_path = "cond_stage_model.transformer"
     if transformer is not None and hasattr(transformer, "model"):
         core_model = transformer.model
     else:
         located = _locate_transformer_components(clone.cond_stage_model)
         if located is not None:
-            transformer, core_model = located
+            transformer, core_model, transformer_path = located
 
     if transformer is None or core_model is None:
         clip_structure = _describe_clip_structure(clone)
@@ -393,6 +392,17 @@ def apply_dype_to_qwen_clip(
 
     if not hasattr(core_model, "config") or not hasattr(core_model.config, "rope_theta"):
         raise ValueError("This text encoder is not compatible with DyPE for Qwen.")
+
+    logger.info(
+        "DyPE_QwenClip: patching transformer at %s (method=%s, enable_dype=%s, "
+        "dype_exponent=%s, base_ctx_len=%d, max_ctx_len=%d).",
+        transformer_path,
+        method_normalized,
+        enable_dype,
+        dype_exponent,
+        base_ctx_len,
+        max_ctx_len,
+    )
 
     config = {
         "enable_dype": enable_dype,

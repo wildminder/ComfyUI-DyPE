@@ -375,3 +375,27 @@ def test_apply_dype_finds_nested_transformer():
     result = nested.forward()
     assert result == ((), {})
     assert nested.forward_calls == 1
+
+
+def test_dype_qwen_clip_execute_emits_info(caplog):
+    from __init__ import DyPE_QWEN_CLIP  # type: ignore
+
+    clip = _NestedClip()
+    caplog.set_level(logging.INFO, logger="__init__")
+    caplog.set_level(logging.INFO, logger="src.qwen_patch")
+
+    result = DyPE_QWEN_CLIP.execute(
+        clip=clip,
+        method="ntk",
+        enable_dype=True,
+        dype_exponent=1.5,
+        base_ctx_len=16,
+        max_ctx_len=64,
+    )
+
+    node_messages = [record.message for record in caplog.records if record.name == "__init__"]
+    assert any("DyPE_QwenClip: requested patch" in msg for msg in node_messages)
+
+    patch_messages = [record.message for record in caplog.records if record.name == "src.qwen_patch"]
+    assert any("patching transformer" in msg for msg in patch_messages)
+    assert hasattr(result, "args") and result.args[0].cond_stage_model is clip.cond_stage_model

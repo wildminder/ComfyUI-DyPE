@@ -1,3 +1,4 @@
+import logging
 import torch
 from comfy_api.latest import ComfyExtension, io
 
@@ -7,6 +8,8 @@ try:
 except ImportError:  # pragma: no cover - fallback for direct execution contexts
     from src.patch import apply_dype_to_flux  # type: ignore[no-redef]
     from src.qwen_patch import apply_dype_to_qwen_clip  # type: ignore[no-redef]
+
+logger = logging.getLogger(__name__)
 
 class DyPE_FLUX(io.ComfyNode):
     """
@@ -84,6 +87,18 @@ class DyPE_FLUX(io.ComfyNode):
         """
         if not hasattr(model.model, "diffusion_model") or not hasattr(model.model.diffusion_model, "pe_embedder"):
              raise ValueError("This node is only compatible with FLUX models.")
+
+        logger.info(
+            "DyPE_FLUX: patching model at %dx%d (method=%s, enable_dype=%s, "
+            "dype_exponent=%s, base_shift=%s, max_shift=%s).",
+            width,
+            height,
+            method,
+            enable_dype,
+            dype_exponent,
+            base_shift,
+            max_shift,
+        )
         
         patched_model = apply_dype_to_flux(model, width, height, method, enable_dype, dype_exponent, base_shift, max_shift)
         return io.NodeOutput(patched_model)
@@ -144,6 +159,16 @@ class DyPE_QWEN_CLIP(io.ComfyNode):
     def execute(cls, clip, method: str, enable_dype: bool, dype_exponent: float = 2.0, base_ctx_len: int = 8192, max_ctx_len: int = 262144) -> io.NodeOutput:
         if not hasattr(clip, "cond_stage_model"):
             raise ValueError("This node expects a CLIP/text encoder input.")
+
+        logger.info(
+            "DyPE_QwenClip: requested patch (method=%s, enable_dype=%s, dype_exponent=%s, "
+            "base_ctx_len=%d, max_ctx_len=%d).",
+            method,
+            enable_dype,
+            dype_exponent,
+            base_ctx_len,
+            max_ctx_len,
+        )
 
         patched_clip = apply_dype_to_qwen_clip(
             clip,
