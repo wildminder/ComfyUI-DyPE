@@ -132,7 +132,7 @@ Beyond the code, I believe in the power of community and continuous learning. I 
 ## ⚠️ Known Issues and Limitations
 *   **FLUX Only:** This implementation is highly specific to the architecture of the FLUX model and will not work on standard U-Net models (like SD 1.5/SDXL) or other Diffusion Transformers.
 *   **Parameter Tuning:** The optimal `dype_exponent` can vary based on your target resolution. Experimentation is key to finding the best setting for your use case. The default of `2.0` is optimized for 4K.
-*   **Qwen CLIP Diagnostics:** When a supplied CLIP encoder is missing the expected `transformer.model`, the extension now raises an error that includes a structured snapshot of the offending object in both the logs and exception text to speed up debugging.
+*   **Qwen CLIP Diagnostics:** When a supplied CLIP encoder is missing the expected `transformer.model`, the extension now recursively searches typical attachment points (including nested module dictionaries) and, if still unresolved, raises an error that includes a structured snapshot in both the logs and exception text to speed up debugging.
 
 <p align="right">(<a href="#readme-top">back to top</a>)</p>
 

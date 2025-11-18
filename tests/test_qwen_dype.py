@@ -316,3 +316,62 @@ def test_apply_dype_reports_structure_when_missing_transformer(caplog):
     assert any(
         "Structure snapshot" in record.message for record in caplog.records
     ), "Expected structure snapshot to be logged when transformer is missing."
+
+
+class _NestedTransformerModel:
+    def __init__(self):
+        self.config = types.SimpleNamespace(rope_theta=1_000_000.0)
+        self.forward_calls = 0
+
+    def forward(self, *args, **kwargs):
+        self.forward_calls += 1
+        return args, kwargs
+
+
+class _NestedTransformer:
+    def __init__(self):
+        self.model = _NestedTransformerModel()
+        self._modules = {"model": self.model}
+
+
+class _NestedModuleWrapper:
+    def __init__(self, transformer):
+        self.transformer = transformer
+        self._modules = {}
+
+
+class _NestedCondStageModel:
+    def __init__(self):
+        transformer = _NestedTransformer()
+        self.transformer = None
+        self._modules = {"qwen25_7b": _NestedModuleWrapper(transformer)}
+
+
+class _NestedClip:
+    def __init__(self):
+        self.cond_stage_model = _NestedCondStageModel()
+
+    def clone(self):
+        cloned = _NestedClip()
+        cloned.cond_stage_model = self.cond_stage_model
+        return cloned
+
+
+def test_apply_dype_finds_nested_transformer():
+    clip = _NestedClip()
+
+    patched_clip = qwen_patch.apply_dype_to_qwen_clip(
+        clip=clip,
+        method="yarn",
+        enable_dype=True,
+        dype_exponent=2.0,
+        base_ctx_len=16,
+        max_ctx_len=32,
+    )
+
+    nested = patched_clip.cond_stage_model._modules["qwen25_7b"].transformer.model
+    assert nested._qwen_dype_config["max_ctx_len"] == 32
+
+    result = nested.forward()
+    assert result == ((), {})
+    assert nested.forward_calls == 1

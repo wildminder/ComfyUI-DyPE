@@ -1,5 +1,6 @@
 import logging
 import types
+from collections import deque
 from contextvars import ContextVar
 from typing import Any, Iterable
 
@@ -17,6 +18,29 @@ _QWEN_DYPE_CONTEXT: ContextVar[dict[str, Any] | None] = ContextVar(
 )
 _ORIGINAL_PRECOMPUTE = llama_module.precompute_freqs_cis
 _PATCH_INSTALLED = False
+
+_EXPANSION_CANDIDATES = [
+    "cond_stage_model",
+    "clip",
+    "clip_model",
+    "transformer",
+    "model",
+    "text_model",
+    "language_model",
+    "vision_model",
+    "encoder",
+    "text_encoder",
+]
+
+_PRIMITIVE_TYPES = (str, bytes, int, float, bool)
+
+
+def _is_expandable(value: Any) -> bool:
+    if value is None:
+        return False
+    if isinstance(value, _PRIMITIVE_TYPES):
+        return False
+    return True
 
 
 def _safe_attribute_names(obj: Any, *, max_items: int = 20) -> list[str]:
@@ -48,35 +72,14 @@ def _describe_clip_structure(clip: Any) -> str:
             return "None"
         return f"{type(obj).__module__}.{type(obj).__name__}"
 
-    # Attributes we attempt to expand recursively.
-    expansion_candidates = [
-        "cond_stage_model",
-        "clip",
-        "clip_model",
-        "transformer",
-        "model",
-        "text_model",
-        "language_model",
-        "vision_model",
-        "encoder",
-        "text_encoder",
-    ]
-
     max_depth = 5
     max_module_items = 6
 
-    def _should_expand(value: Any) -> bool:
-        if value is None:
-            return False
-        if isinstance(value, (str, bytes, int, float, bool)):
-            return False
-        return True
-
     def _summarize(path: str, obj: Any, depth: int) -> None:
-        if depth > max_depth:
-            parts.append(f"{path} <depth limit reached>")
-            return
         indent = "  " * depth
+        if depth > max_depth:
+            parts.append(f"{indent}{path} <depth limit reached>")
+            return
         if obj is None:
             parts.append(f"{indent}{path} (None)")
             return
@@ -93,7 +96,7 @@ def _describe_clip_structure(clip: Any) -> str:
         candidate_summaries: list[str] = []
         expansions: list[tuple[str, Any]] = []
 
-        for candidate in expansion_candidates:
+        for candidate in _EXPANSION_CANDIDATES:
             try:
                 value = getattr(obj, candidate)
             except AttributeError:
@@ -103,7 +106,7 @@ def _describe_clip_structure(clip: Any) -> str:
                 continue
 
             candidate_summaries.append(f"{candidate}={_type_string(value)}")
-            if _should_expand(value):
+            if _is_expandable(value):
                 expansions.append((f"{path}.{candidate}", value))
 
         modules_info: list[str] = []
@@ -116,7 +119,7 @@ def _describe_clip_structure(clip: Any) -> str:
             if isinstance(module_items, dict):
                 for name, submodule in list(module_items.items())[:max_module_items]:
                     modules_info.append(f"{name}={_type_string(submodule)}")
-                    if _should_expand(submodule):
+                    if _is_expandable(submodule):
                         expansions.append((f"{path}._modules['{name}']", submodule))
                 if len(module_items) > max_module_items:
                     modules_info.append("...")
@@ -131,6 +134,62 @@ def _describe_clip_structure(clip: Any) -> str:
 
     _summarize("clip", clip, 0)
     return "\n".join(parts)
+
+
+def _iter_expansion_targets(obj: Any) -> Iterable[tuple[str, Any]]:
+    for name in _EXPANSION_CANDIDATES:
+        try:
+            value = getattr(obj, name)
+        except AttributeError:
+            continue
+        except Exception:
+            continue
+        yield name, value
+
+    modules = getattr(obj, "_modules", None)
+    if isinstance(modules, dict):
+        for name, submodule in modules.items():
+            yield f"_modules['{name}']", submodule
+
+
+def _locate_transformer_components(root: Any) -> tuple[Any, Any] | None:
+    visited: set[int] = set()
+    queue = deque([(root, "cond_stage_model", 0)])
+    max_depth = 6
+
+    while queue:
+        obj, path, depth = queue.popleft()
+        obj_id = id(obj)
+        if obj_id in visited:
+            continue
+        visited.add(obj_id)
+
+        transformer = getattr(obj, "transformer", None)
+        if transformer is not None and hasattr(transformer, "model"):
+            model = getattr(transformer, "model", None)
+            if model is not None and hasattr(model, "config") and hasattr(
+                model.config, "rope_theta"
+            ):
+                logger.debug("Found transformer via %s", f"{path}.transformer")
+                return transformer, model
+
+        if hasattr(obj, "model"):
+            model_candidate = getattr(obj, "model")
+            if model_candidate is not None and hasattr(
+                model_candidate, "config"
+            ) and hasattr(model_candidate.config, "rope_theta"):
+                logger.debug("Found model via %s", f"{path}.model")
+                return obj, model_candidate
+
+        if depth >= max_depth:
+            continue
+
+        for name, value in _iter_expansion_targets(obj):
+            if not _is_expandable(value):
+                continue
+            queue.append((value, f"{path}.{name}", depth + 1))
+
+    return None
 
 
 def _normalize_method(method: str) -> str:
@@ -313,7 +372,15 @@ def apply_dype_to_qwen_clip(
     _ensure_llama_patch_installed()
 
     transformer = getattr(clone.cond_stage_model, "transformer", None)
-    if transformer is None or not hasattr(transformer, "model"):
+    core_model = None
+    if transformer is not None and hasattr(transformer, "model"):
+        core_model = transformer.model
+    else:
+        located = _locate_transformer_components(clone.cond_stage_model)
+        if located is not None:
+            transformer, core_model = located
+
+    if transformer is None or core_model is None:
         clip_structure = _describe_clip_structure(clone)
         logger.error(
             "Provided clip does not expose a transformer model. Structure snapshot:\n%s",
@@ -324,7 +391,6 @@ def apply_dype_to_qwen_clip(
             f"Observed structure:\n{clip_structure}"
         )
 
-    core_model = transformer.model
     if not hasattr(core_model, "config") or not hasattr(core_model.config, "rope_theta"):
         raise ValueError("This text encoder is not compatible with DyPE for Qwen.")
 
