@@ -62,7 +62,20 @@ def _describe_clip_structure(clip: Any) -> str:
         "text_encoder",
     ]
 
+    max_depth = 5
+    max_module_items = 6
+
+    def _should_expand(value: Any) -> bool:
+        if value is None:
+            return False
+        if isinstance(value, (str, bytes, int, float, bool)):
+            return False
+        return True
+
     def _summarize(path: str, obj: Any, depth: int) -> None:
+        if depth > max_depth:
+            parts.append(f"{path} <depth limit reached>")
+            return
         indent = "  " * depth
         if obj is None:
             parts.append(f"{indent}{path} (None)")
@@ -90,10 +103,28 @@ def _describe_clip_structure(clip: Any) -> str:
                 continue
 
             candidate_summaries.append(f"{candidate}={_type_string(value)}")
-            expansions.append((f"{path}.{candidate}", value))
+            if _should_expand(value):
+                expansions.append((f"{path}.{candidate}", value))
+
+        modules_info: list[str] = []
+        if hasattr(obj, "_modules"):
+            try:
+                module_items = getattr(obj, "_modules")
+            except Exception as err:  # pragma: no cover - defensive diagnostics
+                modules_info.append(f"_modules=<error: {err}>")
+                module_items = None
+            if isinstance(module_items, dict):
+                for name, submodule in list(module_items.items())[:max_module_items]:
+                    modules_info.append(f"{name}={_type_string(submodule)}")
+                    if _should_expand(submodule):
+                        expansions.append((f"{path}._modules['{name}']", submodule))
+                if len(module_items) > max_module_items:
+                    modules_info.append("...")
 
         if candidate_summaries:
             parts.append(f"{indent}  key types: {', '.join(candidate_summaries)}")
+        if modules_info:
+            parts.append(f"{indent}  modules: {', '.join(modules_info)}")
 
         for next_path, value in expansions:
             _summarize(next_path, value, depth + 1)
