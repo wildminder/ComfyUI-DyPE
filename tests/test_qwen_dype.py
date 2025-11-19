@@ -129,35 +129,58 @@ def _install_comfy_stub() -> None:
 
     model_patcher_module = types.ModuleType("comfy.model_patcher")
 
-    class _StubModelSampler:
-        def __init__(self):
-            self._dype_patched = False
-
     class _StubDiffusionModel:
         def __init__(self):
-            self.patch_size = 1
-            self.pe_embedder = None
+            self.patch_size = 2
+            self.pe_embedder = _StubEmbedder()
+
+    class _StubEmbedder(torch.nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.theta = 10_000.0
+            self.axes_dim = [4, 4, 4]
+
+        def forward(self, ids):
+            batch = ids.shape[0]
+            tokens = ids.shape[1]
+            return torch.zeros(batch, 1, 6, 2, 2)
+
+    class _ModelSamplingFlux:
+        def __init__(self):
+            self._dype_patched = False
+            self.sigma_max = torch.tensor(1.0)
+
+        def sigma(self, timestep):
+            return timestep
 
     class _StubModelWrapper:
         def __init__(self):
-            self.model_sampling = _StubModelSampler()
+            self.model_sampling = _ModelSamplingFlux()
             self.diffusion_model = _StubDiffusionModel()
 
     class _StubModelPatcher:
         def __init__(self):
             self.model = _StubModelWrapper()
+            self._wrapper = None
 
         def clone(self):
-            return self
+            cloned = _StubModelPatcher()
+            cloned.model = self.model
+            return cloned
+
+        def add_object_patch(self, path, obj):
+            if path == "diffusion_model.pe_embedder":
+                self.model.diffusion_model.pe_embedder = obj
+
+        def set_model_unet_function_wrapper(self, wrapper):
+            self._wrapper = wrapper
 
     model_patcher_module.ModelPatcher = _StubModelPatcher  # type: ignore[attr-defined]
 
     model_sampling_module = types.ModuleType("comfy.model_sampling")
 
-    class _ModelSamplingFlux:  # pragma: no cover - diagnostic stub
-        pass
-
     model_sampling_module.ModelSamplingFlux = _ModelSamplingFlux  # type: ignore[attr-defined]
+    model_sampling_module.flux_time_shift = lambda mu, sigma, t: t  # type: ignore[attr-defined]
 
     comfy_module.model_patcher = model_patcher_module  # type: ignore[attr-defined]
     comfy_module.model_sampling = model_sampling_module  # type: ignore[attr-defined]
@@ -225,7 +248,7 @@ def _install_comfy_api_stub() -> None:
 
 _install_comfy_api_stub()
 
-from src import qwen_patch  # noqa: E402
+from src import qwen_patch, qwen_spatial  # noqa: E402
 
 
 def _call_patched_precompute(position_ids, cfg):
@@ -318,6 +341,47 @@ def test_apply_dype_reports_structure_when_missing_transformer(caplog):
     ), "Expected structure snapshot to be logged when transformer is missing."
 
 
+class _RecordingEmbedder(torch.nn.Module):
+    def __init__(self):
+        super().__init__()
+        self.theta = 10_000.0
+        self.axes_dim = [4, 4, 4]
+        self.calls = 0
+
+    def forward(self, ids):
+        self.calls += 1
+        batch = ids.shape[0]
+        return torch.zeros(batch, 1, 6, 2, 2)
+
+
+def _make_token_ids(expanded: bool) -> torch.Tensor:
+    text_tokens = torch.tensor(
+        [
+            [4.0, 4.0, 4.0],
+            [5.0, 5.0, 5.0],
+        ]
+    )
+    if expanded:
+        image_tokens = torch.tensor(
+            [
+                [0.0, -2.0, -2.0],
+                [0.0, -2.0, 1.0],
+                [0.0, 1.0, -2.0],
+                [0.0, 1.0, 1.0],
+            ]
+        )
+    else:
+        image_tokens = torch.tensor(
+            [
+                [0.0, -1.0, -1.0],
+                [0.0, -1.0, 0.0],
+                [0.0, 0.0, -1.0],
+                [0.0, 0.0, 0.0],
+            ]
+        )
+    return torch.cat([text_tokens, image_tokens], dim=0).unsqueeze(0)
+
+
 class _NestedTransformerModel:
     def __init__(self):
         self.config = types.SimpleNamespace(rope_theta=1_000_000.0)
@@ -399,3 +463,81 @@ def test_dype_qwen_clip_execute_emits_info(caplog):
     patch_messages = [record.message for record in caplog.records if record.name == "src.qwen_patch"]
     assert any("patching transformer" in msg for msg in patch_messages)
     assert hasattr(result, "args") and result.args[0].cond_stage_model is clip.cond_stage_model
+
+
+def test_qwen_spatial_embedder_falls_back_to_backing():
+    backing = _RecordingEmbedder()
+    embedder = qwen_spatial.QwenSpatialPosEmbed(
+        theta=backing.theta,
+        axes_dim=backing.axes_dim,
+        patch_size=2,
+        method="yarn",
+        enable_dype=False,
+        dype_exponent=2.0,
+        base_resolution=(32, 32),
+        target_resolution=(32, 32),
+        backing_embedder=backing,
+    )
+
+    ids = _make_token_ids(expanded=False)
+    output = embedder(ids)
+
+    assert backing.calls == 1
+    assert output.shape[0] == 1
+    assert output.shape[1] == 1
+
+
+def test_qwen_spatial_embedder_extends_when_grid_grows():
+    backing = _RecordingEmbedder()
+    embedder = qwen_spatial.QwenSpatialPosEmbed(
+        theta=backing.theta,
+        axes_dim=backing.axes_dim,
+        patch_size=2,
+        method="ntk",
+        enable_dype=False,
+        dype_exponent=1.0,
+        base_resolution=(32, 32),
+        target_resolution=(64, 64),
+        backing_embedder=backing,
+    )
+
+    ids = _make_token_ids(expanded=True)
+    output = embedder(ids)
+
+    assert backing.calls == 0
+    assert output.shape == (1, 1, 6, 2, 2)
+
+
+def test_apply_dype_to_qwen_image_installs_embedder_and_wrapper():
+    patcher = comfy.model_patcher.ModelPatcher()
+
+    patched = qwen_spatial.apply_dype_to_qwen_image(
+        model=patcher,
+        width=2048,
+        height=2048,
+        method="ntk",
+        enable_dype=True,
+        dype_exponent=1.5,
+        base_width=1024,
+        base_height=1024,
+        base_shift=1.15,
+        max_shift=1.35,
+    )
+
+    embedder = patched.model.diffusion_model.pe_embedder
+    assert isinstance(embedder, qwen_spatial.QwenSpatialPosEmbed)
+    assert hasattr(patched, "_wrapper") and patched._wrapper is not None
+    assert patched.model.model_sampling._dype_patched is True
+
+    args_dict = {
+        "input": torch.zeros(1),
+        "timestep": torch.tensor([0.5]),
+        "c": {},
+    }
+
+    def _dummy_model_fn(x, timestep, **kwargs):
+        return x, timestep, kwargs
+
+    result = patched._wrapper(_dummy_model_fn, args_dict)
+    assert hasattr(embedder, "current_timestep") and embedder.current_timestep == 0.5
+    assert isinstance(result, tuple) and result[1] is args_dict["timestep"]
