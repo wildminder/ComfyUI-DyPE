@@ -13,6 +13,15 @@ from .rope import get_1d_rotary_pos_embed
 
 
 logger = logging.getLogger(__name__)
+if not logger.handlers:
+    stream_handler = logging.StreamHandler()
+    stream_handler.setLevel(logging.INFO)
+    stream_handler.setFormatter(
+        logging.Formatter("[DyPE QwenImage] %(message)s")
+    )
+    logger.addHandler(stream_handler)
+logger.setLevel(logging.INFO)
+logger.propagate = False
 
 
 def _normalize_method(method: str) -> str:
@@ -189,18 +198,16 @@ class QwenSpatialPosEmbed(nn.Module):
                 current_len = base_len
                 target_len = current_len
 
-            if logger.isEnabledFor(logging.DEBUG):
-                logger.debug(
-                    "QwenSpatialPosEmbed: axis=%s base_len=%d current_len=%d target_len=%d "
-                    "method=%s enable_dype=%s timestep=%.4f",
-                    axis_name,
-                    base_len,
-                    current_len,
-                    target_len,
-                    self.method,
-                    self.enable_dype,
-                    self.current_timestep,
-                )
+            logger.info(
+                "axis=%s base_len=%d current_len=%d target_len=%d method=%s enable_dype=%s timestep=%.4f",
+                axis_name,
+                base_len,
+                current_len,
+                target_len,
+                self.method,
+                self.enable_dype,
+                self.current_timestep,
+            )
 
             if axis_idx == 0 or self.method == "base":
                 cos, sin = get_1d_rotary_pos_embed(**common_kwargs)
