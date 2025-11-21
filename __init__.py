@@ -1,6 +1,17 @@
+import logging
 import torch
 from comfy_api.latest import ComfyExtension, io
-from .src.patch import apply_dype_to_flux
+
+try:
+    from .src.patch import apply_dype_to_flux
+    from .src.qwen_patch import apply_dype_to_qwen_clip
+    from .src.qwen_spatial import apply_dype_to_qwen_image
+except ImportError:  # pragma: no cover - fallback for direct execution contexts
+    from src.patch import apply_dype_to_flux  # type: ignore[no-redef]
+    from src.qwen_patch import apply_dype_to_qwen_clip  # type: ignore[no-redef]
+    from src.qwen_spatial import apply_dype_to_qwen_image  # type: ignore[no-redef]
+
+logger = logging.getLogger(__name__)
 
 class DyPE_FLUX(io.ComfyNode):
     """
@@ -78,15 +89,278 @@ class DyPE_FLUX(io.ComfyNode):
         """
         if not hasattr(model.model, "diffusion_model") or not hasattr(model.model.diffusion_model, "pe_embedder"):
              raise ValueError("This node is only compatible with FLUX models.")
+
+        logger.info(
+            "DyPE_FLUX: patching model at %dx%d (method=%s, enable_dype=%s, "
+            "dype_exponent=%s, base_shift=%s, max_shift=%s).",
+            width,
+            height,
+            method,
+            enable_dype,
+            dype_exponent,
+            base_shift,
+            max_shift,
+        )
         
         patched_model = apply_dype_to_flux(model, width, height, method, enable_dype, dype_exponent, base_shift, max_shift)
         return io.NodeOutput(patched_model)
+
+
+class DyPE_QWEN_IMAGE(io.ComfyNode):
+    """
+    Applies DyPE-style spatial extrapolation to a Qwen Image diffusion model.
+    """
+
+    @classmethod
+    def define_schema(cls) -> io.Schema:
+        return io.Schema(
+            node_id="DyPE_QwenImage",
+            display_name="DyPE for Qwen Image",
+            category="model_patches/unet",
+            description="Expands the spatial rotary embeddings inside the Qwen image transformer using DyPE.",
+            inputs=[
+                io.Model.Input(
+                    "model",
+                    tooltip="The Qwen Image model to patch.",
+                ),
+                io.Int.Input(
+                    "width",
+                    default=1024,
+                    min=16,
+                    max=16384,
+                    step=8,
+                    tooltip="Target output width in pixels.",
+                ),
+                io.Int.Input(
+                    "height",
+                    default=1024,
+                    min=16,
+                    max=16384,
+                    step=8,
+                    tooltip="Target output height in pixels.",
+                ),
+                io.Boolean.Input(
+                    "auto_detect",
+                    default=True,
+                    label_on="Auto",
+                    label_off="Manual",
+                    tooltip="Automatically detect Qwen patch size and training resolution from the model.",
+                ),
+                io.Int.Input(
+                    "base_width",
+                    default=1024,
+                    min=16,
+                    max=16384,
+                    step=8,
+                    tooltip="Training width used by the base Qwen model (used when auto detection is disabled).",
+                ),
+                io.Int.Input(
+                    "base_height",
+                    default=1024,
+                    min=16,
+                    max=16384,
+                    step=8,
+                    tooltip="Training height used by the base Qwen model (used when auto detection is disabled).",
+                ),
+                io.Combo.Input(
+                    "method",
+                    options=["yarn", "ntk", "base"],
+                    default="yarn",
+                    tooltip="Spatial RoPE extrapolation strategy.",
+                ),
+                io.Boolean.Input(
+                    "enable_dype",
+                    default=True,
+                    label_on="Enabled",
+                    label_off="Disabled",
+                    tooltip="Enable Dynamic Position Extrapolation over the sampling trajectory.",
+                ),
+                io.Float.Input(
+                    "dype_exponent",
+                    default=2.0,
+                    min=0.0,
+                    max=4.0,
+                    step=0.1,
+                    optional=True,
+                    tooltip="Controls how strongly DyPE ramps across sampling timesteps.",
+                ),
+                io.Float.Input(
+                    "base_shift",
+                    default=1.15,
+                    min=0.0,
+                    max=10.0,
+                    step=0.01,
+                    optional=True,
+                    tooltip="Baseline shift applied to the flow-matching noise schedule.",
+                ),
+                io.Float.Input(
+                    "max_shift",
+                    default=1.35,
+                    min=0.0,
+                    max=10.0,
+                    step=0.01,
+                    optional=True,
+                    tooltip="Maximum shift applied when operating at the target resolution.",
+                ),
+                io.Float.Input(
+                    "editing_strength",
+                    default=1.0,
+                    min=0.0,
+                    max=1.0,
+                    step=0.05,
+                    optional=True,
+                    tooltip="Scale DyPE while editing images (1.0 = full strength, 0.0 = disable DyPE scaling in edits).",
+                ),
+                io.Combo.Input(
+                    "editing_mode",
+                    options=["adaptive", "timestep_aware", "resolution_aware", "minimal", "full"],
+                    default="adaptive",
+                    tooltip="Strategy for tapering DyPE during edits. Adaptive is a balanced default.",
+                ),
+            ],
+            outputs=[
+                io.Model.Output(
+                    display_name="Patched Model",
+                    tooltip="The Qwen Image model patched with spatial DyPE.",
+                ),
+            ],
+        )
+
+    @classmethod
+    def execute(
+        cls,
+        model,
+        width: int,
+        height: int,
+        auto_detect: bool,
+        base_width: int,
+        base_height: int,
+        method: str,
+        enable_dype: bool,
+        dype_exponent: float = 2.0,
+        base_shift: float = 1.15,
+        max_shift: float = 1.35,
+        editing_strength: float = 1.0,
+        editing_mode: str = "adaptive",
+    ) -> io.NodeOutput:
+        if not hasattr(model, "model") or not hasattr(model.model, "diffusion_model"):
+            raise ValueError("This node expects a Qwen Image diffusion model input.")
+
+        logger.info(
+            "DyPE_QwenImage: requested patch (width=%d, height=%d, method=%s, "
+            "enable_dype=%s, dype_exponent=%s, base_shift=%s, max_shift=%s, "
+            "auto_detect=%s, editing_mode=%s, editing_strength=%.3f).",
+            width,
+            height,
+            method,
+            enable_dype,
+            dype_exponent,
+            base_shift,
+            max_shift,
+            auto_detect,
+            editing_mode,
+            editing_strength,
+        )
+
+        patched_model = apply_dype_to_qwen_image(
+            model=model,
+            width=width,
+            height=height,
+            method=method,
+            enable_dype=enable_dype,
+            dype_exponent=dype_exponent,
+            base_width=base_width,
+            base_height=base_height,
+            base_shift=base_shift,
+            max_shift=max_shift,
+            auto_detect=auto_detect,
+            editing_strength=editing_strength,
+            editing_mode=editing_mode,
+        )
+        return io.NodeOutput(patched_model)
+
+class DyPE_QWEN_CLIP(io.ComfyNode):
+    """
+    Applies DyPE position extrapolation to a Qwen-based CLIP/text encoder.
+    """
+
+    @classmethod
+    def define_schema(cls) -> io.Schema:
+        return io.Schema(
+            node_id="DyPE_QwenClip",
+            display_name="DyPE for Qwen CLIP",
+            category="model_patches/clip",
+            description="Extends Qwen text encoder RoPE for longer prompts using DyPE-style extrapolation.",
+            inputs=[
+                io.Clip.Input("clip"),
+                io.Combo.Input(
+                    "method",
+                    options=["yarn", "ntk", "base"],
+                    default="ntk",
+                    tooltip="RoPE extrapolation strategy. NTK is a good default for language models.",
+                ),
+                io.Boolean.Input(
+                    "enable_dype",
+                    default=True,
+                    label_on="Enabled",
+                    label_off="Disabled",
+                    tooltip="Toggle Dynamic Position Extrapolation scaling.",
+                ),
+                io.Float.Input(
+                    "dype_exponent",
+                    default=2.0, min=0.0, max=4.0, step=0.1,
+                    optional=True,
+                    tooltip="Controls how aggressively DyPE ramps with context length.",
+                ),
+                io.Int.Input(
+                    "base_ctx_len",
+                    default=8192, min=1024, max=512000, step=512,
+                    tooltip="Context length the model was trained on. DyPE stays inactive at or below this size.",
+                ),
+                io.Int.Input(
+                    "max_ctx_len",
+                    default=262144, min=4096, max=1048576, step=512,
+                    tooltip="Target maximum context DyPE should support.",
+                ),
+            ],
+            outputs=[
+                io.Clip.Output(
+                    display_name="Patched CLIP",
+                    tooltip="Qwen text encoder with DyPE RoPE scaling.",
+                ),
+            ],
+        )
+
+    @classmethod
+    def execute(cls, clip, method: str, enable_dype: bool, dype_exponent: float = 2.0, base_ctx_len: int = 8192, max_ctx_len: int = 262144) -> io.NodeOutput:
+        if not hasattr(clip, "cond_stage_model"):
+            raise ValueError("This node expects a CLIP/text encoder input.")
+
+        logger.info(
+            "DyPE_QwenClip: requested patch (method=%s, enable_dype=%s, dype_exponent=%s, "
+            "base_ctx_len=%d, max_ctx_len=%d).",
+            method,
+            enable_dype,
+            dype_exponent,
+            base_ctx_len,
+            max_ctx_len,
+        )
+
+        patched_clip = apply_dype_to_qwen_clip(
+            clip,
+            method=method,
+            enable_dype=enable_dype,
+            dype_exponent=dype_exponent,
+            base_ctx_len=base_ctx_len,
+            max_ctx_len=max_ctx_len,
+        )
+        return io.NodeOutput(patched_clip)
 
 class DyPEExtension(ComfyExtension):
     """Registers the DyPE node."""
 
     async def get_node_list(self) -> list[type[io.ComfyNode]]:
-        return [DyPE_FLUX]
+        return [DyPE_FLUX, DyPE_QWEN_CLIP, DyPE_QWEN_IMAGE]
 
 async def comfy_entrypoint() -> DyPEExtension:
     return DyPEExtension()
