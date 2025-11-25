@@ -4,6 +4,7 @@ from .src.patch import apply_dype_to_flux
 
 class DyPE_FLUX(io.ComfyNode):
     """
+    test
     Applies DyPE (Dynamic Position Extrapolation) to a FLUX model.
     This allows generating images at resolutions far beyond the model's training scale
     by dynamically adjusting positional encodings and the noise schedule.
