@@ -31,7 +31,7 @@ class DyPE_FLUX(io.ComfyNode):
                 ),
                 io.Combo.Input(
                     "model_type",
-                    options=["auto", "flux", "nunchaku", "qwen"],
+                    options=["auto", "flux", "nunchaku", "qwen", "zimage"],
                     default="auto",
                     tooltip="Specify the model architecture. 'auto' usually works",
                 ),

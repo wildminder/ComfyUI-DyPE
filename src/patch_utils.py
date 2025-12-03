@@ -5,49 +5,52 @@ from comfy import model_sampling
 from .models.flux import PosEmbedFlux
 from .models.nunchaku import PosEmbedNunchaku
 from .models.qwen import PosEmbedQwen
+from .models.zimage import PosEmbedZImage
 
 def apply_dype_to_model(model: ModelPatcher, model_type: str, width: int, height: int, method: str, yarn_alt_scaling: bool, enable_dype: bool, dype_scale: float, dype_exponent: float, base_shift: float, max_shift: float, base_resolution: int = 1024, dype_start_sigma: float = 1.0) -> ModelPatcher:
     m = model.clone()
     
     is_nunchaku = False
     is_qwen = False
+    is_zimage = False
     
     if model_type == "nunchaku":
         is_nunchaku = True
     elif model_type == "qwen":
         is_qwen = True
+    elif model_type == "zimage":
+        is_zimage = True
     elif model_type == "flux":
-        pass
+        pass # defaults false
     else: # auto
         if hasattr(m.model, "diffusion_model"):
             dm = m.model.diffusion_model
             model_class_name = dm.__class__.__name__
-
-            # ToDo: add normal logging
+            
             if "QwenImage" in model_class_name:
                 is_qwen = True
-                # print("[DyPE] Auto-detected Qwen Image model.")
+            elif "NextDiT" in model_class_name:
+                is_zimage = True
             elif hasattr(dm, "model") and hasattr(dm.model, "pos_embed"):
                 is_nunchaku = True
-                # print("[DyPE] Auto-detected Nunchaku Flux model.")
             elif hasattr(dm, "pe_embedder"):
-                # print("[DyPE] Auto-detected Standard Flux model.")
                 pass
             else:
-                # print("[DyPE] Warning: Could not auto-detect model type. Assuming Standard Flux.")
                 pass
         else:
              raise ValueError("The provided model is not a compatible model.")
 
-    new_dype_params = (width, height, base_shift, max_shift, method, yarn_alt_scaling, base_resolution, dype_start_sigma, is_nunchaku, is_qwen)
+    new_dype_params = (width, height, base_shift, max_shift, method, yarn_alt_scaling, base_resolution, dype_start_sigma, is_nunchaku, is_qwen, is_zimage)
     
     should_patch_schedule = True
     if hasattr(m.model, "_dype_params"):
         if m.model._dype_params == new_dype_params:
             should_patch_schedule = False
+        else:
+            pass
 
     if enable_dype and should_patch_schedule:
-        patch_size = 2 # Default Flux/Qwen
+        patch_size = 2 # Default Flux/Qwen/Z-Image
         try:
             if is_nunchaku:
                 patch_size = m.model.diffusion_model.model.config.patch_size
@@ -57,7 +60,7 @@ def apply_dype_to_model(model: ModelPatcher, model_type: str, width: int, height
             pass
 
         try:
-            if isinstance(m.model.model_sampling, model_sampling.ModelSamplingFlux) or is_qwen:
+            if isinstance(m.model.model_sampling, model_sampling.ModelSamplingFlux) or is_qwen or is_zimage:
                 latent_h, latent_w = height // 8, width // 8
                 padded_h, padded_w = math.ceil(latent_h / patch_size) * patch_size, math.ceil(latent_w / patch_size) * patch_size
                 image_seq_len = (padded_h // patch_size) * (padded_w // patch_size)
@@ -74,7 +77,6 @@ def apply_dype_to_model(model: ModelPatcher, model_type: str, width: int, height
                     dype_shift = image_seq_len * slope + intercept
                 
                 dype_shift = max(0.0, dype_shift)
-                # print(f"[DyPE DEBUG] Calculated dype_shift (mu): {dype_shift:.4f} for resolution {width}x{height} (Base: {base_resolution})")
 
                 class DypeModelSamplingFlux(model_sampling.ModelSamplingFlux, model_sampling.CONST):
                     pass
@@ -85,7 +87,7 @@ def apply_dype_to_model(model: ModelPatcher, model_type: str, width: int, height
                 m.add_object_patch("model_sampling", new_model_sampler)
                 m.model._dype_params = new_dype_params
         except:
-            pass
+            pass 
 
     elif not enable_dype:
         if hasattr(m.model, "_dype_params"):
@@ -98,19 +100,24 @@ def apply_dype_to_model(model: ModelPatcher, model_type: str, width: int, height
         if is_nunchaku:
             orig_embedder = m.model.diffusion_model.model.pos_embed
             target_patch_path = "diffusion_model.model.pos_embed"
+        elif is_zimage:
+            orig_embedder = m.model.diffusion_model.rope_embedder
+            target_patch_path = "diffusion_model.rope_embedder"
         else:
             orig_embedder = m.model.diffusion_model.pe_embedder
             target_patch_path = "diffusion_model.pe_embedder"
             
         theta, axes_dim = orig_embedder.theta, orig_embedder.axes_dim
     except AttributeError:
-        raise ValueError("The provided model is not a compatible FLUX/Qwen model structure.")
+        raise ValueError("The provided model is not a compatible FLUX/Qwen/Z-Image model structure.")
 
     embedder_cls = PosEmbedFlux
     if is_nunchaku:
         embedder_cls = PosEmbedNunchaku
     elif is_qwen:
         embedder_cls = PosEmbedQwen
+    elif is_zimage:
+        embedder_cls = PosEmbedZImage
 
     new_pe_embedder = embedder_cls(
         theta, axes_dim, method, yarn_alt_scaling, enable_dype, 
