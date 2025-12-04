@@ -11,55 +11,54 @@ from .models.nunchaku import PosEmbedNunchaku
 from .models.qwen import PosEmbedQwen
 from .models.z_image import PosEmbedZImage
 
+
 def apply_dype_to_model(model: ModelPatcher, model_type: str, width: int, height: int, method: str, yarn_alt_scaling: bool, enable_dype: bool, dype_scale: float, dype_exponent: float, base_shift: float, max_shift: float, base_resolution: int = 1024, dype_start_sigma: float = 1.0) -> ModelPatcher:
     m = model.clone()
 
     is_nunchaku = False
     is_qwen = False
-    is_z_image = False
+    is_zimage = False
 
-    if model_type == "nunchaku":
+    normalized_model_type = model_type.replace("_", "").lower()
+
+    if normalized_model_type == "nunchaku":
         is_nunchaku = True
-    elif model_type == "qwen":
+    elif normalized_model_type == "qwen":
         is_qwen = True
-    elif model_type == "z_image":
-        is_z_image = True
+    elif normalized_model_type == "zimage":
+        is_zimage = True
     elif model_type == "flux":
-        pass
+        pass # defaults false
     else: # auto
         if hasattr(m.model, "diffusion_model"):
             dm = m.model.diffusion_model
             model_class_name = dm.__class__.__name__
 
-            # ToDo: add normal logging
             if "QwenImage" in model_class_name:
                 is_qwen = True
-                # print("[DyPE] Auto-detected Qwen Image model.")
-            elif hasattr(dm, "rope_embedder"):
-                is_z_image = True
-                # print("[DyPE] Auto-detected Z-Image / NextDiT model.")
+            elif "NextDiT" in model_class_name or hasattr(dm, "rope_embedder"):
+                is_zimage = True
             elif hasattr(dm, "model") and hasattr(dm.model, "pos_embed"):
                 is_nunchaku = True
-                # print("[DyPE] Auto-detected Nunchaku Flux model.")
             elif hasattr(dm, "pe_embedder"):
-                # print("[DyPE] Auto-detected Standard Flux model.")
                 pass
             else:
-                # print("[DyPE] Warning: Could not auto-detect model type. Assuming Standard Flux.")
                 pass
         else:
             raise ValueError("The provided model is not a compatible model.")
 
-    new_dype_params = (width, height, base_shift, max_shift, method, yarn_alt_scaling, base_resolution, dype_start_sigma, is_nunchaku, is_qwen, is_z_image)
+    new_dype_params = (width, height, base_shift, max_shift, method, yarn_alt_scaling, base_resolution, dype_start_sigma, is_nunchaku, is_qwen, is_zimage)
 
     should_patch_schedule = True
     if hasattr(m.model, "_dype_params"):
         if m.model._dype_params == new_dype_params:
             should_patch_schedule = False
+        else:
+            pass
 
     base_patch_h_tokens = None
     base_patch_w_tokens = None
-    if is_z_image:
+    if is_zimage:
         axes_lens = getattr(m.model.diffusion_model, "axes_lens", None)
         if isinstance(axes_lens, (list, tuple)) and len(axes_lens) >= 3:
             base_patch_h_tokens = int(axes_lens[1])
@@ -83,7 +82,7 @@ def apply_dype_to_model(model: ModelPatcher, model_type: str, width: int, height
 
     if enable_dype and should_patch_schedule:
         try:
-            if isinstance(m.model.model_sampling, model_sampling.ModelSamplingFlux) or is_qwen or is_z_image:
+            if isinstance(m.model.model_sampling, model_sampling.ModelSamplingFlux) or is_qwen or is_zimage:
                 latent_h, latent_w = height // 8, width // 8
                 padded_h, padded_w = math.ceil(latent_h / patch_size) * patch_size, math.ceil(latent_w / patch_size) * patch_size
                 image_seq_len = (padded_h // patch_size) * (padded_w // patch_size)
@@ -122,7 +121,7 @@ def apply_dype_to_model(model: ModelPatcher, model_type: str, width: int, height
         if is_nunchaku:
             orig_embedder = m.model.diffusion_model.model.pos_embed
             target_patch_path = "diffusion_model.model.pos_embed"
-        elif is_z_image:
+        elif is_zimage:
             orig_embedder = m.model.diffusion_model.rope_embedder
             target_patch_path = "diffusion_model.rope_embedder"
         else:
@@ -131,26 +130,26 @@ def apply_dype_to_model(model: ModelPatcher, model_type: str, width: int, height
 
         theta, axes_dim = orig_embedder.theta, orig_embedder.axes_dim
     except AttributeError:
-        raise ValueError("The provided model is not a compatible FLUX/Qwen model structure.")
+        raise ValueError("The provided model is not a compatible FLUX/Qwen/Z-Image model structure.")
 
     embedder_cls = PosEmbedFlux
     if is_nunchaku:
         embedder_cls = PosEmbedNunchaku
     elif is_qwen:
         embedder_cls = PosEmbedQwen
-    elif is_z_image:
+    elif is_zimage:
         embedder_cls = PosEmbedZImage
 
-    embedder_base_patches = derived_base_patches if is_z_image else None
+    embedder_base_patches = derived_base_patches if is_zimage else None
 
     new_pe_embedder = embedder_cls(
         theta, axes_dim, method, yarn_alt_scaling, enable_dype,
         dype_scale, dype_exponent, base_resolution, dype_start_sigma, embedder_base_patches
     )
-        
+
     m.add_object_patch(target_patch_path, new_pe_embedder)
 
-    if is_z_image:
+    if is_zimage:
         base_hw_override = None
         if base_patch_h_tokens is not None and base_patch_w_tokens is not None:
             base_hw_override = (base_patch_h_tokens, base_patch_w_tokens)
@@ -247,18 +246,18 @@ def apply_dype_to_model(model: ModelPatcher, model_type: str, width: int, height
             return padded_full_embed, mask, img_sizes, l_effective_cap_len, freqs_cis
 
         m.add_object_patch("diffusion_model.patchify_and_embed", types.MethodType(dype_patchify_and_embed, m.model.diffusion_model))
-    
+
     sigma_max = m.model.model_sampling.sigma_max.item()
-    
+
     def dype_wrapper_function(model_function, args_dict):
         timestep_tensor = args_dict.get("timestep")
         if timestep_tensor is not None and timestep_tensor.numel() > 0:
             current_sigma = timestep_tensor.flatten()[0].item()
-            
+
             if sigma_max > 0:
                 normalized_timestep = min(max(current_sigma / sigma_max, 0.0), 1.0)
                 new_pe_embedder.set_timestep(normalized_timestep)
-        
+
         input_x, c = args_dict.get("input"), args_dict.get("c", {})
         return model_function(input_x, args_dict.get("timestep"), **c)
 

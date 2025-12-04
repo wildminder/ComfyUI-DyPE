@@ -60,6 +60,9 @@ class DyPEBasePosEmbed(nn.Module):
         t_factor = math.pow(t_norm, self.dype_exponent)
         current_mscale = mscale_end + (mscale_start - mscale_end) * t_factor
 
+        # Low Theta Heuristic (Z-Image / Lumina)
+        force_isotropic = self.theta < 1000.0
+
         for i in range(n_axes):
             axis_pos = pos[..., i]
             axis_dim = self.axes_dim[i]
@@ -85,7 +88,12 @@ class DyPEBasePosEmbed(nn.Module):
 
             if i > 0:
                 scale_local = max(1.0, current_patches / self.base_patches)
-                dype_kwargs['linear_scale'] = scale_local 
+                
+                # Apply Low Theta protection
+                if force_isotropic:
+                    dype_kwargs['linear_scale'] = 1.0
+                else:
+                    dype_kwargs['linear_scale'] = scale_local 
                 
                 if scale_global > 1.0:
                     cos, sin = get_1d_dype_yarn_pos_embed(
@@ -119,7 +127,10 @@ class DyPEBasePosEmbed(nn.Module):
 
         needs_extrapolation = (max_current_patches > self.base_patches)
 
-        if needs_extrapolation and self.yarn_alt_scaling:
+        force_isotropic = self.theta < 1000.0
+        use_anisotropic = self.yarn_alt_scaling and not force_isotropic
+
+        if needs_extrapolation and use_anisotropic:
             for i in range(n_axes):
                 axis_pos = pos[..., i]
                 axis_dim = self.axes_dim[i]
@@ -207,7 +218,7 @@ class DyPEBasePosEmbed(nn.Module):
             return self._calc_vision_yarn_components(pos, freqs_dtype)
         elif self.method == 'yarn':
             return self._calc_yarn_components(pos, freqs_dtype)
-        else:
+        else: # 'ntk' or 'base'
             return self._calc_ntk_components(pos, freqs_dtype)
             
     def forward(self, ids: torch.Tensor) -> torch.Tensor:

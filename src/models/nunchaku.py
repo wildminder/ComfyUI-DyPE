@@ -60,7 +60,9 @@ class PosEmbedNunchaku(DyPEBasePosEmbed):
             rope_i = self._axis_rope_from_cos_sin(cos, sin)
             emb_parts.append(rope_i)
 
-        emb = torch.cat(emb_parts, dim=-3)
+        # Concatenate along axis dimension: dim = -3
+        # shape: (B, M, D_total//2, 1, 2)
+        emb = torch.cat(emb_parts, dim=-3)  
 
         out = emb.unsqueeze(1).to(ids.device)
         return out

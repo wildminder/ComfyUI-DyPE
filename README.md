@@ -1,13 +1,11 @@
-<a id="readme-top"></a>
-
-<div align="center">
+<div id="readme-top" align="center">
   <h1 align="center">ComfyUI-DyPE</h1>
 
 <img src="https://github.com/user-attachments/assets/4f11966b-86f7-4bdb-acd4-ada6135db2f8" alt="ComfyUI-DyPE Banner" width="70%">
 
   
   <p align="center">
-    A ComfyUI custom node that implements <strong>DyPE (Dynamic Position Extrapolation)</strong>, enabling Diffusion Transformers (like <strong>FLUX</strong> and <strong>Qwen Image</strong>) to generate ultra-high-resolution images (4K and beyond) with exceptional coherence and detail.
+    A ComfyUI custom node that implements <strong>DyPE (Dynamic Position Extrapolation)</strong>, enabling Diffusion Transformers (like <strong>FLUX</strong>, <strong>Qwen Image</strong>, and <strong>Z-Image</strong>) to generate ultra-high-resolution images (4K and beyond) with exceptional coherence and detail.
     <br />
     <br />
     <a href="https://github.com/wildminder/ComfyUI-DyPE/issues/new?labels=bug&template=bug-report---.md">Report Bug</a>
@@ -44,7 +42,7 @@ It works by taking advantage of the spectral progression inherent to the diffusi
 This node provides a seamless, "plug-and-play" integration of DyPE into your workflow.
 
 **✨ Key Features:**
-*   **Multi-Architecture Support:** Now supports **FLUX** (Standard), **Nunchaku** (Quantized Flux), and **Qwen Image**.
+*   **Multi-Architecture Support:** Supports **FLUX** (Standard), **Nunchaku** (Quantized Flux), **Qwen Image**, and **Z-Image** (Lumina 2).
 *   **High-Resolution Generation:** Push models to 4096x4096 and beyond.
 *   **Single-Node Integration:** Simply place the `DyPE for FLUX` node after your model loader to patch the model. No complex workflow changes required.
 *   **Full Compatibility:** Works seamlessly with your existing ComfyUI workflows, samplers, schedulers, and other optimization nodes.
@@ -84,7 +82,7 @@ Alternatively, to install manually:
 
 Using the node is straightforward and designed for minimal workflow disruption.
 
-1.  **Load Your Model:** Use your preferred loader (e.g., `Load Checkpoint` for Flux, `Nunchaku Flux DiT Loader`, or a Qwen loader).
+1.  **Load Your Model:** Use your preferred loader (e.g., `Load Checkpoint` for Flux, `Nunchaku Flux DiT Loader`, or `ZImage` loader).
 2.  **Add the DyPE Node:** Add the `DyPE for FLUX` node to your graph (found under `model_patches/unet`).
 3.  **Connect the Model:** Connect the `MODEL` output from your loader to the `model` input of the DyPE node.
 4.  **Set Resolution:** Set the `width` and `height` on the DyPE node to match the resolution of your `Empty Latent Image`.
@@ -98,12 +96,13 @@ Using the node is straightforward and designed for minimal workflow disruption.
 
 #### 1. Model Configuration
 *   **`model_type`**:
-    *   **`auto`**: Attempts to automatically detect the model architecture (Flux, Nunchaku, or Qwen). Recommended.
+    *   **`auto`**: Attempts to automatically detect the model architecture. Recommended.
     *   **`flux`**: Forces Standard Flux logic.
     *   **`nunchaku`**: Forces Nunchaku (Quantized Flux) logic.
     *   **`qwen`**: Forces Qwen Image logic.
+    *   **`zimage`**: Forces Z-Image (Lumina 2) logic.
 *   **`base_resolution`**: The native resolution the model was trained on.
-    *   Flux: `1024`
+    *   Flux / Z-Image: `1024`
     *   Qwen: `1328` (Recommended setting for Qwen models)
 
 #### 2. Method Selection
@@ -118,6 +117,10 @@ Using the node is straightforward and designed for minimal workflow disruption.
     *   **Anisotropic (High-Res):** Scales Height and Width independently. Can cause geometric stretching if the aspect ratio differs significantly from the training data.
     *   **Isotropic (Stable Default):** Scales both dimensions based on the largest axis. .
     *   *Note: `vision_yarn` automatically handles this balance internally, so this switch is ignored when `vision_yarn` is selected.*
+
+> [!TIP]
+> **Z-Image Usage:** Z-Image models have a very low RoPE base frequency (`theta=256`). This makes anisotropic scaling unstable (vertical stretching). The node automatically detects this and forces isotropic behavior in `vision_yarn` mode for Z-Image. We recommend using `vision_yarn` or `ntk` for Z-Image.
+
 #### 3. Dynamic Control
 *   **`enable_dype`**: Enables or disables the **dynamic, time-aware** component of DyPE.
     *   **Enabled (True):** Both the noise schedule and RoPE will be dynamically adjusted throughout sampling. This is the full DyPE algorithm.
@@ -134,6 +137,9 @@ Using the node is straightforward and designed for minimal workflow disruption.
 <p align="right">(<a href="#readme-top">back to top</a>)</p>
 
 ## Changelog
+
+#### v2.2
+*   **Z-Image Support:** Added experimental support for **Z-Image (Lumina 2)** architecture.
 
 #### v2.1
 *   **New Architecture Support:** Added support for **Qwen Image** and **Nunchaku** (Quantized Flux) models.

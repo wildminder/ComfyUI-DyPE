@@ -1,7 +1,7 @@
 [project]
 name = "ComfyUI-DyPE"
-description = "DyPE. Artifact-free 4K+ image generation. Qwen, Flux, Nunchacku"
-version = "2.1.0"
+description = "DyPE. Artifact-free 4K+ image generation. Qwen, Flux, Nunchacku, Z-Image"
+version = "2.2.0"
 license = {file = "LICENSE"}
 dependencies = ["torch"]
 
