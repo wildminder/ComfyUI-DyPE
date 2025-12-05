@@ -19,7 +19,12 @@ class DyPEBasePosEmbed(nn.Module):
         self.dype_scale = dype_scale
         self.dype_exponent = dype_exponent
         self.base_resolution = base_resolution
-        self.dype_start_sigma = max(0.001, min(1.0, dype_start_sigma)) # Clamp 0.001-1.0
+
+        is_z_image = self.__class__.__name__.lower().endswith("zimage")
+        if is_z_image:
+            self.dype_start_sigma = 1.0
+        else:
+            self.dype_start_sigma = max(0.001, min(1.0, dype_start_sigma)) # Clamp 0.001-1.0
         
         self.current_timestep = 1.0
         
