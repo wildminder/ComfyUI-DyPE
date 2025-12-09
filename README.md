@@ -119,7 +119,10 @@ Using the node is straightforward and designed for minimal workflow disruption.
     *   *Note: `vision_yarn` automatically handles this balance internally, so this switch is ignored when `vision_yarn` is selected.*
 
 > [!TIP]
-> **Z-Image Usage:** Z-Image models have a very low RoPE base frequency (`theta=256`). This makes anisotropic scaling unstable (vertical stretching). The node automatically detects this and forces isotropic behavior in `vision_yarn` mode for Z-Image. We recommend using `vision_yarn` or `ntk` for Z-Image.
+> **Z-Image (Lumina 2) Specifics:** 
+> *   Z-Image models use a very low RoPE base frequency (`theta=256`).
+> *   **Geometric Stretching:** To prevent vertical stretching, the node automatically enforces **Isotropic Scaling** for Z-Image, regardless of user settings.
+> *   **Method Choice:** recommend **`vision_yarn`** or **`ntk`**. Standard `yarn` may produce artifacts.
 
 #### 3. Dynamic Control
 *   **`enable_dype`**: Enables or disables the **dynamic, time-aware** component of DyPE.
@@ -138,20 +141,24 @@ Using the node is straightforward and designed for minimal workflow disruption.
 
 ## Changelog
 
-#### v2.2
+#### v2.3.0
+*   **Z-Image Overhaul:** Fixed geometric stretching artifacts
+*   **Method Fixes**
+
+#### v2.2.0
 *   **Z-Image Support:** Added experimental support for **Z-Image (Lumina 2)** architecture.
 
-#### v2.1
+#### v2.1.0
 *   **New Architecture Support:** Added support for **Qwen Image** and **Nunchaku** (Quantized Flux) models.
 *   **Modular Architecture:** Refactored codebase into a modular adapter pattern (`src/models/`) to ensure stability and easier updates for future models.
 *   **UI Updates:** Added `model_type` selector for explicit model definition.
 
-#### v2.0
+#### v2.0.0
 *   **Vision-YaRN:** Introduced the `vision_yarn` method for decoupled aspect-ratio handling.
 *   **Dynamic Attention:** Implemented quadratic decay schedule for `mscale` to balance sharpness and artifacts.
 *   **Start Sigma:** Added `dype_start_sigma` control.
 
-#### v1.0
+#### v1.0.0
 *   **Initial Release:** Core DyPE implementation for Standard Flux models.
 *   **Basic Modes:** Support for `yarn` (Isotropic/Anisotropic) and `ntk`.
 
@@ -162,6 +169,14 @@ Using the node is straightforward and designed for minimal workflow disruption.
 > [!IMPORTANT]
 > **Limitations at Extreme Resolutions (4K)**
 > While DyPE significantly extends the capabilities of DiT models, generating perfectly clean 4096x4096 images is still a limitation of the base model itself. Even with DyPE, you are pushing a model trained on ~1 megapixel to generate 16 megapixels. You may still encounter minor artifacts at these extreme scales.
+
+> [!TIP]
+> **Dealing with Speckle Noise**
+> At extreme resolutions (4K+), you may notice high-frequency "speckle" noise in focused areas (e.g., hair, eyes). This is a side effect of scaling the model's attention mechanism beyond its training limits.
+> 
+> **How to fix:**
+> 1.  **Increase `dype_exponent`:** Try raising this to `3.0` or `4.0` or any other higher values.
+> 2.  **Use LoRAs:** Smoothing or "Detailer" LoRAs can help suppress high-frequency artifacts.
 
 > [!TIP]
 > **Experimentation is Required**
@@ -193,12 +208,6 @@ Beyond the code, I believe in the power of community and continuous learning. I 
 </table>
 
 <p align="center">══════════════════════════════════</p>
-
-<p align="right">(<a href="#readme-top">back to top</a>)</p>
-
-<!-- LICENSE -->
-## License
-The original DyPE project is patent pending. For commercial use or licensing inquiries regarding the underlying method, please contact the [original authors](mailto:noam.issachar@mail.huji.ac.il).
 
 <p align="right">(<a href="#readme-top">back to top</a>)</p>
 
