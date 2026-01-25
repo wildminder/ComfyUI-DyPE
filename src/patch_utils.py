@@ -149,7 +149,7 @@ def apply_dype_to_model(model: ModelPatcher, model_type: str, width: int, height
         if base_hw_override is not None:
             m.model.diffusion_model._dype_base_hw = base_hw_override
 
-        def dype_patchify_and_embed(self, x, cap_feats, cap_mask, t, num_tokens, transformer_options={}):
+        def dype_patchify_and_embed(self, x, cap_feats, cap_mask, t, num_tokens, transformer_options={}, **kwargs):
             bsz = len(x)
             pH = pW = self.patch_size
             device = x[0].device
