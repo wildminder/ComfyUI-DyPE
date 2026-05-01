@@ -86,7 +86,7 @@ def apply_dype_to_model(model: ModelPatcher, model_type: str, width: int, height
                 image_seq_len = (padded_h // patch_size) * (padded_w // patch_size)
 
                 base_seq_len = derived_base_seq_len
-                max_seq_len = image_seq_len
+                max_seq_len = derived_base_seq_len * 4
 
                 if is_anima:
                     native_shift = getattr(m.model.model_sampling, "shift", 3.0)
