@@ -78,9 +78,9 @@ def apply_dype_to_model(model: ModelPatcher, model_type: str, width: int, height
         derived_base_patches = (base_resolution // 8) // 2
         derived_base_seq_len = derived_base_patches * derived_base_patches
 
-    if enable_dype and should_patch_schedule:
+    if enable_dype and should_patch_schedule and not is_anima:
         try:
-            if isinstance(m.model.model_sampling, model_sampling.ModelSamplingFlux) or is_qwen or is_z_image or is_anima:
+            if isinstance(m.model.model_sampling, model_sampling.ModelSamplingFlux) or is_qwen or is_z_image:
                 latent_h, latent_w = height // 8, width // 8
                 padded_h, padded_w = math.ceil(latent_h / patch_size) * patch_size, math.ceil(latent_w / patch_size) * patch_size
                 image_seq_len = (padded_h // patch_size) * (padded_w // patch_size)
@@ -88,13 +88,8 @@ def apply_dype_to_model(model: ModelPatcher, model_type: str, width: int, height
                 base_seq_len = derived_base_seq_len
                 max_seq_len = derived_base_seq_len * 4
 
-                if is_anima:
-                    native_shift = getattr(m.model.model_sampling, "shift", 3.0)
-                    effective_base_shift = native_shift
-                    effective_max_shift = native_shift * (max_shift / base_shift) if base_shift > 0 else max_shift
-                else:
-                    effective_base_shift = base_shift
-                    effective_max_shift = max_shift
+                effective_base_shift = base_shift
+                effective_max_shift = max_shift
 
                 if max_seq_len <= base_seq_len:
                     dype_shift = effective_base_shift
@@ -105,31 +100,20 @@ def apply_dype_to_model(model: ModelPatcher, model_type: str, width: int, height
 
                 dype_shift = max(0.0, dype_shift)
 
-                if is_anima:
-                    class DypeModelSamplingFlow(model_sampling.ModelSamplingDiscreteFlow, model_sampling.CONST):
-                        pass
-                    new_model_sampler = DypeModelSamplingFlow(m.model.model_config)
-                    orig_multiplier = getattr(m.model.model_sampling, "multiplier", 1.0)
-                    new_model_sampler.set_parameters(shift=dype_shift, multiplier=orig_multiplier)
-                else:
-                    class DypeModelSamplingFlux(model_sampling.ModelSamplingFlux, model_sampling.CONST):
-                        pass
-                    new_model_sampler = DypeModelSamplingFlux(m.model.model_config)
-                    new_model_sampler.set_parameters(shift=dype_shift)
+                class DypeModelSamplingFlux(model_sampling.ModelSamplingFlux, model_sampling.CONST):
+                    pass
+                new_model_sampler = DypeModelSamplingFlux(m.model.model_config)
+                new_model_sampler.set_parameters(shift=dype_shift)
 
                 m.add_object_patch("model_sampling", new_model_sampler)
                 m.model._dype_params = new_dype_params
         except:
             pass
 
-    elif not enable_dype:
+    elif not enable_dype and not is_anima:
         if hasattr(m.model, "_dype_params"):
-            if is_anima:
-                class DefaultModelSamplingFlow(model_sampling.ModelSamplingDiscreteFlow, model_sampling.CONST): pass
-                default_sampler = DefaultModelSamplingFlow(m.model.model_config)
-            else:
-                class DefaultModelSamplingFlux(model_sampling.ModelSamplingFlux, model_sampling.CONST): pass
-                default_sampler = DefaultModelSamplingFlux(m.model.model_config)
+            class DefaultModelSamplingFlux(model_sampling.ModelSamplingFlux, model_sampling.CONST): pass
+            default_sampler = DefaultModelSamplingFlux(m.model.model_config)
             m.add_object_patch("model_sampling", default_sampler)
             del m.model._dype_params
 
