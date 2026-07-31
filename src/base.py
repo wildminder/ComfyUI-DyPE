@@ -9,10 +9,15 @@ class DyPEBasePosEmbed(nn.Module):
     Handles the calculation of DyPE scaling factors and raw (cos, sin) components.
     Subclasses must implement `forward` to format the output for specific model architectures.
     """
-    def __init__(self, theta: int, axes_dim: list[int], method: str = 'yarn', yarn_alt_scaling: bool = False, dype: bool = True, dype_scale: float = 2.0, dype_exponent: float = 2.0, base_resolution: int = 1024, dype_start_sigma: float = 1.0, base_patch_grid: tuple[int, int] = None):
+    def __init__(self, theta, axes_dim: list[int], method: str = 'yarn', yarn_alt_scaling: bool = False, dype: bool = True, dype_scale: float = 2.0, dype_exponent: float = 2.0, base_resolution: int = 1024, dype_start_sigma: float = 1.0, base_patch_grid: tuple[int, int] = None):
         super().__init__()
         self.theta = theta
         self.axes_dim = axes_dim
+        # per-axis thetas: if list/tuple, use theta[i]; otherwise use scalar theta for all
+        if isinstance(theta, (list, tuple)):
+            self.thetas = list(theta)
+        else:
+            self.thetas = None
         self.method = method
         self.yarn_alt_scaling = yarn_alt_scaling
         self.dype = True if method == 'vision_yarn' else (dype if method != 'base' else False)
@@ -84,7 +89,8 @@ class DyPEBasePosEmbed(nn.Module):
             axis_dim = self.axes_dim[i]
             current_patches = self._axis_token_span(axis_pos)
             
-            common_kwargs = {'dim': axis_dim, 'pos': axis_pos, 'theta': self.theta, 'use_real': True, 'repeat_interleave_real': True, 'freqs_dtype': freqs_dtype}
+            axis_theta = self.thetas[i] if self.thetas is not None else self.theta
+            common_kwargs = {'dim': axis_dim, 'pos': axis_pos, 'theta': axis_theta, 'use_real': True, 'repeat_interleave_real': True, 'freqs_dtype': freqs_dtype}
             dype_kwargs = {'dype': self.dype, 'current_timestep': self.current_timestep, 'dype_scale': self.dype_scale, 'dype_exponent': self.dype_exponent, 'ntk_scale': scale_global, 'override_mscale': current_mscale}
 
             if i > 0:
@@ -121,7 +127,8 @@ class DyPEBasePosEmbed(nn.Module):
             for i in range(n_axes):
                 axis_pos = pos[..., i]
                 axis_dim = self.axes_dim[i]
-                common_kwargs = {'dim': axis_dim, 'pos': axis_pos, 'theta': self.theta, 'use_real': True, 'repeat_interleave_real': True, 'freqs_dtype': freqs_dtype}
+                axis_theta = self.thetas[i] if self.thetas is not None else self.theta
+                common_kwargs = {'dim': axis_dim, 'pos': axis_pos, 'theta': axis_theta, 'use_real': True, 'repeat_interleave_real': True, 'freqs_dtype': freqs_dtype}
                 dype_kwargs = {'dype': self.dype, 'current_timestep': self.current_timestep, 'dype_scale': self.dype_scale, 'dype_exponent': self.dype_exponent}
 
                 current_patches = self._axis_token_span(axis_pos)
@@ -138,10 +145,11 @@ class DyPEBasePosEmbed(nn.Module):
             cos_full_spatial, sin_full_spatial = None, None
             if needs_extrapolation:
                 spatial_axis_dim = self.axes_dim[1]
+                spatial_theta = self.thetas[1] if self.thetas is not None else self.theta
                 square_pos = torch.arange(0, max_current_patches, device=pos.device).float()
                 max_pe_len = torch.tensor(max_current_patches, dtype=freqs_dtype, device=pos.device)
                 
-                common_kwargs_spatial = {'dim': spatial_axis_dim, 'theta': self.theta, 'use_real': True, 'repeat_interleave_real': True, 'freqs_dtype': freqs_dtype}
+                common_kwargs_spatial = {'dim': spatial_axis_dim, 'theta': spatial_theta, 'use_real': True, 'repeat_interleave_real': True, 'freqs_dtype': freqs_dtype}
                 dype_kwargs = {'dype': self.dype, 'current_timestep': self.current_timestep, 'dype_scale': self.dype_scale, 'dype_exponent': self.dype_exponent}
 
                 cos_full_spatial, sin_full_spatial = get_1d_yarn_pos_embed(
@@ -151,6 +159,7 @@ class DyPEBasePosEmbed(nn.Module):
             for i in range(n_axes):
                 axis_pos = pos[..., i]
                 axis_dim = self.axes_dim[i]
+                axis_theta = self.thetas[i] if self.thetas is not None else self.theta
                 
                 if i > 0 and needs_extrapolation:
                     offset_indices = axis_pos.long() - axis_pos.long().min()
@@ -160,7 +169,7 @@ class DyPEBasePosEmbed(nn.Module):
                     cos = cos_full_spatial[pos_indices].view(*axis_pos.shape, -1)
                     sin = sin_full_spatial[pos_indices].view(*axis_pos.shape, -1)
                 else:
-                    common_kwargs = {'dim': axis_dim, 'pos': axis_pos, 'theta': self.theta, 'use_real': True, 'repeat_interleave_real': True, 'freqs_dtype': freqs_dtype}
+                    common_kwargs = {'dim': axis_dim, 'pos': axis_pos, 'theta': axis_theta, 'use_real': True, 'repeat_interleave_real': True, 'freqs_dtype': freqs_dtype}
                     cos, sin = get_1d_ntk_pos_embed(**common_kwargs, ntk_factor=1.0)
 
                 components.append((cos, sin))
@@ -182,7 +191,8 @@ class DyPEBasePosEmbed(nn.Module):
         for i in range(n_axes):
             axis_pos = pos[..., i]
             axis_dim = self.axes_dim[i]
-            common_kwargs = {'dim': axis_dim, 'pos': axis_pos, 'theta': self.theta, 'use_real': True, 'repeat_interleave_real': True, 'freqs_dtype': freqs_dtype}
+            axis_theta = self.thetas[i] if self.thetas is not None else self.theta
+            common_kwargs = {'dim': axis_dim, 'pos': axis_pos, 'theta': axis_theta, 'use_real': True, 'repeat_interleave_real': True, 'freqs_dtype': freqs_dtype}
             
             ntk_factor = 1.0
             if i > 0 and scale_global > 1.0:

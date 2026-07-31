@@ -10,6 +10,7 @@ from .models.flux import PosEmbedFlux
 from .models.nunchaku import PosEmbedNunchaku
 from .models.qwen import PosEmbedQwen
 from .models.zimage import PosEmbedZImage
+from .models.anima import PosEmbedAnima
 
 def apply_dype_to_model(model: ModelPatcher, model_type: str, width: int, height: int, method: str, yarn_alt_scaling: bool, enable_dype: bool, dype_scale: float, dype_exponent: float, base_shift: float, max_shift: float, base_resolution: int = 1024, dype_start_sigma: float = 1.0) -> ModelPatcher:
     m = model.clone()
@@ -17,6 +18,7 @@ def apply_dype_to_model(model: ModelPatcher, model_type: str, width: int, height
     is_nunchaku = False
     is_qwen = False
     is_z_image = False
+    is_anima = False
 
     if model_type == "nunchaku":
         is_nunchaku = True
@@ -24,6 +26,8 @@ def apply_dype_to_model(model: ModelPatcher, model_type: str, width: int, height
         is_qwen = True
     elif model_type == "z_image":
         is_z_image = True
+    elif model_type == "anima":
+        is_anima = True
     elif model_type == "flux":
         pass
     else: # auto
@@ -36,10 +40,12 @@ def apply_dype_to_model(model: ModelPatcher, model_type: str, width: int, height
                 is_z_image = True
             elif hasattr(dm, "model") and hasattr(dm.model, "pos_embed"):
                 is_nunchaku = True
+            elif hasattr(dm, "pos_embedder") and hasattr(dm.pos_embedder, "dim_spatial_range"):
+                is_anima = True
         else:
             raise ValueError("The provided model is not a compatible model.")
 
-    new_dype_params = (width, height, base_shift, max_shift, method, yarn_alt_scaling, base_resolution, dype_start_sigma, is_nunchaku, is_qwen, is_z_image)
+    new_dype_params = (width, height, base_shift, max_shift, method, yarn_alt_scaling, base_resolution, dype_start_sigma, is_nunchaku, is_qwen, is_z_image, is_anima)
 
     should_patch_schedule = True
     if hasattr(m.model, "_dype_params"):
@@ -58,6 +64,8 @@ def apply_dype_to_model(model: ModelPatcher, model_type: str, width: int, height
     try:
         if is_nunchaku:
             patch_size = m.model.diffusion_model.model.config.patch_size
+        elif is_anima:
+            patch_size = m.model.diffusion_model.patch_spatial
         else:
             patch_size = m.model.diffusion_model.patch_size
     except:
@@ -70,7 +78,7 @@ def apply_dype_to_model(model: ModelPatcher, model_type: str, width: int, height
         derived_base_patches = (base_resolution // 8) // 2
         derived_base_seq_len = derived_base_patches * derived_base_patches
 
-    if enable_dype and should_patch_schedule:
+    if enable_dype and should_patch_schedule and not is_anima:
         try:
             if isinstance(m.model.model_sampling, model_sampling.ModelSamplingFlux) or is_qwen or is_z_image:
                 latent_h, latent_w = height // 8, width // 8
@@ -78,20 +86,22 @@ def apply_dype_to_model(model: ModelPatcher, model_type: str, width: int, height
                 image_seq_len = (padded_h // patch_size) * (padded_w // patch_size)
 
                 base_seq_len = derived_base_seq_len
-                max_seq_len = image_seq_len
+                max_seq_len = derived_base_seq_len * 4
+
+                effective_base_shift = base_shift
+                effective_max_shift = max_shift
 
                 if max_seq_len <= base_seq_len:
-                    dype_shift = base_shift
+                    dype_shift = effective_base_shift
                 else:
-                    slope = (max_shift - base_shift) / (max_seq_len - base_seq_len)
-                    intercept = base_shift - slope * base_seq_len
+                    slope = (effective_max_shift - effective_base_shift) / (max_seq_len - base_seq_len)
+                    intercept = effective_base_shift - slope * base_seq_len
                     dype_shift = image_seq_len * slope + intercept
 
                 dype_shift = max(0.0, dype_shift)
 
                 class DypeModelSamplingFlux(model_sampling.ModelSamplingFlux, model_sampling.CONST):
                     pass
-
                 new_model_sampler = DypeModelSamplingFlux(m.model.model_config)
                 new_model_sampler.set_parameters(shift=dype_shift)
 
@@ -100,7 +110,7 @@ def apply_dype_to_model(model: ModelPatcher, model_type: str, width: int, height
         except:
             pass
 
-    elif not enable_dype:
+    elif not enable_dype and not is_anima:
         if hasattr(m.model, "_dype_params"):
             class DefaultModelSamplingFlux(model_sampling.ModelSamplingFlux, model_sampling.CONST): pass
             default_sampler = DefaultModelSamplingFlux(m.model.model_config)
@@ -114,11 +124,28 @@ def apply_dype_to_model(model: ModelPatcher, model_type: str, width: int, height
         elif is_z_image:
             orig_embedder = m.model.diffusion_model.rope_embedder
             target_patch_path = "diffusion_model.rope_embedder"
+        elif is_anima:
+            orig_embedder = m.model.diffusion_model.pos_embedder
+            target_patch_path = "diffusion_model.pos_embedder"
         else:
             orig_embedder = m.model.diffusion_model.pe_embedder
             target_patch_path = "diffusion_model.pe_embedder"
 
-        theta, axes_dim = orig_embedder.theta, orig_embedder.axes_dim
+        if is_anima:
+            theta_base = 10000.0
+            dm = m.model.diffusion_model
+            head_dim = dm.model_channels // dm.num_heads
+            dim_h = head_dim // 6 * 2
+            dim_t = head_dim - 2 * dim_h
+            dim_w = dim_h
+            axes_dim = [dim_t, dim_h, dim_w]
+            # Cosmos uses per-axis NTK even at native resolution
+            t_ntk = getattr(orig_embedder, "t_ntk_factor", 1.0)
+            h_ntk = getattr(orig_embedder, "h_ntk_factor", 1.0)
+            w_ntk = getattr(orig_embedder, "w_ntk_factor", 1.0)
+            theta = [theta_base * t_ntk, theta_base * h_ntk, theta_base * w_ntk]
+        else:
+            theta, axes_dim = orig_embedder.theta, orig_embedder.axes_dim
     except AttributeError:
         raise ValueError("The provided model is not a compatible FLUX/Qwen model structure.")
 
@@ -129,6 +156,8 @@ def apply_dype_to_model(model: ModelPatcher, model_type: str, width: int, height
         embedder_cls = PosEmbedQwen
     elif is_z_image:
         embedder_cls = PosEmbedZImage
+    elif is_anima:
+        embedder_cls = PosEmbedAnima
 
     embedder_base_patches = derived_base_patches if is_z_image else None
 
