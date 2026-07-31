@@ -18,7 +18,17 @@ from .models.zimage import PosEmbedZImage
 _DYPE_PARAMS_ATTR = "_comfyui_dype_params"
 
 
+def _snap_to_multiple(value: int, multiple: int = 16) -> int:
+    """Round value to the nearest multiple (minimum = multiple)."""
+    snapped = max(multiple, round(value / multiple) * multiple)
+    return snapped
+
+
 def apply_dype_to_model(model: ModelPatcher, model_type: str, width: int, height: int, method: str, yarn_alt_scaling: bool, enable_dype: bool, dype_scale: float, dype_exponent: float, base_shift: float, max_shift: float, base_resolution: int = 1024, dype_start_sigma: float = 1.0) -> ModelPatcher:
+    # Snap resolution to nearest multiple of 16 for latent space compatibility
+    width = _snap_to_multiple(width, 16)
+    height = _snap_to_multiple(height, 16)
+
     m = model.clone()
 
     is_nunchaku = False

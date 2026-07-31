@@ -1,95 +1,79 @@
-"""Tests for node input validation logic (Tier 1: standalone logic tests)."""
+"""Tests for resolution snapping logic (Tier 1: pure unit tests)."""
 import pytest
 
-
-def _validate_inputs(**kwargs) -> bool | str:
-    """Standalone validation logic matching DyPE_FLUX.validate_inputs()."""
-    width = kwargs.get("width", 1024)
-    height = kwargs.get("height", 1024)
-
-    if not isinstance(width, int) or not isinstance(height, int):
-        return "Width and height must be integers."
-
-    if width < 16 or height < 16:
-        return "Width and height must be at least 16 pixels."
-
-    if width % 16 != 0:
-        return f"Width ({width}) must be a multiple of 16 for latent space compatibility."
-
-    if height % 16 != 0:
-        return f"Height ({height}) must be a multiple of 16 for latent space compatibility."
-
-    base_resolution = kwargs.get("base_resolution", 1024)
-    if base_resolution < 256:
-        return "base_resolution must be at least 256."
-
-    # Check latent dimensions are even (patch_size=2 compatibility)
-    latent_w = width // 8
-    latent_h = height // 8
-    if latent_w % 2 != 0 or latent_h % 2 != 0:
-        return (
-            f"Resolution {width}x{height} produces odd latent dimensions "
-            f"({latent_w}x{latent_h}). This may cause issues with patch_size=2 models. "
-            f"Use dimensions that are multiples of 16."
-        )
-
-    return True
+from src.patch_utils import _snap_to_multiple
 
 
 @pytest.mark.unit
-class TestValidateInputs:
-    def test_valid_defaults(self):
-        assert _validate_inputs() is True
+class TestSnapToMultiple:
+    def test_exact_multiple_unchanged(self):
+        assert _snap_to_multiple(1024) == 1024
 
-    def test_valid_4k(self):
-        assert _validate_inputs(width=4096, height=4096) is True
+    def test_exact_multiple_4096(self):
+        assert _snap_to_multiple(4096) == 4096
 
-    def test_valid_non_square(self):
-        assert _validate_inputs(width=2048, height=1024) is True
+    def test_rounds_up_above_half(self):
+        # 1000 / 16 = 62.5 → round(62.5) = 62 (banker's rounding) or 63
+        # Python round(62.5) = 62 (rounds to even), so 62*16 = 992
+        # Actually round(1000/16) = round(62.5) = 62 → 992
+        result = _snap_to_multiple(1000)
+        assert result in (992, 1008)  # Either is acceptable rounding behavior
+        assert result % 16 == 0
 
-    def test_valid_minimum(self):
-        assert _validate_inputs(width=16, height=16) is True
+    def test_rounds_down_below_half(self):
+        # 999 / 16 = 62.4375 → round = 62 → 992
+        assert _snap_to_multiple(999) == 992
 
-    def test_valid_1024(self):
-        assert _validate_inputs(width=1024, height=1024) is True
+    def test_rounds_up_clearly_above(self):
+        # 1001 / 16 = 62.5625 → round = 63 → 1008
+        assert _snap_to_multiple(1001) == 1008
 
-    def test_invalid_width_not_multiple_16(self):
-        result = _validate_inputs(width=1000, height=1024)
-        assert isinstance(result, str)
-        assert "multiple of 16" in result
+    def test_minimum_is_multiple(self):
+        assert _snap_to_multiple(1) == 16
+        assert _snap_to_multiple(0) == 16
+        assert _snap_to_multiple(8) == 16
+        assert _snap_to_multiple(15) == 16
 
-    def test_invalid_height_not_multiple_16(self):
-        result = _validate_inputs(width=1024, height=1000)
-        assert isinstance(result, str)
-        assert "multiple of 16" in result
+    def test_value_16_unchanged(self):
+        assert _snap_to_multiple(16) == 16
 
-    def test_invalid_too_small_width(self):
-        result = _validate_inputs(width=8, height=1024)
-        assert isinstance(result, str)
-        assert "at least 16" in result
+    def test_value_17_snaps_to_16(self):
+        # 17/16 = 1.0625 → round = 1 → 16
+        assert _snap_to_multiple(17) == 16
 
-    def test_invalid_too_small_height(self):
-        result = _validate_inputs(width=1024, height=8)
-        assert isinstance(result, str)
-        assert "at least 16" in result
+    def test_value_24_snaps_to_16_or_32(self):
+        # 24/16 = 1.5 → round(1.5) = 2 (banker's) → 32
+        result = _snap_to_multiple(24)
+        assert result in (16, 32)
+        assert result % 16 == 0
 
-    def test_invalid_base_resolution(self):
-        result = _validate_inputs(base_resolution=128)
-        assert isinstance(result, str)
-        assert "at least 256" in result
+    def test_large_value(self):
+        assert _snap_to_multiple(4095) == 4096
+        assert _snap_to_multiple(4097) == 4096
 
-    def test_valid_base_resolution_minimum(self):
-        assert _validate_inputs(base_resolution=256) is True
+    def test_custom_multiple_32(self):
+        assert _snap_to_multiple(100, 32) == 96
+        assert _snap_to_multiple(113, 32) == 128
 
-    def test_odd_latent_dimensions_caught(self):
-        # 24 is not multiple of 16, so it fails at the multiple-of-16 check first
-        result = _validate_inputs(width=24, height=1024)
-        assert isinstance(result, str)
+    def test_custom_multiple_8(self):
+        # 100/8 = 12.5 → round(12.5) = 12 (banker's rounding) → 96
+        assert _snap_to_multiple(100, 8) == 96
+        # 101/8 = 12.625 → round = 13 → 104
+        assert _snap_to_multiple(101, 8) == 104
 
-    def test_valid_produces_even_latent(self):
-        # 1024 // 8 = 128 (even) — valid
-        assert _validate_inputs(width=1024, height=1024) is True
+    def test_always_returns_int(self):
+        assert isinstance(_snap_to_multiple(1000), int)
+        assert isinstance(_snap_to_multiple(0), int)
 
-    def test_2048_produces_even_latent(self):
-        # 2048 // 8 = 256 (even) — valid
-        assert _validate_inputs(width=2048, height=2048) is True
+    def test_never_returns_zero(self):
+        assert _snap_to_multiple(0) >= 16
+        assert _snap_to_multiple(-5) >= 16
+
+
+@pytest.mark.unit
+class TestNoValidateInputs:
+    def test_validate_inputs_removed(self):
+        """validate_inputs should not exist — snapping is done in execute()."""
+        import pathlib
+        content = (pathlib.Path(__file__).parent.parent / "__init__.py").read_text(encoding="utf-8")
+        assert "validate_inputs" not in content

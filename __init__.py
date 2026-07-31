@@ -103,39 +103,6 @@ class DyPE_FLUX(io.ComfyNode):
         patched_model = apply_dype_to_model(model, model_type, width, height, method, yarn_alt_scaling, enable_dype, dype_scale, dype_exponent, base_shift, max_shift, base_resolution, dype_start_sigma)
         return io.NodeOutput(patched_model)
 
-    @classmethod
-    def validate_inputs(cls, **kwargs) -> bool | str:
-        width = kwargs.get("width", 1024)
-        height = kwargs.get("height", 1024)
-
-        if not isinstance(width, int) or not isinstance(height, int):
-            return "Width and height must be integers."
-
-        if width < 16 or height < 16:
-            return "Width and height must be at least 16 pixels."
-
-        if width % 16 != 0:
-            return f"Width ({width}) must be a multiple of 16 for latent space compatibility."
-
-        if height % 16 != 0:
-            return f"Height ({height}) must be a multiple of 16 for latent space compatibility."
-
-        base_resolution = kwargs.get("base_resolution", 1024)
-        if base_resolution < 256:
-            return "base_resolution must be at least 256."
-
-        # Check latent dimensions are even (patch_size=2 compatibility)
-        latent_w = width // 8
-        latent_h = height // 8
-        if latent_w % 2 != 0 or latent_h % 2 != 0:
-            return (
-                f"Resolution {width}x{height} produces odd latent dimensions "
-                f"({latent_w}x{latent_h}). This may cause issues with patch_size=2 models. "
-                f"Use dimensions that are multiples of 16."
-            )
-
-        return True
-
 class DyPEExtension(ComfyExtension):
     async def get_node_list(self) -> list[type[io.ComfyNode]]:
         return [DyPE_FLUX]
