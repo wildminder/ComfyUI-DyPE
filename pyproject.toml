@@ -5,6 +5,9 @@ version = "2.3.0"
 license = {file = "LICENSE"}
 dependencies = ["torch"]
 
+[project.optional-dependencies]
+test = ["pytest>=7.0", "pytest-cov>=4.0"]
+
 [project.urls]
 Repository = "https://github.com/wildminder/ComfyUI-DyPE"
 #  Used by Comfy Registry https://comfyregistry.org
@@ -13,3 +16,34 @@ Repository = "https://github.com/wildminder/ComfyUI-DyPE"
 PublisherId = "wildai"
 DisplayName = "ComfyUI-DyPE"
 Icon = ""
+requires-comfyui = ">=0.28.0"
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+python_files = ["test_*.py"]
+python_classes = ["Test*"]
+python_functions = ["test_*"]
+addopts = "-v --tb=short --import-mode=importlib"
+consider_namespace_packages = true
+pythonpath = ["."]
+markers = [
+    "unit: Pure unit test (no ComfyUI dependency)",
+    "mock_integration: Mock-based integration test",
+    "comfyui_integration: Requires real ComfyUI runtime (--comfyui-real)",
+]
+filterwarnings = [
+    "ignore::DeprecationWarning",
+    "ignore::PendingDeprecationWarning",
+]
+
+[tool.ruff]
+target-version = "py310"
+line-length = 120
+src = ["src", "tests"]
+
+[tool.ruff.lint]
+select = ["E", "F", "W", "I"]
+ignore = ["E501"]
+
+[tool.ruff.lint.isort]
+known-first-party = ["src"]

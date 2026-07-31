@@ -2,25 +2,30 @@ import torch
 import numpy as np
 import math
 
-def find_correction_factor(num_rotations, dim, base, max_position_embeddings):
+
+def find_correction_factor(num_rotations: float, dim: int, base: float, max_position_embeddings: int) -> float:
     return (dim * math.log(max_position_embeddings/(num_rotations * 2 * math.pi)))/(2 * math.log(base))
 
-def find_correction_range(low_ratio, high_ratio, dim, base, ori_max_pe_len):
+
+def find_correction_range(low_ratio: float, high_ratio: float, dim: int, base: float, ori_max_pe_len: int) -> tuple[float, float]:
     low = np.floor(find_correction_factor(low_ratio, dim, base, ori_max_pe_len))
     high = np.ceil(find_correction_factor(high_ratio, dim, base, ori_max_pe_len))
     return max(low, 0), min(high, dim-1)
 
-def linear_ramp_mask(min_val, max_val, dim):
+
+def linear_ramp_mask(min_val: float, max_val: float, dim: int) -> torch.Tensor:
     if min_val == max_val:
         max_val += 0.001
     linear_func = (torch.arange(dim, dtype=torch.float32) - min_val) / (max_val - min_val)
     ramp_func = torch.clamp(linear_func, 0, 1)
     return ramp_func
 
-def find_newbase_ntk(dim, base, scale):
+
+def find_newbase_ntk(dim: int, base: float, scale: float) -> float:
     return base * (scale ** (dim / (dim - 2)))
 
-# Magic is here...Vision YaRN
+
+# Vision YaRN with DyPE dynamic scheduling
 def get_1d_dype_yarn_pos_embed(
         dim: int,
         pos: torch.Tensor,
@@ -28,20 +33,27 @@ def get_1d_dype_yarn_pos_embed(
         use_real: bool,
         repeat_interleave_real: bool,
         freqs_dtype: torch.dtype,
-        linear_scale: float,  
-        ntk_scale: float,     
+        linear_scale: float,
+        ntk_scale: float,
         ori_max_pe_len: int,
         dype: bool,
         current_timestep: float,
         dype_scale: float,
         dype_exponent: float,
-        override_mscale: float = None,
-):
+        override_mscale: float | None = None,
+) -> tuple[torch.Tensor, torch.Tensor]:
     device = pos.device
     linear_scale = max(linear_scale, 1.0)
     ntk_scale = max(ntk_scale, 1.0)
 
-    beta_0, beta_1 = 1.25, 0.75 
+    # YaRN ramp thresholds (Peng et al., 2023b "YaRN", Section 3.3):
+    # beta_0, beta_1 define the NTK-by-parts lower ramp boundary.
+    # gamma_0, gamma_1 define the upper ramp boundary for base-frequency blending.
+    # These are the default values from the YaRN paper, empirically determined.
+    # In DyPE, they are modulated by k_t = dype_scale * t^dype_exponent
+    # to dynamically shift frequency band allocation over the sampling trajectory.
+    # See DyPE paper (Issachar et al.) Appendix D for ablation of these values.
+    beta_0, beta_1 = 1.25, 0.75
     gamma_0, gamma_1 = 16, 2
 
     if dype:
@@ -103,7 +115,7 @@ def get_1d_yarn_pos_embed(
         dype_scale: float,
         dype_exponent: float,
         use_aggressive_mscale: bool = False,
-):
+) -> tuple[torch.Tensor, torch.Tensor]:
     device = pos.device
     scale = torch.clamp_min(max_pe_len / ori_max_pe_len, 1.0)
 
@@ -165,7 +177,7 @@ def get_1d_ntk_pos_embed(
         repeat_interleave_real: bool,
         freqs_dtype: torch.dtype,
         ntk_factor: float,
-):
+) -> tuple[torch.Tensor, torch.Tensor]:
     device = pos.device
     theta_ntk = theta * ntk_factor
     freqs = 1.0 / (theta_ntk ** (torch.arange(0, dim, 2, dtype=freqs_dtype, device=device) / dim))

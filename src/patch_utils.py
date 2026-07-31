@@ -1,8 +1,11 @@
+import logging
 import math
 import types
 import torch
 import torch.nn.functional as F
 import comfy
+
+logger = logging.getLogger("ComfyUI-DyPE")
 from comfy.model_patcher import ModelPatcher
 from comfy import model_sampling
 
@@ -12,7 +15,21 @@ from .models.qwen import PosEmbedQwen
 from .models.zimage import PosEmbedZImage
 from .models.anima import PosEmbedAnima
 
+# Namespaced attribute for cache invalidation (stored on ModelPatcher, not raw model)
+_DYPE_PARAMS_ATTR = "_comfyui_dype_params"
+
+
+def _snap_to_multiple(value: int, multiple: int = 16) -> int:
+    """Round value to the nearest multiple (minimum = multiple)."""
+    snapped = max(multiple, round(value / multiple) * multiple)
+    return snapped
+
+
 def apply_dype_to_model(model: ModelPatcher, model_type: str, width: int, height: int, method: str, yarn_alt_scaling: bool, enable_dype: bool, dype_scale: float, dype_exponent: float, base_shift: float, max_shift: float, base_resolution: int = 1024, dype_start_sigma: float = 1.0) -> ModelPatcher:
+    # Snap resolution to nearest multiple of 16 for latent space compatibility
+    width = _snap_to_multiple(width, 16)
+    height = _snap_to_multiple(height, 16)
+
     m = model.clone()
 
     is_nunchaku = False
@@ -45,11 +62,14 @@ def apply_dype_to_model(model: ModelPatcher, model_type: str, width: int, height
         else:
             raise ValueError("The provided model is not a compatible model.")
 
+    detected_type = 'nunchaku' if is_nunchaku else 'qwen' if is_qwen else 'zimage' if is_z_image else 'anima' if is_anima else 'flux'
+    logger.info(f"DyPE: Detected model type: {detected_type}")
+
     new_dype_params = (width, height, base_shift, max_shift, method, yarn_alt_scaling, base_resolution, dype_start_sigma, is_nunchaku, is_qwen, is_z_image, is_anima)
 
     should_patch_schedule = True
-    if hasattr(m.model, "_dype_params"):
-        if m.model._dype_params == new_dype_params:
+    if hasattr(m, _DYPE_PARAMS_ATTR):
+        if getattr(m, _DYPE_PARAMS_ATTR) == new_dype_params:
             should_patch_schedule = False
 
     base_patch_h_tokens = None
@@ -68,8 +88,8 @@ def apply_dype_to_model(model: ModelPatcher, model_type: str, width: int, height
             patch_size = m.model.diffusion_model.patch_spatial
         else:
             patch_size = m.model.diffusion_model.patch_size
-    except:
-        pass
+    except (AttributeError, TypeError) as e:
+        logger.warning(f"Could not read patch_size from model (defaulting to 2): {e}")
 
     if base_patch_h_tokens is not None and base_patch_w_tokens is not None:
         derived_base_patches = max(base_patch_h_tokens, base_patch_w_tokens)
@@ -106,16 +126,16 @@ def apply_dype_to_model(model: ModelPatcher, model_type: str, width: int, height
                 new_model_sampler.set_parameters(shift=dype_shift)
 
                 m.add_object_patch("model_sampling", new_model_sampler)
-                m.model._dype_params = new_dype_params
-        except:
-            pass
+                setattr(m, _DYPE_PARAMS_ATTR, new_dype_params)
+        except (AttributeError, TypeError, ValueError) as e:
+            logger.warning(f"DyPE noise schedule patching failed (model will use default schedule): {e}")
 
     elif not enable_dype and not is_anima:
-        if hasattr(m.model, "_dype_params"):
+        if hasattr(m, _DYPE_PARAMS_ATTR):
             class DefaultModelSamplingFlux(model_sampling.ModelSamplingFlux, model_sampling.CONST): pass
             default_sampler = DefaultModelSamplingFlux(m.model.model_config)
             m.add_object_patch("model_sampling", default_sampler)
-            del m.model._dype_params
+            delattr(m, _DYPE_PARAMS_ATTR)
 
     try:
         if is_nunchaku:
@@ -178,94 +198,16 @@ def apply_dype_to_model(model: ModelPatcher, model_type: str, width: int, height
         if base_hw_override is not None:
             m.model.diffusion_model._dype_base_hw = base_hw_override
 
-        def dype_patchify_and_embed(self, x, cap_feats, cap_mask, t, num_tokens, transformer_options={}):
-            bsz = len(x)
-            pH = pW = self.patch_size
-            device = x[0].device
-
-            if self.pad_tokens_multiple is not None:
-                pad_extra = (-cap_feats.shape[1]) % self.pad_tokens_multiple
-                if pad_extra:
-                    cap_pad = self.cap_pad_token.to(device=cap_feats.device, dtype=cap_feats.dtype, copy=True).unsqueeze(0)
-                    cap_feats = torch.cat((cap_feats, cap_pad.repeat(cap_feats.shape[0], pad_extra, 1)), dim=1)
-
-            cap_pos_ids = torch.zeros(bsz, cap_feats.shape[1], 3, dtype=torch.float32, device=device)
-            cap_pos_ids[:, :, 0] = torch.arange(cap_feats.shape[1], dtype=torch.float32, device=device) + 1.0
-
-            B, C, H, W = x.shape
-            x = self.x_embedder(x.view(B, C, H // pH, pH, W // pW, pW).permute(0, 2, 4, 3, 5, 1).flatten(3).flatten(1, 2))
-
-            requested_hw = transformer_options.get("dype_requested_hw", (height, width))
-            rope_base_resolution = transformer_options.get("dype_base_resolution", base_resolution)
-
-            raw_scale_y = float(rope_base_resolution) / max(1.0, float(requested_hw[0]))
-            raw_scale_x = float(rope_base_resolution) / max(1.0, float(requested_hw[1]))
-            
-            iso_scale = min(raw_scale_y, raw_scale_x)
-            rope_scale_y = iso_scale
-            rope_scale_x = iso_scale
-            
-            freq_scale_factor = 1.0 / iso_scale
-            new_pe_embedder.set_scale_hint(freq_scale_factor)
-
-            h_start = 0.0
-            w_start = 0.0
-
-            original_hw = transformer_options.get("dype_original_hw")
-            if original_hw is None:
-                original_hw = (H, W)
-
-            H_tokens = math.ceil(original_hw[0] / pH)
-            W_tokens = math.ceil(original_hw[1] / pW)
-            
-            token_stride_y = (original_hw[0] / max(1, H_tokens)) * rope_scale_y
-            token_stride_x = (original_hw[1] / max(1, W_tokens)) * rope_scale_x
-            
-            shift_y = h_start * (original_hw[0] / max(1, H_tokens))
-            shift_x = w_start * (original_hw[1] / max(1, W_tokens))
-            
-            def _build_spatial_pos_ids(batch: int, total_len: int, width_tokens: int, cap_len: int, stride_y: float, stride_x: float, h_start: float, w_start: float, device: torch.device):
-                base_pos = torch.arange(total_len, device=device, dtype=torch.float32)
-                y = torch.div(base_pos, width_tokens, rounding_mode='floor') * stride_y + h_start
-                x = torch.remainder(base_pos, width_tokens) * stride_x + w_start
-
-                pos = torch.stack([
-                    torch.full_like(base_pos, cap_len + 1),
-                    y,
-                    x
-                ], dim=-1)
-                return pos.unsqueeze(0).repeat(batch, 1, 1)
-
-            base_img_tokens = H_tokens * W_tokens
-            x_pos_ids = _build_spatial_pos_ids(bsz, base_img_tokens, W_tokens, cap_feats.shape[1], token_stride_y, token_stride_x, shift_y, shift_x, device)
-
-            if self.pad_tokens_multiple is not None:
-                pad_extra = (-x.shape[1]) % self.pad_tokens_multiple
-                if pad_extra:
-                    x = torch.cat((x, self.x_pad_token.to(device=x.device, dtype=x.dtype, copy=True).unsqueeze(0).repeat(x.shape[0], pad_extra, 1)), dim=1)
-
-            if x.shape[1] != x_pos_ids.shape[1]:
-                x_pos_ids = _build_spatial_pos_ids(bsz, x.shape[1], W_tokens, cap_feats.shape[1], token_stride_y, token_stride_x, shift_y, shift_x, device)
-
-            freqs_cis = self.rope_embedder(torch.cat((cap_pos_ids, x_pos_ids), dim=1)).movedim(1, 2)
-
-            for layer in self.context_refiner:
-                cap_feats = layer(cap_feats, cap_mask, freqs_cis[:, :cap_pos_ids.shape[1]], transformer_options=transformer_options)
-
-            padded_img_mask = None
-            for layer in self.noise_refiner:
-                x = layer(x, padded_img_mask, freqs_cis[:, cap_pos_ids.shape[1]:], t, transformer_options=transformer_options)
-
-            padded_full_embed = torch.cat((cap_feats, x), dim=1)
-            mask = None
-            img_sizes = [(H, W)] * bsz
-            l_effective_cap_len = [cap_feats.shape[1]] * bsz
-            return padded_full_embed, mask, img_sizes, l_effective_cap_len, freqs_cis
-
-        m.add_object_patch(
-            "diffusion_model.patchify_and_embed",
-            types.MethodType(dype_patchify_and_embed, m.model.diffusion_model)
-        )
+        # Compute isotropic scale hint for Z-Image RoPE.
+        # This is set on the embedder before each forward pass via the wrapper.
+        # We no longer override patchify_and_embed — the native Lumina model handles
+        # position generation, and PosEmbedZImage applies DyPE scaling to whatever
+        # positions it receives.
+        raw_scale_y = float(base_resolution) / max(1.0, float(height))
+        raw_scale_x = float(base_resolution) / max(1.0, float(width))
+        iso_scale = min(raw_scale_y, raw_scale_x)
+        zimage_freq_scale_factor = max(1.0, 1.0 / iso_scale)
+        logger.debug(f"DyPE Z-Image: scale hint = {zimage_freq_scale_factor:.4f} (iso_scale={iso_scale:.4f})")
 
     sigma_max = m.model.model_sampling.sigma_max.item()
     
@@ -278,16 +220,11 @@ def apply_dype_to_model(model: ModelPatcher, model_type: str, width: int, height
                 normalized_timestep = min(max(current_sigma / sigma_max, 0.0), 1.0)
                 new_pe_embedder.set_timestep(normalized_timestep)
         
+        # Set Z-Image scale hint before each forward pass
+        if is_z_image:
+            new_pe_embedder.set_scale_hint(zimage_freq_scale_factor)
+
         input_x, c = args_dict.get("input"), args_dict.get("c", {})
-
-        if is_z_image and isinstance(input_x, torch.Tensor) and input_x.dim() >= 4:
-            c = dict(c)
-            transformer_options = dict(c.get("transformer_options", {}))
-            transformer_options["dype_original_hw"] = (input_x.shape[-2], input_x.shape[-1])
-            transformer_options["dype_requested_hw"] = (height, width)
-            transformer_options["dype_base_resolution"] = base_resolution
-            c["transformer_options"] = transformer_options
-
         return model_function(input_x, args_dict.get("timestep"), **c)
 
     m.set_model_unet_function_wrapper(dype_wrapper_function)
