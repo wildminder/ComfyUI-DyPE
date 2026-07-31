@@ -12,7 +12,7 @@ class DyPE_FLUX(io.ComfyNode):
         return io.Schema(
             node_id="DyPE_FLUX",
             display_name="DyPE",
-            category="model_patches/unet",
+            category="model_patches/position_encoding",
             description="Applies DyPE (Dynamic Position Extrapolation) to a models for ultra-high-resolution generation.",
             inputs=[
                 io.Model.Input(
@@ -37,7 +37,7 @@ class DyPE_FLUX(io.ComfyNode):
                 ),
                 io.Combo.Input(
                     "method",
-                    options=["vision_yarn", "yarn", "ntk", "base"],
+                    options=["vision_yarn", "yarn", "ntk", "pi", "base"],
                     default="vision_yarn",
                     tooltip="Position encoding extrapolation method.",
                 ),
@@ -102,6 +102,39 @@ class DyPE_FLUX(io.ComfyNode):
     def execute(cls, model, width: int, height: int, model_type: str, method: str, yarn_alt_scaling: bool, enable_dype: bool, base_resolution: int = 1024, dype_start_sigma: float = 1.0, dype_scale: float = 2.0, dype_exponent: float = 2.0, base_shift: float = 0.5, max_shift: float = 1.15) -> io.NodeOutput:
         patched_model = apply_dype_to_model(model, model_type, width, height, method, yarn_alt_scaling, enable_dype, dype_scale, dype_exponent, base_shift, max_shift, base_resolution, dype_start_sigma)
         return io.NodeOutput(patched_model)
+
+    @classmethod
+    def validate_inputs(cls, **kwargs) -> bool | str:
+        width = kwargs.get("width", 1024)
+        height = kwargs.get("height", 1024)
+
+        if not isinstance(width, int) or not isinstance(height, int):
+            return "Width and height must be integers."
+
+        if width < 16 or height < 16:
+            return "Width and height must be at least 16 pixels."
+
+        if width % 16 != 0:
+            return f"Width ({width}) must be a multiple of 16 for latent space compatibility."
+
+        if height % 16 != 0:
+            return f"Height ({height}) must be a multiple of 16 for latent space compatibility."
+
+        base_resolution = kwargs.get("base_resolution", 1024)
+        if base_resolution < 256:
+            return "base_resolution must be at least 256."
+
+        # Check latent dimensions are even (patch_size=2 compatibility)
+        latent_w = width // 8
+        latent_h = height // 8
+        if latent_w % 2 != 0 or latent_h % 2 != 0:
+            return (
+                f"Resolution {width}x{height} produces odd latent dimensions "
+                f"({latent_w}x{latent_h}). This may cause issues with patch_size=2 models. "
+                f"Use dimensions that are multiples of 16."
+            )
+
+        return True
 
 class DyPEExtension(ComfyExtension):
     async def get_node_list(self) -> list[type[io.ComfyNode]]:
