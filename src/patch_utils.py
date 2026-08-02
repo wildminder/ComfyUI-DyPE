@@ -41,7 +41,7 @@ def apply_dype_to_model(model: ModelPatcher, model_type: str, width: int, height
         is_nunchaku = True
     elif model_type == "qwen":
         is_qwen = True
-    elif model_type == "z_image":
+    elif model_type in ("z_image", "zimage"):
         is_z_image = True
     elif model_type == "anima":
         is_anima = True
@@ -53,6 +53,8 @@ def apply_dype_to_model(model: ModelPatcher, model_type: str, width: int, height
             model_class_name = dm.__class__.__name__
             if "QwenImage" in model_class_name:
                 is_qwen = True
+            elif "Anima" in model_class_name or "MiniTrainDIT" in model_class_name:
+                is_anima = True
             elif hasattr(dm, "rope_embedder"):
                 is_z_image = True
             elif hasattr(dm, "model") and hasattr(dm.model, "pos_embed"):
