@@ -1,5 +1,5 @@
 [project]
-name = "DyPE"
+name = "ComfyUI-DyPE"
 description = "DyPE. Artifact-free 4K+ image generation. Flux, Nunchaku, Qwen, Z-Image, Anima, Krea-2"
 version = "2.4.0"
 requires-python = ">=3.10"
