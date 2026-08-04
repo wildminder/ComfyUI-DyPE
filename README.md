@@ -5,7 +5,7 @@
 
   
   <p align="center">
-    A ComfyUI custom node that implements <strong>DyPE (Dynamic Position Extrapolation)</strong>, enabling Diffusion Transformers (like <strong>FLUX</strong>, <strong>Qwen Image</strong>, and <strong>Z-Image</strong>) to generate ultra-high-resolution images (4K and beyond) with exceptional coherence and detail.
+    A ComfyUI custom node that implements <strong>DyPE (Dynamic Position Extrapolation)</strong>, enabling Diffusion Transformers (like <strong>FLUX</strong>, <strong>Qwen Image</strong>, <strong>Z-Image</strong>, <strong>Anima/Cosmos</strong>, and <strong>Krea-2</strong>) to generate ultra-high-resolution images (4K and beyond) with exceptional coherence and detail.
     <br />
     <br />
     <a href="https://github.com/wildminder/ComfyUI-DyPE/issues/new?labels=bug&template=bug-report---.md">Report Bug</a>
@@ -42,7 +42,7 @@ It works by taking advantage of the spectral progression inherent to the diffusi
 This node provides a seamless, "plug-and-play" integration of DyPE into your workflow.
 
 **✨ Key Features:**
-*   **Multi-Architecture Support:** Supports **FLUX** (Standard), **Nunchaku** (Quantized Flux), **Qwen Image**, and **Z-Image** (Lumina 2).
+*   **Multi-Architecture Support:** Supports **FLUX** (Standard), **Nunchaku** (Quantized Flux), **Qwen Image**, **Z-Image** (Lumina 2), **Anima/Cosmos**, and **Krea-2**.
 *   **High-Resolution Generation:** Push models to 4096x4096 and beyond.
 *   **Single-Node Integration:** Simply place the `DyPE for FLUX` node after your model loader to patch the model. No complex workflow changes required.
 *   **Full Compatibility:** Works seamlessly with your existing ComfyUI workflows, samplers, schedulers, and other optimization nodes.
@@ -82,7 +82,7 @@ Alternatively, to install manually:
 
 Using the node is straightforward and designed for minimal workflow disruption.
 
-1.  **Load Your Model:** Use your preferred loader (e.g., `Load Checkpoint` for Flux, `Nunchaku Flux DiT Loader`, or `ZImage` loader).
+1.  **Load Your Model:** Use your preferred loader (e.g., `Load Checkpoint` for Flux, `Nunchaku Flux DiT Loader`, `ZImage` loader, or the Anima/Krea-2 UNET loaders).
 2.  **Add the DyPE Node:** Add the `DyPE for FLUX` node to your graph (found under `model_patches/unet`).
 3.  **Connect the Model:** Connect the `MODEL` output from your loader to the `model` input of the DyPE node.
 4.  **Set Resolution:** Set the `width` and `height` on the DyPE node to match the resolution of your `Empty Latent Image`.
@@ -99,11 +99,13 @@ Using the node is straightforward and designed for minimal workflow disruption.
     *   **`auto`**: Attempts to automatically detect the model architecture. Recommended.
     *   **`flux`**: Forces Standard Flux logic.
     *   **`nunchaku`**: Forces Nunchaku (Quantized Flux) logic.
-    *   **`qwen`**: Forces Qwen Image logic.
+    *   **`qwen`**: Forces Qwen Image logic (also used for **Krea-2**, which shares the Qwen architecture).
     *   **`zimage`**: Forces Z-Image (Lumina 2) logic.
+    *   **`anima`**: Forces Anima/Cosmos logic.
 *   **`base_resolution`**: The native resolution the model was trained on.
     *   Flux / Z-Image: `1024`
-    *   Qwen: `1328` (Recommended setting for Qwen models)
+    *   Qwen / Krea-2: `1328` (Recommended setting for Qwen-family models)
+    *   Anima/Cosmos: `1920` (native `max_img` is 240 latent = 1920px; auto-detected from the model)
 
 #### 2. Method Selection
 *   **`method`**:
@@ -124,6 +126,11 @@ Using the node is straightforward and designed for minimal workflow disruption.
 > *   **Geometric Stretching:** To prevent vertical stretching, the node automatically enforces **Isotropic Scaling** for Z-Image, regardless of user settings.
 > *   **Method Choice:** recommend **`vision_yarn`** or **`ntk`**. Standard `yarn` may produce artifacts.
 
+> [!TIP]
+> **Anima/Cosmos Specifics:**
+> *   The native patch grid and per-axis NTK factors are read from the model, so DyPE only extrapolates beyond the native 1920px training resolution.
+> *   **Method Choice:** **`vision_yarn`** is recommended. Other methods may produce speckle noise at ultra-high resolutions (>2K).
+
 #### 3. Dynamic Control
 *   **`enable_dype`**: Enables or disables the **dynamic, time-aware** component of DyPE.
     *   **Enabled (True):** Both the noise schedule and RoPE will be dynamically adjusted throughout sampling. This is the full DyPE algorithm.
@@ -140,6 +147,12 @@ Using the node is straightforward and designed for minimal workflow disruption.
 <p align="right">(<a href="#readme-top">back to top</a>)</p>
 
 ## Changelog
+
+#### v2.4.0
+*   **Anima/Cosmos Support:** Added support for **Anima/Cosmos** models. Reads the model's native per-axis NTK factors and patch grid (`max_img_h/w`, `patch_spatial`) so DyPE only extrapolates beyond native resolution. Recommended method: `vision_yarn`.
+*   **Krea-2 Support:** Added support for **Krea-2** (Qwen-family architecture, auto-detected).
+*   **State Pollution Fix:** Patch parameters are now cached on the `ModelPatcher` to avoid re-patching and state leakage across runs.
+*   **Example Workflows:** Added Anima and Krea-2 example workflows.
 
 #### v2.3.0
 *   **Z-Image Overhaul:** Fixed geometric stretching artifacts
@@ -184,30 +197,6 @@ Using the node is straightforward and designed for minimal workflow disruption.
 > *   **Test different Methods:** Start with `vision_yarn`, but try `yarn` if you encounter issues.
 > *   **Adjust `dype_exponent`:** This is your main knob for balancing sharpness vs. artifacts.
 
-<p align="center">══════════════════════════════════</p>
-
-Beyond the code, I believe in the power of community and continuous learning. I invite you to join the 'TokenDiff AI News' and 'TokenDiff Community Hub'
-
-<table border="0" align="center" cellspacing="10" cellpadding="0">
-  <tr>
-    <td align="center" valign="top">
-      <h4>TokenDiff AI News</h4>
-      <a href="https://t.me/TokenDiff">
-        <img width="40%" alt="tokendiff-tg-qw" src="https://github.com/user-attachments/assets/e29f6b3c-52e5-4150-8088-12163a2e1e78" />
-      </a>
-      <p><sub>AI for every home, creativity for every mind!</sub></p>
-    </td>
-    <td align="center" valign="top">
-      <h4>TokenDiff Community Hub</h4>
-      <a href="https://t.me/TokenDiff_hub">
-        <img width="40%" alt="token_hub-tg-qr" src="https://github.com/user-attachments/assets/da544121-5f5b-4e3d-a3ef-02272535929e" />
-      </a>
-      <p><sub>questions, help, and thoughtful discussion.</sub> </p>
-    </td>
-  </tr>
-</table>
-
-<p align="center">══════════════════════════════════</p>
 
 <p align="right">(<a href="#readme-top">back to top</a>)</p>
 
