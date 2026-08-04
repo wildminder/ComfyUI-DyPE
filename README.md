@@ -112,6 +112,7 @@ Using the node is straightforward and designed for minimal workflow disruption.
     *   **`vision_yarn`:** A novel variant designed specifically for aspect-ratio robustness. It decouples structure from texture: low frequencies (shapes) are scaled to fit your canvas aspect ratio, while high frequencies (details) are scaled uniformly. It uses a dynamic attention schedule to ensure sharpness.
     *   **`yarn`:** The standard YaRN method. Good general performance but can struggle with extreme aspect ratios.
     *   **`ntk`:** Neural Tangent Kernel scaling. Very stable but tends to be softer/blurrier at high resolutions.
+    *   **`pi`:** Position Interpolation. Scales positions uniformly (`pos / s^κ(t)`) with a time-dependent exponent. Preserves local structure well; a good alternative when `ntk` over-smooths.
     *   **`base`:** No positional interpolation (standard behavior).
 
 ##### Scaling Options
