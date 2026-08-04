@@ -1,22 +1,22 @@
 {
   "id": "9ae6082b-c7f4-433c-9971-7a8f65a3ea65",
   "revision": 0,
-  "last_node_id": 53,
-  "last_link_id": 51,
+  "last_node_id": 59,
+  "last_link_id": 61,
   "nodes": [
     {
       "id": 44,
       "type": "KSampler",
       "pos": [
-        1050,
-        320
+        1110,
+        330
       ],
       "size": [
         320,
         540
       ],
       "flags": {},
-      "order": 11,
+      "order": 14,
       "mode": 0,
       "inputs": [
         {
@@ -81,7 +81,7 @@
       ],
       "size": [
         380,
-        86
+        90
       ],
       "flags": {},
       "order": 0,
@@ -122,104 +122,6 @@
       "bgcolor": "#533"
     },
     {
-      "id": 47,
-      "type": "ModelSamplingAuraFlow",
-      "pos": [
-        1050,
-        270
-      ],
-      "size": [
-        225,
-        0
-      ],
-      "flags": {
-        "collapsed": true
-      },
-      "order": 10,
-      "mode": 0,
-      "inputs": [
-        {
-          "name": "model",
-          "type": "MODEL",
-          "link": 47
-        }
-      ],
-      "outputs": [
-        {
-          "name": "MODEL",
-          "type": "MODEL",
-          "slot_index": 0,
-          "links": [
-            40
-          ]
-        }
-      ],
-      "properties": {
-        "Node name for S&R": "ModelSamplingAuraFlow",
-        "cnr_id": "comfy-core",
-        "ver": "0.3.64",
-        "enableTabs": false,
-        "tabWidth": 65,
-        "tabXOffset": 10,
-        "hasSecondTab": false,
-        "secondTabText": "Send Back",
-        "secondTabOffset": 80,
-        "secondTabWidth": 65
-      },
-      "widgets_values": [
-        3
-      ]
-    },
-    {
-      "id": 45,
-      "type": "CLIPTextEncode",
-      "pos": [
-        590,
-        320
-      ],
-      "size": [
-        400,
-        290
-      ],
-      "flags": {},
-      "order": 7,
-      "mode": 0,
-      "inputs": [
-        {
-          "name": "clip",
-          "type": "CLIP",
-          "link": 44
-        }
-      ],
-      "outputs": [
-        {
-          "name": "CONDITIONING",
-          "type": "CONDITIONING",
-          "links": [
-            36,
-            41
-          ]
-        }
-      ],
-      "properties": {
-        "Node name for S&R": "CLIPTextEncode",
-        "cnr_id": "comfy-core",
-        "ver": "0.3.73",
-        "enableTabs": false,
-        "tabWidth": 65,
-        "tabXOffset": 10,
-        "hasSecondTab": false,
-        "secondTabText": "Send Back",
-        "secondTabOffset": 80,
-        "secondTabWidth": 65
-      },
-      "widgets_values": [
-        "Latina female with thick wavy hair, harbor boats and pastel houses behind. Breezy seaside light, warm tones, cinematic close-up."
-      ],
-      "color": "#232",
-      "bgcolor": "#353"
-    },
-    {
       "id": 42,
       "type": "ConditioningZeroOut",
       "pos": [
@@ -233,7 +135,7 @@
       "flags": {
         "collapsed": true
       },
-      "order": 9,
+      "order": 11,
       "mode": 0,
       "inputs": [
         {
@@ -376,98 +278,6 @@
       "bgcolor": "#653"
     },
     {
-      "id": 43,
-      "type": "VAEDecode",
-      "pos": [
-        1090,
-        920
-      ],
-      "size": [
-        230,
-        80
-      ],
-      "flags": {},
-      "order": 12,
-      "mode": 0,
-      "inputs": [
-        {
-          "name": "samples",
-          "type": "LATENT",
-          "link": 38
-        },
-        {
-          "name": "vae",
-          "type": "VAE",
-          "link": 39
-        }
-      ],
-      "outputs": [
-        {
-          "name": "IMAGE",
-          "type": "IMAGE",
-          "slot_index": 0,
-          "links": [
-            51
-          ]
-        }
-      ],
-      "properties": {
-        "Node name for S&R": "VAEDecode",
-        "cnr_id": "comfy-core",
-        "ver": "0.3.64",
-        "enableTabs": false,
-        "tabWidth": 65,
-        "tabXOffset": 10,
-        "hasSecondTab": false,
-        "secondTabText": "Send Back",
-        "secondTabOffset": 80,
-        "secondTabWidth": 65
-      },
-      "widgets_values": []
-    },
-    {
-      "id": 50,
-      "type": "LoraLoaderModelOnly",
-      "pos": [
-        140,
-        830
-      ],
-      "size": [
-        380,
-        114
-      ],
-      "flags": {},
-      "order": 6,
-      "mode": 0,
-      "inputs": [
-        {
-          "name": "model",
-          "type": "MODEL",
-          "link": 48
-        }
-      ],
-      "outputs": [
-        {
-          "name": "MODEL",
-          "type": "MODEL",
-          "links": [
-            49
-          ]
-        }
-      ],
-      "properties": {
-        "Node name for S&R": "LoraLoaderModelOnly",
-        "cnr_id": "comfy-core",
-        "ver": "0.3.76"
-      },
-      "widgets_values": [
-        "zit\\ench-ZI-dejpeg_lite.safetensors",
-        1
-      ],
-      "color": "#322",
-      "bgcolor": "#533"
-    },
-    {
       "id": 39,
       "type": "CLIPLoader",
       "pos": [
@@ -476,7 +286,7 @@
       ],
       "size": [
         380,
-        138
+        140
       ],
       "flags": {},
       "order": 4,
@@ -519,11 +329,218 @@
       "bgcolor": "#533"
     },
     {
+      "id": 47,
+      "type": "ModelSamplingAuraFlow",
+      "pos": [
+        1110,
+        280
+      ],
+      "size": [
+        230,
+        50
+      ],
+      "flags": {
+        "collapsed": true
+      },
+      "order": 13,
+      "mode": 0,
+      "inputs": [
+        {
+          "name": "model",
+          "type": "MODEL",
+          "link": 56
+        }
+      ],
+      "outputs": [
+        {
+          "name": "MODEL",
+          "type": "MODEL",
+          "slot_index": 0,
+          "links": [
+            40
+          ]
+        }
+      ],
+      "properties": {
+        "Node name for S&R": "ModelSamplingAuraFlow",
+        "cnr_id": "comfy-core",
+        "ver": "0.3.64",
+        "enableTabs": false,
+        "tabWidth": 65,
+        "tabXOffset": 10,
+        "hasSecondTab": false,
+        "secondTabText": "Send Back",
+        "secondTabOffset": 80,
+        "secondTabWidth": 65
+      },
+      "widgets_values": [
+        3
+      ]
+    },
+    {
+      "id": 50,
+      "type": "LoraLoaderModelOnly",
+      "pos": [
+        140,
+        830
+      ],
+      "size": [
+        380,
+        120
+      ],
+      "flags": {},
+      "order": 7,
+      "mode": 4,
+      "inputs": [
+        {
+          "name": "model",
+          "type": "MODEL",
+          "link": 48
+        }
+      ],
+      "outputs": [
+        {
+          "name": "MODEL",
+          "type": "MODEL",
+          "links": [
+            49
+          ]
+        }
+      ],
+      "properties": {
+        "Node name for S&R": "LoraLoaderModelOnly",
+        "cnr_id": "comfy-core",
+        "ver": "0.3.76"
+      },
+      "widgets_values": [
+        "zit\\ench-ZI-dejpeg_lite.safetensors",
+        1
+      ],
+      "color": "#322",
+      "bgcolor": "#533"
+    },
+    {
+      "id": 43,
+      "type": "VAEDecode",
+      "pos": [
+        1280,
+        930
+      ],
+      "size": [
+        230,
+        80
+      ],
+      "flags": {
+        "collapsed": true
+      },
+      "order": 15,
+      "mode": 0,
+      "inputs": [
+        {
+          "name": "samples",
+          "type": "LATENT",
+          "link": 38
+        },
+        {
+          "name": "vae",
+          "type": "VAE",
+          "link": 39
+        }
+      ],
+      "outputs": [
+        {
+          "name": "IMAGE",
+          "type": "IMAGE",
+          "slot_index": 0,
+          "links": [
+            61
+          ]
+        }
+      ],
+      "properties": {
+        "Node name for S&R": "VAEDecode",
+        "cnr_id": "comfy-core",
+        "ver": "0.3.64",
+        "enableTabs": false,
+        "tabWidth": 65,
+        "tabXOffset": 10,
+        "hasSecondTab": false,
+        "secondTabText": "Send Back",
+        "secondTabOffset": 80,
+        "secondTabWidth": 65
+      },
+      "widgets_values": []
+    },
+    {
+      "id": 41,
+      "type": "EmptySD3LatentImage",
+      "pos": [
+        820,
+        940
+      ],
+      "size": [
+        380,
+        150
+      ],
+      "flags": {
+        "collapsed": true
+      },
+      "order": 9,
+      "mode": 0,
+      "inputs": [
+        {
+          "name": "width",
+          "type": "INT",
+          "widget": {
+            "name": "width"
+          },
+          "link": 57
+        },
+        {
+          "name": "height",
+          "type": "INT",
+          "widget": {
+            "name": "height"
+          },
+          "link": 58
+        }
+      ],
+      "outputs": [
+        {
+          "name": "LATENT",
+          "type": "LATENT",
+          "slot_index": 0,
+          "links": [
+            43
+          ]
+        }
+      ],
+      "properties": {
+        "Node name for S&R": "EmptySD3LatentImage",
+        "cnr_id": "comfy-core",
+        "ver": "0.3.64",
+        "enableTabs": false,
+        "tabWidth": 65,
+        "tabXOffset": 10,
+        "hasSecondTab": false,
+        "secondTabText": "Send Back",
+        "secondTabOffset": 80,
+        "secondTabWidth": 65
+      },
+      "widgets_values": [
+        2160,
+        3840,
+        1
+      ],
+      "color": "#232",
+      "bgcolor": "#353"
+    },
+    {
       "id": 9,
       "type": "SaveImage",
       "pos": [
-        1420,
-        320
+        1480,
+        330
       ],
       "size": [
         420,
@@ -532,13 +549,13 @@
       "flags": {
         "collapsed": false
       },
-      "order": 13,
+      "order": 16,
       "mode": 0,
       "inputs": [
         {
           "name": "images",
           "type": "IMAGE",
-          "link": 51
+          "link": 61
         }
       ],
       "outputs": [
@@ -565,15 +582,15 @@
       ]
     },
     {
-      "id": 41,
-      "type": "EmptySD3LatentImage",
+      "id": 57,
+      "type": "PrimitiveNode",
       "pos": [
-        140,
-        1080
+        580,
+        800
       ],
       "size": [
-        380,
-        142
+        210,
+        90
       ],
       "flags": {},
       "order": 5,
@@ -581,18 +598,102 @@
       "inputs": [],
       "outputs": [
         {
-          "name": "LATENT",
-          "type": "LATENT",
-          "slot_index": 0,
+          "name": "INT",
+          "type": "INT",
+          "widget": {
+            "name": "width"
+          },
           "links": [
-            43
+            57,
+            59
+          ]
+        }
+      ],
+      "title": "width",
+      "properties": {
+        "Run widget replace on values": false
+      },
+      "widgets_values": [
+        2160,
+        "fixed"
+      ],
+      "color": "#232",
+      "bgcolor": "#353"
+    },
+    {
+      "id": 58,
+      "type": "PrimitiveNode",
+      "pos": [
+        810,
+        800
+      ],
+      "size": [
+        210,
+        90
+      ],
+      "flags": {},
+      "order": 6,
+      "mode": 0,
+      "inputs": [],
+      "outputs": [
+        {
+          "name": "INT",
+          "type": "INT",
+          "widget": {
+            "name": "height"
+          },
+          "links": [
+            58,
+            60
+          ]
+        }
+      ],
+      "title": "height",
+      "properties": {
+        "Run widget replace on values": false
+      },
+      "widgets_values": [
+        3840,
+        "fixed"
+      ],
+      "color": "#232",
+      "bgcolor": "#353"
+    },
+    {
+      "id": 45,
+      "type": "CLIPTextEncode",
+      "pos": [
+        590,
+        320
+      ],
+      "size": [
+        420,
+        290
+      ],
+      "flags": {},
+      "order": 8,
+      "mode": 0,
+      "inputs": [
+        {
+          "name": "clip",
+          "type": "CLIP",
+          "link": 44
+        }
+      ],
+      "outputs": [
+        {
+          "name": "CONDITIONING",
+          "type": "CONDITIONING",
+          "links": [
+            36,
+            41
           ]
         }
       ],
       "properties": {
-        "Node name for S&R": "EmptySD3LatentImage",
+        "Node name for S&R": "CLIPTextEncode",
         "cnr_id": "comfy-core",
-        "ver": "0.3.64",
+        "ver": "0.3.73",
         "enableTabs": false,
         "tabWidth": 65,
         "tabXOffset": 10,
@@ -602,9 +703,7 @@
         "secondTabWidth": 65
       },
       "widgets_values": [
-        2048,
-        3072,
-        1
+        "A surrealist oil painting of Salvador Dalí in a dreamlike, semi-medieval, semi-sci-fi environment. Dalí, featuring his iconic long upward-waxed mustache and eccentric, piercing gaze, wears an ornate ensemble merging a medieval velvet doublet with subtle glowing cybernetic accents. He is holding the word \"Z-Image\" rendered as soft, melting typography—the letters 'Z-Image' are fluid and dripping like liquid gold over his fingers, in the style of his famous melting clocks. Behind him, ancient gothic cathedral towers and stone arches float seamlessly alongside sleek, futuristic glowing monoliths and holographic planetary rings. The scene is set on an infinite, barren desert landscape under a warm twilight sky with deep, elongated shadows. Masterpiece of surrealism, rich oil on canvas texture, dramatic cinematic lighting."
       ],
       "color": "#232",
       "bgcolor": "#353"
@@ -613,16 +712,16 @@
       "id": 48,
       "type": "DyPE_FLUX",
       "pos": [
-        620,
-        810
+        190,
+        1080
       ],
       "size": [
         350,
         410
       ],
       "flags": {},
-      "order": 8,
-      "mode": 0,
+      "order": 10,
+      "mode": 4,
       "inputs": [
         {
           "name": "model",
@@ -635,7 +734,7 @@
           "name": "Patched Model",
           "type": "MODEL",
           "links": [
-            47
+            55
           ]
         }
       ],
@@ -648,13 +747,84 @@
         2048,
         2048,
         "auto",
-        "base",
+        "vision_yarn",
         true,
         true,
         1024,
         1,
         2,
         2,
+        0.5,
+        1.15
+      ],
+      "color": "#332922",
+      "bgcolor": "#593930"
+    },
+    {
+      "id": 56,
+      "type": "SEGA",
+      "pos": [
+        630,
+        1080
+      ],
+      "size": [
+        350,
+        400
+      ],
+      "flags": {
+        "collapsed": false
+      },
+      "order": 12,
+      "mode": 0,
+      "inputs": [
+        {
+          "name": "model",
+          "type": "MODEL",
+          "link": 55
+        },
+        {
+          "name": "width",
+          "type": "INT",
+          "widget": {
+            "name": "width"
+          },
+          "link": 59
+        },
+        {
+          "name": "height",
+          "type": "INT",
+          "widget": {
+            "name": "height"
+          },
+          "link": 60
+        }
+      ],
+      "outputs": [
+        {
+          "name": "Patched Model",
+          "type": "MODEL",
+          "links": [
+            56
+          ]
+        }
+      ],
+      "properties": {
+        "Node name for S&R": "SEGA"
+      },
+      "widgets_values": [
+        2160,
+        3840,
+        "auto",
+        "sega",
+        0.15,
+        1.5,
+        1,
+        0,
+        1,
+        1.5,
+        "power_res",
+        0.08,
+        1024,
         0.5,
         1.15
       ],
@@ -728,14 +898,6 @@
       "CLIP"
     ],
     [
-      47,
-      48,
-      0,
-      47,
-      0,
-      "MODEL"
-    ],
-    [
       48,
       46,
       0,
@@ -752,7 +914,55 @@
       "MODEL"
     ],
     [
-      51,
+      55,
+      48,
+      0,
+      56,
+      0,
+      "MODEL"
+    ],
+    [
+      56,
+      56,
+      0,
+      47,
+      0,
+      "MODEL"
+    ],
+    [
+      57,
+      57,
+      0,
+      41,
+      0,
+      "INT"
+    ],
+    [
+      58,
+      58,
+      0,
+      41,
+      1,
+      "INT"
+    ],
+    [
+      59,
+      57,
+      0,
+      56,
+      1,
+      "INT"
+    ],
+    [
+      60,
+      58,
+      0,
+      56,
+      2,
+      "INT"
+    ],
+    [
+      61,
       43,
       0,
       9,
@@ -765,10 +975,10 @@
       "id": 2,
       "title": "Step2 - Image size",
       "bounding": [
-        120,
-        1000,
-        420,
-        240
+        570,
+        720,
+        460,
+        250
       ],
       "color": "#3f789e",
       "flags": {}
@@ -779,7 +989,7 @@
       "bounding": [
         570,
         240,
-        440,
+        460,
         460
       ],
       "color": "#3f789e",
@@ -801,10 +1011,10 @@
       "id": 5,
       "title": "Model Patching",
       "bounding": [
-        570,
-        730,
-        440,
-        510
+        120,
+        1000,
+        910,
+        520
       ],
       "color": "#3f789e",
       "flags": {}
@@ -813,10 +1023,10 @@
   "config": {},
   "extra": {
     "ds": {
-      "scale": 0.6830134553650706,
+      "scale": 0.5644739300537776,
       "offset": [
-        848.3403527757114,
-        -54.770560974199306
+        754.1894189999997,
+        -27.520564000000075
       ]
     },
     "frontendVersion": "1.47.12",

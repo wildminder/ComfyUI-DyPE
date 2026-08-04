@@ -5,7 +5,7 @@
 
   
   <p align="center">
-    A ComfyUI custom node that implements <strong>DyPE (Dynamic Position Extrapolation)</strong>, enabling Diffusion Transformers (like <strong>FLUX</strong>, <strong>Qwen Image</strong>, <strong>Z-Image</strong>, <strong>Anima/Cosmos</strong>, and <strong>Krea-2</strong>) to generate ultra-high-resolution images (4K and beyond) with exceptional coherence and detail.
+    A ComfyUI custom node that implements <strong>DyPE (Dynamic Position Extrapolation)</strong> and <strong>SEGA (Spectral-Energy Guided Attention)</strong>, enabling Diffusion Transformers (like <strong>FLUX</strong>, <strong>Qwen Image</strong>, <strong>Z-Image</strong>, <strong>Anima/Cosmos</strong>, and <strong>Krea-2</strong>) to generate ultra-high-resolution images (4K and beyond) with exceptional coherence and detail.
     <br />
     <br />
     <a href="https://github.com/wildminder/ComfyUI-DyPE/issues/new?labels=bug&template=bug-report---.md">Report Bug</a>
@@ -58,6 +58,42 @@ This node provides a seamless, "plug-and-play" integration of DyPE into your wor
 <div align="center">
 <img alt="Example dype" src="https://github.com/user-attachments/assets/f85861fd-4d2f-4b57-8058-26881600b7ca" />
 </div>
+
+<p align="right">(<a href="#readme-top">back to top</a>)</p>
+
+## SEGA (Spectral-Energy Guided Attention)
+
+In addition to DyPE, this node pack includes **SEGA** — a complementary method that computes **per-RoPE-dimension scaling factors** from the latent's Fourier spectrum at each denoising step. While DyPE modifies RoPE frequency bases globally, SEGA adapts attention sharpness per-frequency based on the actual image content being generated.
+
+### How SEGA Works
+
+1. At each denoising step, SEGA computes a 2D FFT of the current latent
+2. It extracts per-axis (H, W) spectral energy profiles and a radial (isotropic) profile
+3. Spectral flatness determines a dynamic "spread" gate — early (noisy) steps get low spread, later (structured) steps get high spread
+4. Each RoPE dimension is mapped to its corresponding FFT frequency band
+5. A zero-sum correction redistributes mscale: underrepresented frequencies get stronger scaling, overrepresented get weaker
+
+### SEGA vs DyPE
+
+| Feature | DyPE | SEGA |
+|---------|------|------|
+| **What it scales** | RoPE frequency bases (NTK/YaRN/PI) | Per-dim RoPE mscale multiplier |
+| **Content-aware** | No (static per-step) | Yes (FFT of latent at each step) |
+| **Parameters** | `dype_scale`, `dype_exponent` | `mscale_alpha`, `mscale_beta`, `spread_min/max` |
+| **Best for** | General extrapolation | Content with varying frequency content |
+
+### SEGA Node Parameters
+
+| Parameter | Default | Description |
+|-----------|---------|-------------|
+| `mscale_alpha` | 0.15 | SEGA amplitude — controls spectral redistribution strength |
+| `mscale_beta` | 1.5 | tanh sharpness — higher = more binary redistribution |
+| `mscale_min` | 1.0 | Floor for per-frequency mscale values |
+| `spread_min` | 0.0 | Minimum spectral spread (early steps) |
+| `spread_max` | 1.0 | Maximum spectral spread (late steps) |
+| `spread_alpha` | 1.5 | Non-linear mapping exponent for spread schedule |
+| `base_mscale_formula` | power_res | `power_res`: m_ref = s^κ, `log_res`: m_ref = 1 + κ·ln(s) |
+| `base_mscale_coefficient` | 0.08 | κ coefficient (paper default) |
 
 <p align="right">(<a href="#readme-top">back to top</a>)</p>
 

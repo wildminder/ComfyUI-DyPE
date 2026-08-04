@@ -1,8 +1,8 @@
 {
   "id": "08988737-a544-4ab1-99fb-22d67b7c36e3",
   "revision": 0,
-  "last_node_id": 75,
-  "last_link_id": 113,
+  "last_node_id": 82,
+  "last_link_id": 124,
   "nodes": [
     {
       "id": 57,
@@ -50,17 +50,17 @@
       "id": 58,
       "type": "ConditioningZeroOut",
       "pos": [
-        -200,
-        -570
+        -40,
+        -420
       ],
       "size": [
-        225,
-        0
+        230,
+        30
       ],
       "flags": {
         "collapsed": true
       },
-      "order": 6,
+      "order": 8,
       "mode": 0,
       "inputs": [
         {
@@ -141,7 +141,7 @@
         120
       ],
       "flags": {},
-      "order": 5,
+      "order": 6,
       "mode": 4,
       "inputs": [
         {
@@ -155,7 +155,7 @@
           "name": "MODEL",
           "type": "MODEL",
           "links": [
-            109
+            117
           ]
         }
       ],
@@ -179,152 +179,20 @@
       "bgcolor": "#593930"
     },
     {
-      "id": 52,
-      "type": "EmptyLatentImage",
-      "pos": [
-        -880,
-        -180
-      ],
-      "size": [
-        290,
-        150
-      ],
-      "flags": {},
-      "order": 2,
-      "mode": 0,
-      "inputs": [],
-      "outputs": [
-        {
-          "name": "LATENT",
-          "type": "LATENT",
-          "slot_index": 0,
-          "links": [
-            77
-          ]
-        }
-      ],
-      "properties": {
-        "Node name for S&R": "EmptyLatentImage",
-        "cnr_id": "comfy-core",
-        "ver": "0.25.0"
-      },
-      "widgets_values": [
-        1000,
-        4000,
-        1
-      ]
-    },
-    {
-      "id": 72,
-      "type": "DyPE_FLUX",
-      "pos": [
-        -430,
-        -440
-      ],
-      "size": [
-        440,
-        410
-      ],
-      "flags": {},
-      "order": 7,
-      "mode": 0,
-      "inputs": [
-        {
-          "name": "model",
-          "type": "MODEL",
-          "link": 109
-        }
-      ],
-      "outputs": [
-        {
-          "name": "Patched Model",
-          "type": "MODEL",
-          "links": [
-            110
-          ]
-        }
-      ],
-      "properties": {
-        "Node name for S&R": "DyPE_FLUX",
-        "cnr_id": "ComfyUI-DyPE",
-        "ver": "7dbea3b189ef5d75ead0f7bb5c237eee180ac19a"
-      },
-      "widgets_values": [
-        2048,
-        2048,
-        "auto",
-        "base",
-        true,
-        true,
-        1024,
-        1,
-        2,
-        2,
-        0.5,
-        1.15
-      ],
-      "color": "#332922",
-      "bgcolor": "#593930"
-    },
-    {
-      "id": 74,
-      "type": "SaveImage",
-      "pos": [
-        430,
-        -910
-      ],
-      "size": [
-        620,
-        730
-      ],
-      "flags": {},
-      "order": 10,
-      "mode": 0,
-      "inputs": [
-        {
-          "name": "images",
-          "type": "IMAGE",
-          "link": 113
-        }
-      ],
-      "outputs": [
-        {
-          "name": "images",
-          "type": "IMAGE",
-          "links": null
-        }
-      ],
-      "properties": {
-        "Node name for S&R": "SaveImage",
-        "enableTabs": false,
-        "tabWidth": 65,
-        "tabXOffset": 10,
-        "hasSecondTab": false,
-        "secondTabText": "Send Back",
-        "secondTabOffset": 80,
-        "secondTabWidth": 65,
-        "cnr_id": "comfy-core",
-        "ver": "0.11.1"
-      },
-      "widgets_values": [
-        "krea2"
-      ]
-    },
-    {
       "id": 54,
       "type": "VAEDecode",
       "pos": [
-        120,
-        -330
+        -170,
+        -350
       ],
       "size": [
         230,
-        100
+        50
       ],
       "flags": {
-        "collapsed": false
+        "collapsed": true
       },
-      "order": 9,
+      "order": 12,
       "mode": 0,
       "inputs": [
         {
@@ -344,7 +212,7 @@
           "type": "IMAGE",
           "slot_index": 0,
           "links": [
-            113
+            124
           ]
         }
       ],
@@ -367,7 +235,7 @@
         110
       ],
       "flags": {},
-      "order": 3,
+      "order": 2,
       "mode": 0,
       "inputs": [],
       "outputs": [
@@ -402,15 +270,15 @@
       "id": 51,
       "type": "CLIPTextEncode",
       "pos": [
-        -450,
+        -440,
         -870
       ],
       "size": [
-        480,
-        250
+        620,
+        400
       ],
       "flags": {},
-      "order": 4,
+      "order": 5,
       "mode": 0,
       "inputs": [
         {
@@ -445,7 +313,7 @@
       "id": 53,
       "type": "KSampler",
       "pos": [
-        80,
+        240,
         -910
       ],
       "size": [
@@ -453,13 +321,13 @@
         540
       ],
       "flags": {},
-      "order": 8,
+      "order": 11,
       "mode": 0,
       "inputs": [
         {
           "name": "model",
           "type": "MODEL",
-          "link": 110
+          "link": 119
         },
         {
           "name": "positive",
@@ -501,6 +369,306 @@
         "simple",
         1
       ]
+    },
+    {
+      "id": 52,
+      "type": "EmptyLatentImage",
+      "pos": [
+        -430,
+        -350
+      ],
+      "size": [
+        230,
+        40
+      ],
+      "flags": {
+        "collapsed": true
+      },
+      "order": 7,
+      "mode": 0,
+      "inputs": [
+        {
+          "name": "width",
+          "type": "INT",
+          "widget": {
+            "name": "width"
+          },
+          "link": 120
+        },
+        {
+          "name": "height",
+          "type": "INT",
+          "widget": {
+            "name": "height"
+          },
+          "link": 121
+        }
+      ],
+      "outputs": [
+        {
+          "name": "LATENT",
+          "type": "LATENT",
+          "slot_index": 0,
+          "links": [
+            77
+          ]
+        }
+      ],
+      "properties": {
+        "Node name for S&R": "EmptyLatentImage",
+        "cnr_id": "comfy-core",
+        "ver": "0.25.0"
+      },
+      "widgets_values": [
+        1000,
+        4000,
+        1
+      ]
+    },
+    {
+      "id": 74,
+      "type": "SaveImage",
+      "pos": [
+        600,
+        -910
+      ],
+      "size": [
+        620,
+        730
+      ],
+      "flags": {},
+      "order": 13,
+      "mode": 0,
+      "inputs": [
+        {
+          "name": "images",
+          "type": "IMAGE",
+          "link": 124
+        }
+      ],
+      "outputs": [
+        {
+          "name": "images",
+          "type": "IMAGE",
+          "links": null
+        }
+      ],
+      "properties": {
+        "Node name for S&R": "SaveImage",
+        "enableTabs": false,
+        "tabWidth": 65,
+        "tabXOffset": 10,
+        "hasSecondTab": false,
+        "secondTabText": "Send Back",
+        "secondTabOffset": 80,
+        "secondTabWidth": 65,
+        "cnr_id": "comfy-core",
+        "ver": "0.11.1"
+      },
+      "widgets_values": [
+        "krea2"
+      ]
+    },
+    {
+      "id": 72,
+      "type": "DyPE_FLUX",
+      "pos": [
+        -390,
+        -250
+      ],
+      "size": [
+        440,
+        410
+      ],
+      "flags": {},
+      "order": 9,
+      "mode": 4,
+      "inputs": [
+        {
+          "name": "model",
+          "type": "MODEL",
+          "link": 117
+        }
+      ],
+      "outputs": [
+        {
+          "name": "Patched Model",
+          "type": "MODEL",
+          "links": [
+            118
+          ]
+        }
+      ],
+      "properties": {
+        "Node name for S&R": "DyPE_FLUX",
+        "cnr_id": "ComfyUI-DyPE",
+        "ver": "7dbea3b189ef5d75ead0f7bb5c237eee180ac19a"
+      },
+      "widgets_values": [
+        2048,
+        2048,
+        "auto",
+        "vision_yarn",
+        true,
+        true,
+        1024,
+        1,
+        2,
+        2,
+        0.5,
+        1.15
+      ],
+      "color": "#332922",
+      "bgcolor": "#593930"
+    },
+    {
+      "id": 78,
+      "type": "SEGA",
+      "pos": [
+        100,
+        -250
+      ],
+      "size": [
+        350,
+        480
+      ],
+      "flags": {
+        "collapsed": false
+      },
+      "order": 10,
+      "mode": 0,
+      "inputs": [
+        {
+          "name": "model",
+          "type": "MODEL",
+          "link": 118
+        },
+        {
+          "name": "width",
+          "type": "INT",
+          "widget": {
+            "name": "width"
+          },
+          "link": 122
+        },
+        {
+          "name": "height",
+          "type": "INT",
+          "widget": {
+            "name": "height"
+          },
+          "link": 123
+        }
+      ],
+      "outputs": [
+        {
+          "name": "Patched Model",
+          "type": "MODEL",
+          "links": [
+            119
+          ]
+        }
+      ],
+      "properties": {
+        "Node name for S&R": "SEGA"
+      },
+      "widgets_values": [
+        1000,
+        4000,
+        "auto",
+        "sega",
+        0.15,
+        1.5,
+        1,
+        0,
+        1,
+        1.5,
+        "power_res",
+        0.08,
+        1024,
+        0.5,
+        1.15
+      ],
+      "color": "#332922",
+      "bgcolor": "#593930"
+    },
+    {
+      "id": 81,
+      "type": "PrimitiveNode",
+      "pos": [
+        -740,
+        0
+      ],
+      "size": [
+        250,
+        90
+      ],
+      "flags": {},
+      "order": 3,
+      "mode": 0,
+      "inputs": [],
+      "outputs": [
+        {
+          "name": "INT",
+          "type": "INT",
+          "widget": {
+            "name": "height"
+          },
+          "links": [
+            121,
+            123
+          ]
+        }
+      ],
+      "title": "height",
+      "properties": {
+        "Run widget replace on values": false
+      },
+      "widgets_values": [
+        4000,
+        "fixed"
+      ],
+      "color": "#232",
+      "bgcolor": "#353"
+    },
+    {
+      "id": 82,
+      "type": "PrimitiveNode",
+      "pos": [
+        -740,
+        -140
+      ],
+      "size": [
+        250,
+        90
+      ],
+      "flags": {},
+      "order": 4,
+      "mode": 0,
+      "inputs": [],
+      "outputs": [
+        {
+          "name": "INT",
+          "type": "INT",
+          "widget": {
+            "name": "width"
+          },
+          "links": [
+            120,
+            122
+          ]
+        }
+      ],
+      "title": "width",
+      "properties": {
+        "Run widget replace on values": false
+      },
+      "widgets_values": [
+        1000,
+        "fixed"
+      ],
+      "color": "#232",
+      "bgcolor": "#353"
     }
   ],
   "links": [
@@ -569,7 +737,7 @@
       "MODEL"
     ],
     [
-      109,
+      117,
       59,
       0,
       72,
@@ -577,15 +745,55 @@
       "MODEL"
     ],
     [
-      110,
+      118,
       72,
+      0,
+      78,
+      0,
+      "MODEL"
+    ],
+    [
+      119,
+      78,
       0,
       53,
       0,
       "MODEL"
     ],
     [
-      113,
+      120,
+      82,
+      0,
+      52,
+      0,
+      "INT"
+    ],
+    [
+      121,
+      81,
+      0,
+      52,
+      1,
+      "INT"
+    ],
+    [
+      122,
+      82,
+      0,
+      78,
+      1,
+      "INT"
+    ],
+    [
+      123,
+      81,
+      0,
+      78,
+      2,
+      "INT"
+    ],
+    [
+      124,
       54,
       0,
       74,
@@ -600,8 +808,8 @@
       "bounding": [
         -980,
         -940,
-        490,
-        920
+        500,
+        740
       ],
       "color": "#3f789e",
       "flags": {}
@@ -612,8 +820,8 @@
       "bounding": [
         -460,
         -940,
-        500,
-        390
+        660,
+        540
       ],
       "color": "#3f789e",
       "flags": {}
@@ -622,10 +830,10 @@
       "id": 8,
       "title": "Size",
       "bounding": [
-        -460,
-        -520,
-        500,
-        500
+        -440,
+        -330,
+        950,
+        600
       ],
       "color": "#3f789e",
       "flags": {}
@@ -634,10 +842,10 @@
   "config": {},
   "extra": {
     "ds": {
-      "scale": 0.6901133551829569,
+      "scale": 0.6273757774390538,
       "offset": [
-        1497.4633408533543,
-        1172.928762968007
+        1060,
+        1010
       ]
     },
     "frontendVersion": "1.47.12",
