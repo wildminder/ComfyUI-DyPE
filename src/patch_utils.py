@@ -531,7 +531,7 @@ def apply_sega_to_model(
                     target_res_h=height, target_res_w=width,
                 )
             except Exception as e:
-                logger.warning(f"SEGA spectral computation failed: {e}", exc_info=True)
+                logger.debug(f"SEGA spectral computation skipped: {e}")
 
         input_x, c = args_dict.get("input"), args_dict.get("c", {})
         return model_function(input_x, args_dict.get("timestep"), **c)

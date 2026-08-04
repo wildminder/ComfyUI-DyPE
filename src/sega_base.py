@@ -182,12 +182,6 @@ class SegAPosEmbed(DyPEBasePosEmbed):
 
         # If no spectral data or spread is zero, return uniform base_mscale
         if energy_profile is None or self._dynamic_spread <= 0.0 or base_ms <= 1.0 + 1e-8:
-            import logging
-            logging.getLogger("ComfyUI-DyPE").debug(
-                f"SEGA mscale: axis={axis_idx} using uniform base_ms={base_ms:.4f} "
-                f"(energy={'None' if energy_profile is None else 'set'}, "
-                f"spread={self._dynamic_spread:.4f})"
-            )
             return float(base_ms)
 
         # Compute inverse frequencies for this axis
@@ -207,12 +201,6 @@ class SegAPosEmbed(DyPEBasePosEmbed):
             alpha=self.mscale_alpha,
             beta=self.mscale_beta,
             min_mscale=self.mscale_min,
-        )
-        import logging
-        logging.getLogger("ComfyUI-DyPE").info(
-            f"SEGA mscale: axis={axis_idx} per-dim computed "
-            f"(base_ms={base_ms:.4f}, spread={self._dynamic_spread:.4f}, "
-            f"mscale range=[{mscale.min().item():.4f}, {mscale.max().item():.4f}])"
         )
         return mscale
 
