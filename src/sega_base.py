@@ -188,8 +188,12 @@ class SegAPosEmbed(DyPEBasePosEmbed):
         axis_theta = self.thetas[axis_idx] if self.thetas is not None else self.theta
         dim_half = axis_dim // 2
         dim_indices = torch.arange(0, axis_dim, 2, dtype=torch.float32, device=device)
-        # NTK-scaled theta
-        scaled_theta = axis_theta * ntk_factor
+        # For models with baked-in NTK (per-axis theta), the theta already
+        # contains the NTK scaling, so we use ntk_factor=1.0 here to avoid
+        # double-NTK in the frequency mapping for SEGA allocation.
+        has_baked_ntk = self.thetas is not None
+        freq_ntk_factor = 1.0 if has_baked_ntk else ntk_factor
+        scaled_theta = axis_theta * freq_ntk_factor
         freqs = 1.0 / (scaled_theta ** (dim_indices / axis_dim))
 
         # Compute per-dim mscale via SEGA allocation
@@ -214,10 +218,18 @@ class SegAPosEmbed(DyPEBasePosEmbed):
         2. Compute per-dim SEGA mscale from the spectral energy profile.
         3. Generate cos/sin with NTK-scaled frequencies.
         4. Multiply cos/sin by the per-dim mscale.
+
+        For models with per-axis theta (e.g. Anima/Cosmos), the NTK is
+        already baked into the theta values.  In that case, we use
+        ``ntk_factor=1.0`` for the base frequencies (to avoid double-NTK)
+        but still use the computed NTK factor for the SEGA mscale gate.
         """
         n_axes = pos.shape[-1]
         components = []
         device = pos.device
+
+        # Detect per-axis theta (NTK already baked in, e.g. Anima)
+        has_baked_ntk = self.thetas is not None
 
         # Compute global scale (same logic as _calc_ntk_components)
         if n_axes >= 3:
@@ -238,6 +250,11 @@ class SegAPosEmbed(DyPEBasePosEmbed):
             if i > 0 and scale_global > 1.0:
                 ntk_factor = self._compute_ntk_factor(axis_dim, scale_global)
 
+            # For models with baked-in NTK (per-axis theta), use ntk_factor=1.0
+            # for base frequencies to avoid double-NTK. The theta already
+            # contains the NTK scaling.
+            base_ntk_factor = 1.0 if has_baked_ntk else ntk_factor
+
             # Generate cos/sin with NTK-scaled frequencies
             common_kwargs = {
                 "dim": axis_dim,
@@ -247,7 +264,7 @@ class SegAPosEmbed(DyPEBasePosEmbed):
                 "repeat_interleave_real": True,
                 "freqs_dtype": freqs_dtype,
             }
-            cos, sin = get_1d_ntk_pos_embed(**common_kwargs, ntk_factor=ntk_factor)
+            cos, sin = get_1d_ntk_pos_embed(**common_kwargs, ntk_factor=base_ntk_factor)
 
             # Apply per-dim SEGA mscale to spatial axes
             if i > 0 and ntk_factor > 1.0:

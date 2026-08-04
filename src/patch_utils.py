@@ -428,6 +428,18 @@ def apply_sega_to_model(
 
     embedder_base_patches = derived_base_patches if is_z_image else None
 
+    # For Anima, use the native patch grid from the model config
+    if is_anima:
+        try:
+            dm = m.model.diffusion_model
+            max_img_h = getattr(dm, 'max_img_h', None)
+            patch_spatial = getattr(dm, 'patch_spatial', 2)
+            if max_img_h is not None:
+                native_patches = max_img_h // patch_spatial
+                embedder_base_patches = native_patches
+        except Exception as e:
+            logger.debug(f"Could not read Anima native patch grid: {e}")
+
     new_pe_embedder = sega_embedder_cls(
         theta, axes_dim, method=method,
         yarn_alt_scaling=False, dype=False,
@@ -483,15 +495,20 @@ def apply_sega_to_model(
 
         # --- Compute spectral profiles from input latent ---
         input_x = args_dict.get("input")
-        if input_x is not None and input_x.dim() == 4:
+        if input_x is not None and input_x.dim() >= 4:
             try:
-                B, C_lat, H_lat, W_lat = input_x.shape
+                # Handle both 4D (B,C,H,W) and 5D (B,C,T,H,W) latents
+                if input_x.dim() == 5:
+                    # Video model (e.g. Anima): use first frame for spectral analysis
+                    B, C_lat, T_lat, H_lat, W_lat = input_x.shape
+                    spatial = input_x[:, :, 0].float().permute(0, 2, 3, 1)  # (B, H, W, C)
+                else:
+                    B, C_lat, H_lat, W_lat = input_x.shape
+                    spatial = input_x.float().permute(0, 2, 3, 1)  # (B, H, W, C)
+
                 # Convert to patch grid dimensions
                 H_patches = max(H_lat // patch_size, 1)
                 W_patches = max(W_lat // patch_size, 1)
-
-                # Reshape to (B, H, W, C) for spectral analysis
-                spatial = input_x.float().permute(0, 2, 3, 1)  # (B, H, W, C)
 
                 n_bins_h = max(H_patches // 2, 8)
                 n_bins_w = max(W_patches // 2, 8)
