@@ -242,6 +242,7 @@ class DyPEBasePosEmbed(nn.Module):
         for i in range(n_axes):
             axis_pos = pos[..., i]
             axis_dim = self.axes_dim[i]
+            axis_theta = self.thetas[i] if self.thetas is not None else self.theta
 
             if i > 0 and scale_global > 1.0:
                 if self.dype:
@@ -254,7 +255,7 @@ class DyPEBasePosEmbed(nn.Module):
             else:
                 scaled_pos = axis_pos
 
-            common_kwargs = {'dim': axis_dim, 'pos': scaled_pos, 'theta': self.theta,
+            common_kwargs = {'dim': axis_dim, 'pos': scaled_pos, 'theta': axis_theta,
                             'use_real': True, 'repeat_interleave_real': True, 'freqs_dtype': freqs_dtype}
             cos, sin = get_1d_ntk_pos_embed(**common_kwargs, ntk_factor=1.0)
             components.append((cos, sin))

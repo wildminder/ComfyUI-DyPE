@@ -218,3 +218,59 @@ class TestGetComponents:
 
         # Axis 1 (height) should differ since extrapolation is needed
         assert not torch.allclose(comp_vy[1][0], comp_base[1][0], atol=1e-3)
+
+
+@pytest.mark.unit
+class TestPerAxisTheta:
+    """Test per-axis theta support in base class."""
+
+    def _make_pos(self, H=64, W=64):
+        L = H * W
+        pos = torch.zeros(1, L, 3)
+        pos[..., 1] = torch.arange(H).unsqueeze(1).expand(H, W).reshape(-1).float()
+        pos[..., 2] = torch.arange(W).unsqueeze(0).expand(H, W).reshape(-1).float()
+        return pos
+
+    def test_list_theta_vision_yarn(self):
+        """Vision YaRN should work with list theta."""
+        emb = ConcreteEmbed(
+            theta=[10000.0, 20000.0, 30000.0],
+            axes_dim=[16, 56, 56],
+            method='vision_yarn'
+        )
+        pos = self._make_pos(8, 8)
+        components = emb.get_components(pos, torch.float32)
+        assert len(components) == 3
+
+    def test_list_theta_yarn(self):
+        """YaRN should work with list theta."""
+        emb = ConcreteEmbed(
+            theta=[10000.0, 20000.0, 30000.0],
+            axes_dim=[16, 56, 56],
+            method='yarn'
+        )
+        pos = self._make_pos(8, 8)
+        components = emb.get_components(pos, torch.float32)
+        assert len(components) == 3
+
+    def test_list_theta_ntk(self):
+        """NTK should work with list theta."""
+        emb = ConcreteEmbed(
+            theta=[10000.0, 20000.0, 30000.0],
+            axes_dim=[16, 56, 56],
+            method='ntk'
+        )
+        pos = self._make_pos(8, 8)
+        components = emb.get_components(pos, torch.float32)
+        assert len(components) == 3
+
+    def test_list_theta_pi(self):
+        """PI should work with list theta."""
+        emb = ConcreteEmbed(
+            theta=[10000.0, 20000.0, 30000.0],
+            axes_dim=[16, 56, 56],
+            method='pi'
+        )
+        pos = self._make_pos(8, 8)
+        components = emb.get_components(pos, torch.float32)
+        assert len(components) == 3

@@ -1,7 +1,19 @@
 import torch
 from ..base import DyPEBasePosEmbed
 
+
 class PosEmbedAnima(DyPEBasePosEmbed):
+    """
+    DyPE Implementation for Anima/Cosmos models.
+    
+    Cosmos uses per-axis NTK factors (t_ntk_factor, h_ntk_factor, w_ntk_factor)
+    which result in per-axis theta values. The base class DyPEBasePosEmbed already
+    handles per-axis theta via self.thetas[i], so no get_components() override
+    is needed.
+    
+    Output Format: (T*H*W, D/2, 2, 2) rotation matrices matching Cosmos RoPE format.
+    """
+
     def forward(self, x_B_T_H_W_C, fps=None, device=None, dtype=None):
         B, T, H, W, C = x_B_T_H_W_C.shape
 

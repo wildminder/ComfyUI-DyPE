@@ -161,10 +161,17 @@ def apply_dype_to_model(model: ModelPatcher, model_type: str, width: int, height
             dim_t = head_dim - 2 * dim_h
             dim_w = dim_h
             axes_dim = [dim_t, dim_h, dim_w]
-            # Cosmos uses per-axis NTK even at native resolution
-            t_ntk = getattr(orig_embedder, "t_ntk_factor", 1.0)
-            h_ntk = getattr(orig_embedder, "h_ntk_factor", 1.0)
-            w_ntk = getattr(orig_embedder, "w_ntk_factor", 1.0)
+            # Read extrapolation ratios from the diffusion_model config (not from
+            # orig_embedder, which may have been replaced by a previous DyPE call's
+            # PosEmbedAnima instance that lacks t_ntk_factor/h_ntk_factor/w_ntk_factor).
+            # The MiniTrainDIT stores rope_h/w/t_extrapolation_ratio as attributes.
+            h_extrap = getattr(dm, 'rope_h_extrapolation_ratio', 1.0)
+            w_extrap = getattr(dm, 'rope_w_extrapolation_ratio', 1.0)
+            t_extrap = getattr(dm, 'rope_t_extrapolation_ratio', 1.0)
+            # Compute NTK factors the same way VideoRopePosition3DEmb.__init__ does
+            t_ntk = t_extrap ** (dim_t / (dim_t - 2))
+            h_ntk = h_extrap ** (dim_h / (dim_h - 2))
+            w_ntk = w_extrap ** (dim_w / (dim_w - 2))
             theta = [theta_base * t_ntk, theta_base * h_ntk, theta_base * w_ntk]
         else:
             theta, axes_dim = orig_embedder.theta, orig_embedder.axes_dim

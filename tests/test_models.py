@@ -5,6 +5,7 @@ import pytest
 from src.models.flux import PosEmbedFlux
 from src.models.nunchaku import PosEmbedNunchaku
 from src.models.qwen import PosEmbedQwen
+from src.models.anima import PosEmbedAnima
 
 
 @pytest.fixture
@@ -110,3 +111,164 @@ class TestPosEmbedQwen:
         # col1 should be [-sin, cos]
         assert torch.allclose(col1[0], -sin_val, atol=1e-5)
         assert torch.allclose(col1[1], cos_val, atol=1e-5)
+
+
+@pytest.mark.unit
+class TestPosEmbedAnima:
+    """Tests for Anima/Cosmos positional embedding adapter."""
+
+    def _make_anima_pos(self, T=1, H=64, W=64):
+        """Create position tensor for Anima: (T*H*W, 3) with (t, h, w) coordinates."""
+        t_grid = torch.arange(T, dtype=torch.float32).view(T, 1, 1).expand(T, H, W)
+        h_grid = torch.arange(H, dtype=torch.float32).view(1, H, 1).expand(T, H, W)
+        w_grid = torch.arange(W, dtype=torch.float32).view(1, 1, W).expand(T, H, W)
+        pos = torch.stack([t_grid.flatten(), h_grid.flatten(), w_grid.flatten()], dim=-1)
+        return pos
+
+    def test_output_shape(self):
+        """Anima output should be (T*H*W, D/2, 2, 2) rotation matrices."""
+        # head_dim = 128, dim_h = dim_w = 128//6*2 = 42, dim_t = 128 - 84 = 44
+        # axes_dim = [44, 42, 42]
+        emb = PosEmbedAnima(
+            theta=[10000.0, 10000.0, 10000.0],
+            axes_dim=[44, 42, 42],
+            method='vision_yarn'
+        )
+        pos = self._make_anima_pos(T=1, H=8, W=8)
+        components = emb.get_components(pos, torch.float32)
+        assert len(components) == 3
+        # Each component should have shape (T*H*W, dim_axis)
+        assert components[0][0].shape == (64, 44)  # temporal
+        assert components[1][0].shape == (64, 42)  # height
+        assert components[2][0].shape == (64, 42)  # width
+
+    def test_per_axis_theta(self):
+        """Anima should use per-axis theta values via base class thetas list."""
+        emb = PosEmbedAnima(
+            theta=[10000.0, 20000.0, 30000.0],
+            axes_dim=[44, 42, 42],
+            method='vision_yarn'
+        )
+        assert emb.thetas == [10000.0, 20000.0, 30000.0]
+
+    def test_vision_yarn_extrapolation(self):
+        """Vision YaRN should handle extrapolation correctly."""
+        emb = PosEmbedAnima(
+            theta=[10000.0, 10000.0, 10000.0],
+            axes_dim=[44, 42, 42],
+            method='vision_yarn',
+            base_resolution=512  # base_patch_grid = (32, 32)
+        )
+        # 64x64 patches = 2x extrapolation from 32x32 base
+        pos = self._make_anima_pos(T=1, H=64, W=64)
+        components = emb.get_components(pos, torch.float32)
+        assert len(components) == 3
+        # Should not raise and should produce finite values
+        for cos, sin in components:
+            assert torch.isfinite(cos).all()
+            assert torch.isfinite(sin).all()
+
+    def test_yarn_method_with_extrapolation(self):
+        """YaRN method should handle extrapolation with per-axis scale."""
+        emb = PosEmbedAnima(
+            theta=[10000.0, 10000.0, 10000.0],
+            axes_dim=[44, 42, 42],
+            method='yarn',
+            base_resolution=512
+        )
+        pos = self._make_anima_pos(T=1, H=64, W=64)
+        components = emb.get_components(pos, torch.float32)
+        assert len(components) == 3
+        for cos, sin in components:
+            assert torch.isfinite(cos).all()
+            assert torch.isfinite(sin).all()
+
+    def test_ntk_method_with_extrapolation(self):
+        """NTK method should handle extrapolation with per-axis scale."""
+        emb = PosEmbedAnima(
+            theta=[10000.0, 10000.0, 10000.0],
+            axes_dim=[44, 42, 42],
+            method='ntk',
+            base_resolution=512
+        )
+        pos = self._make_anima_pos(T=1, H=64, W=64)
+        components = emb.get_components(pos, torch.float32)
+        assert len(components) == 3
+        for cos, sin in components:
+            assert torch.isfinite(cos).all()
+            assert torch.isfinite(sin).all()
+
+    def test_pi_method_with_extrapolation(self):
+        """PI method should handle extrapolation with per-axis scale."""
+        emb = PosEmbedAnima(
+            theta=[10000.0, 10000.0, 10000.0],
+            axes_dim=[44, 42, 42],
+            method='pi',
+            base_resolution=512
+        )
+        pos = self._make_anima_pos(T=1, H=64, W=64)
+        components = emb.get_components(pos, torch.float32)
+        assert len(components) == 3
+        for cos, sin in components:
+            assert torch.isfinite(cos).all()
+            assert torch.isfinite(sin).all()
+
+    def test_base_method_no_extrapolation(self):
+        """Base method should not apply any scaling."""
+        emb = PosEmbedAnima(
+            theta=[10000.0, 10000.0, 10000.0],
+            axes_dim=[44, 42, 42],
+            method='base',
+            base_resolution=512
+        )
+        pos = self._make_anima_pos(T=1, H=64, W=64)
+        components = emb.get_components(pos, torch.float32)
+        assert len(components) == 3
+        for cos, sin in components:
+            assert torch.isfinite(cos).all()
+            assert torch.isfinite(sin).all()
+
+    def test_temporal_axis_not_scaled(self):
+        """Temporal axis (i=0) should never be scaled."""
+        emb = PosEmbedAnima(
+            theta=[10000.0, 10000.0, 10000.0],
+            axes_dim=[44, 42, 42],
+            method='vision_yarn',
+            base_resolution=512
+        )
+        pos = self._make_anima_pos(T=4, H=64, W=64)
+        components = emb.get_components(pos, torch.float32)
+        # Temporal component should use ntk_factor=1.0 (no scaling)
+        # We can't directly test this, but we can verify the output is finite
+        assert torch.isfinite(components[0][0]).all()
+        assert torch.isfinite(components[0][1]).all()
+
+    def test_non_square_resolution(self):
+        """Non-square resolutions should use per-axis scaling."""
+        emb = PosEmbedAnima(
+            theta=[10000.0, 10000.0, 10000.0],
+            axes_dim=[44, 42, 42],
+            method='vision_yarn',
+            base_resolution=512
+        )
+        # H=64, W=128 — different scales for H and W
+        pos = self._make_anima_pos(T=1, H=64, W=128)
+        components = emb.get_components(pos, torch.float32)
+        assert len(components) == 3
+        for cos, sin in components:
+            assert torch.isfinite(cos).all()
+            assert torch.isfinite(sin).all()
+
+    def test_forward_output_shape(self):
+        """Forward pass should produce correct output shape."""
+        emb = PosEmbedAnima(
+            theta=[10000.0, 10000.0, 10000.0],
+            axes_dim=[44, 42, 42],
+            method='vision_yarn'
+        )
+        x = torch.randn(1, 1, 8, 8, 128)  # B, T, H, W, C
+        out = emb(x)
+        # Output should be (T*H*W, D/2, 2, 2) where D = 128
+        # D/2 = 64, but we have 3 axes with dims [44, 42, 42]
+        # Total freq dim = 44//2 + 42//2 + 42//2 = 22 + 21 + 21 = 64
+        assert out.shape == (64, 64, 2, 2)
