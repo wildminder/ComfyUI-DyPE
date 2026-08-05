@@ -1,5 +1,5 @@
 <div id="readme-top" align="center">
-  <h1 align="center">ComfyUI-DyPE</h1>
+  <h1 align="center">ComfyUI-DyPE/SEGA</h1>
 
 <img src="https://github.com/user-attachments/assets/4f11966b-86f7-4bdb-acd4-ada6135db2f8" alt="ComfyUI-DyPE Banner" width="70%">
 
@@ -63,7 +63,15 @@ This node provides a seamless, "plug-and-play" integration of DyPE into your wor
 
 ## SEGA Node
 
+<div align="center">
+<img alt="Node" width="70%" src="https://github.com/user-attachments/assets/6420a05b-0702-4fa1-8137-047db5e133ea" />
+</div>
+
 **SEGA** (Spectral-Energy Guided Attention) — content-aware per-dimension RoPE mscale from the latent's FFT spectrum. Use as an alternative to DyPE for FLUX/Qwen. For Anima, use DyPE `vision_yarn` instead.
+
+<div align="center">
+<img alt="Example sega" src="https://github.com/user-attachments/assets/c9d812c8-a88b-4e8d-bb84-0f4bd5ef18ef" />
+</div>
 
 ### Usage
 
