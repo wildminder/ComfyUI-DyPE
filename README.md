@@ -61,39 +61,32 @@ This node provides a seamless, "plug-and-play" integration of DyPE into your wor
 
 <p align="right">(<a href="#readme-top">back to top</a>)</p>
 
-## SEGA (Spectral-Energy Guided Attention)
+## SEGA Node
 
-In addition to DyPE, this node pack includes **SEGA** — a complementary method that computes **per-RoPE-dimension scaling factors** from the latent's Fourier spectrum at each denoising step. While DyPE modifies RoPE frequency bases globally, SEGA adapts attention sharpness per-frequency based on the actual image content being generated.
+**SEGA** (Spectral-Energy Guided Attention) — content-aware per-dimension RoPE mscale from the latent's FFT spectrum. Use as an alternative to DyPE for FLUX/Qwen. For Anima, use DyPE `vision_yarn` instead.
 
-### How SEGA Works
+### Usage
 
-1. At each denoising step, SEGA computes a 2D FFT of the current latent
-2. It extracts per-axis (H, W) spectral energy profiles and a radial (isotropic) profile
-3. Spectral flatness determines a dynamic "spread" gate — early (noisy) steps get low spread, later (structured) steps get high spread
-4. Each RoPE dimension is mapped to its corresponding FFT frequency band
-5. A zero-sum correction redistributes mscale: underrepresented frequencies get stronger scaling, overrepresented get weaker
+1. Add the **SEGA** node after your model loader
+2. Set width/height to match your latent
+3. Use `method: sega` (default) or `method: ntk` (NTK only, no spectral)
+4. Tune `mscale_alpha` (amplitude) and `spread_min`/`spread_max` (spectral gate range)
 
-### SEGA vs DyPE
-
-| Feature | DyPE | SEGA |
-|---------|------|------|
-| **What it scales** | RoPE frequency bases (NTK/YaRN/PI) | Per-dim RoPE mscale multiplier |
-| **Content-aware** | No (static per-step) | Yes (FFT of latent at each step) |
-| **Parameters** | `dype_scale`, `dype_exponent` | `mscale_alpha`, `mscale_beta`, `spread_min/max` |
-| **Best for** | General extrapolation | Content with varying frequency content |
-
-### SEGA Node Parameters
+### Parameters
 
 | Parameter | Default | Description |
 |-----------|---------|-------------|
-| `mscale_alpha` | 0.15 | SEGA amplitude — controls spectral redistribution strength |
-| `mscale_beta` | 1.5 | tanh sharpness — higher = more binary redistribution |
-| `mscale_min` | 1.0 | Floor for per-frequency mscale values |
-| `spread_min` | 0.0 | Minimum spectral spread (early steps) |
-| `spread_max` | 1.0 | Maximum spectral spread (late steps) |
-| `spread_alpha` | 1.5 | Non-linear mapping exponent for spread schedule |
-| `base_mscale_formula` | power_res | `power_res`: m_ref = s^κ, `log_res`: m_ref = 1 + κ·ln(s) |
-| `base_mscale_coefficient` | 0.08 | κ coefficient (paper default) |
+| `method` | sega | `sega` = NTK + spectral mscale, `ntk` = NTK only |
+| `mscale_alpha` | 0.15 | Spectral redistribution amplitude |
+| `mscale_beta` | 1.5 | tanh sharpness |
+| `mscale_min` | 1.0 | Floor for per-frequency mscale |
+| `spread_min` | 0.0 | Min spectral spread (early steps) |
+| `spread_max` | 1.0 | Max spectral spread (late steps) |
+| `spread_alpha` | 1.5 | Spread schedule non-linearity |
+| `base_mscale_formula` | power_res | `power_res`: s^κ, `log_res`: 1+κ·ln(s) |
+| `base_mscale_coefficient` | 0.08 | κ (paper default) |
+
+> **Note:** SEGA uses NTK as its base extrapolation. It refines NTK with per-dimension spectral mscale. If NTK doesn't work for your model (e.g. Anima), SEGA won't either — use DyPE `vision_yarn` instead.
 
 <p align="right">(<a href="#readme-top">back to top</a>)</p>
 
@@ -184,6 +177,11 @@ Using the node is straightforward and designed for minimal workflow disruption.
 <p align="right">(<a href="#readme-top">back to top</a>)</p>
 
 ## Changelog
+
+#### v2.5.0
+*   **SEGA Node:** Added **SEGA** (Spectral-Energy Guided Attention) — a new node that computes per-RoPE-dimension mscale from the latent's Fourier spectrum at each denoising step. Content-aware attention sharpening for FLUX/Qwen. Uses NTK as base extrapolation with per-dim spectral refinement.
+*   **5D Latent Support:** SEGA wrapper handles both 4D `(B,C,H,W)` and 5D `(B,C,T,H,W)` latents for video models.
+*   **Native Patch Grid:** SEGA reads Anima's native `max_img_h`/`patch_spatial` for correct scale computation.
 
 #### v2.4.0
 *   **Anima/Cosmos Support:** Added support for **Anima/Cosmos** models. Reads the model's native per-axis NTK factors and patch grid (`max_img_h/w`, `patch_spatial`) so DyPE only extrapolates beyond native resolution. Recommended method: `vision_yarn`.

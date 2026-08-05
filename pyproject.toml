@@ -16,7 +16,7 @@ Repository = "https://github.com/wildminder/ComfyUI-DyPE"
 [tool.comfy]
 PublisherId = "wildai"
 DisplayName = "DyPE"
-Icon = ""
+Icon = "https://raw.githubusercontent.com/wildminder/ComfyUI-DyPE/refs/heads/main/dype-icon.png"
 requires-comfyui = ">=0.28.0"
 
 [tool.pytest.ini_options]
