@@ -24,7 +24,6 @@ def _make_predict_eps(model, positive, negative, cfg_scale):
 
     Returns a callable: predict_eps(latent, timestep) -> eps [B, C, H, W]
     """
-    # Extract conditioning tensors from positive/negative
     def predict_eps(latent: torch.Tensor, timestep: int) -> torch.Tensor:
         # Convert timestep to sigma — model_sampling expects 1-D [B] tensor
         sigmas = model.model.model_sampling.sigmas
@@ -32,28 +31,29 @@ def _make_predict_eps(model, positive, negative, cfg_scale):
             sigma_val = sigmas[timestep].item()
         else:
             sigma_val = sigmas[-1].item()
-        # Create 1-D sigma tensor matching batch size
         B = latent.shape[0]
         sigma = torch.full((B,), sigma_val, device=latent.device, dtype=latent.dtype)
 
-        # Run model with positive conditioning
+        # Run model with conditioning
         def run_cond(conds):
             if conds is None or len(conds) == 0:
                 return torch.zeros_like(latent)
             cond = conds[0]
-            c_crossattn = cond[0].to(latent.device, latent.dtype) if isinstance(cond[0], torch.Tensor) else None
+            c_crossattn = cond[0] if isinstance(cond[0], torch.Tensor) else None
             extra = cond[1] if len(cond) > 1 else {}
-            # Handle pooled embeddings (SDXL adm)
-            c_adm = None
+
+            # Build kwargs for apply_model
+            kwargs = {}
+            if c_crossattn is not None:
+                kwargs["c_crossattn"] = c_crossattn.to(latent.device, latent.dtype)
+
+            # Handle pooled embeddings (SDXL adm) — passed as 'y' kwarg
             if isinstance(extra, dict):
-                c_adm = extra.get("pooled_output", None)
-                if c_adm is not None:
-                    c_adm = c_adm.to(latent.device, latent.dtype)
-            eps = model.model.apply_model(
-                latent, sigma,
-                c_crossattn=[c_crossattn] if c_crossattn is not None else None,
-                c_adm=c_adm,
-            )
+                pooled = extra.get("pooled_output", None)
+                if pooled is not None:
+                    kwargs["y"] = pooled.to(latent.device, latent.dtype)
+
+            eps = model.model.apply_model(latent, sigma, **kwargs)
             return eps
 
         eps_cond = run_cond(positive)
