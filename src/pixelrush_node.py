@@ -88,8 +88,11 @@ def _make_predict_eps(model, positive, negative, cfg_scale):
             p = comfy.samplers.get_area_and_mult(cond, latent, sigma)
             if p is None:
                 return torch.zeros_like(latent)
-            # Build the conditioning dict for apply_model
-            c = dict(p.conditioning)
+            # p.conditioning is a dict of COND objects (e.g. CONDCrossAttn)
+            # apply_model expects raw tensors, not COND objects.
+            # cond_cat extracts .cond from each COND object and concatenates.
+            # With a single cond, concat([]) returns self.cond (the tensor).
+            c = comfy.samplers.cond_cat([p.conditioning])
             # apply_model requires transformer_options
             # model is the ModelPatcher; apply_hooks returns the transformer_options dict
             c['transformer_options'] = model.apply_hooks(hooks=None)

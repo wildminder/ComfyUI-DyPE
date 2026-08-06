@@ -133,3 +133,11 @@ class TestPredictEpsConditioningPipeline:
             "_make_predict_eps should use model.apply_hooks (ModelPatcher) "
             "directly, not model.model.current_patcher.apply_hooks"
         )
+
+    def test_uses_cond_cat_to_extract_tensors(self):
+        """Should use cond_cat to extract tensors from COND objects."""
+        content = self._read_source()
+        assert "cond_cat" in content, (
+            "_make_predict_eps must use cond_cat to extract raw tensors from "
+            "COND objects (p.conditioning contains CONDCrossAttn etc., not tensors)"
+        )
