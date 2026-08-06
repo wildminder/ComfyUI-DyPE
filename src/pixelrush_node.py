@@ -133,12 +133,19 @@ def _make_vae_adapters(vae, device):
 
     Returns (vae_decode, vae_encode) callables.
     All tensors are moved to ``device`` for GPU acceleration.
+    Handles both 2D VAEs (latent_dim=2, 4D latents [B,C,H,W]) and
+    3D/video VAEs (latent_dim=3, 5D latents [B,C,T,H,W]).
     """
+    latent_dim = getattr(vae, 'latent_dim', 2)
+
     def vae_decode(latent: torch.Tensor) -> torch.Tensor:
         # latent: [B, C, H, W] — ComfyUI VAE expects [B, C, H, W]
         if isinstance(latent, dict):
             latent = latent["samples"]
         latent = latent.to(device)
+        # For 3D VAEs (video), add temporal dimension: [B,C,H,W] -> [B,C,1,H,W]
+        if latent_dim == 3 and latent.ndim == 4:
+            latent = latent.unsqueeze(2)
         # VAE decode expects unscaled latent
         # ComfyUI VAEs handle scaling internally
         decoded = vae.decode(latent)
@@ -154,7 +161,10 @@ def _make_vae_adapters(vae, device):
             image = image.movedim(1, -1)
         encoded = vae.encode(image)
         if isinstance(encoded, dict):
-            return encoded["samples"]
+            encoded = encoded["samples"]
+        # For 3D VAEs (video), remove temporal dimension: [B,C,1,H,W] -> [B,C,H,W]
+        if latent_dim == 3 and encoded.ndim == 5:
+            encoded = encoded.squeeze(2)
         return encoded
 
     return vae_decode, vae_encode
