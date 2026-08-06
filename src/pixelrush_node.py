@@ -42,16 +42,23 @@ def _make_predict_eps(model, positive, negative, cfg_scale):
             c_crossattn = cond[0] if isinstance(cond[0], torch.Tensor) else None
             extra = cond[1] if len(cond) > 1 else {}
 
-            # Build kwargs for apply_model
+            # Build kwargs for apply_model — pass conditioning extras
+            # so the model can build adm/y internally via encode_adm()
             kwargs = {}
             if c_crossattn is not None:
                 kwargs["c_crossattn"] = c_crossattn.to(latent.device, latent.dtype)
 
-            # Handle pooled embeddings (SDXL adm) — passed as 'y' kwarg
+            # Pass through conditioning extras (pooled_output, width, height, etc.)
+            # The model's extra_conds()/encode_adm() will handle these
             if isinstance(extra, dict):
-                pooled = extra.get("pooled_output", None)
-                if pooled is not None:
-                    kwargs["y"] = pooled.to(latent.device, latent.dtype)
+                for key in ("pooled_output", "width", "height", "crop_w", "crop_h",
+                            "aesthetic_score", "target_size", "original_size"):
+                    if key in extra:
+                        val = extra[key]
+                        if isinstance(val, torch.Tensor):
+                            kwargs[key] = val.to(latent.device, latent.dtype)
+                        else:
+                            kwargs[key] = val
 
             eps = model.model.apply_model(latent, sigma, **kwargs)
             return eps
