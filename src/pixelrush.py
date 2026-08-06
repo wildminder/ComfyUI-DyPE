@@ -11,6 +11,7 @@ Reference: PixelRush paper (arXiv:2602.12769).
 
 from __future__ import annotations
 
+import logging
 import math
 from dataclasses import dataclass
 from typing import Callable, Iterator, Tuple
@@ -20,6 +21,8 @@ import torch.nn.functional as F
 
 
 Tensor = torch.Tensor
+
+logger = logging.getLogger("ComfyUI-DyPE")
 
 
 @dataclass
@@ -282,13 +285,23 @@ def refine_latent_once(
         dtype=coarse_latent.dtype,
     )  # [1, 1, patch_h, patch_w]
 
-    for y, x in patch_positions(
+    # Collect all patch positions for progress reporting
+    positions = list(patch_positions(
         full_h=full_h,
         full_w=full_w,
         patch_h=cfg.patch_h,
         patch_w=cfg.patch_w,
         overlap=cfg.overlap,
-    ):
+    ))
+    total_patches = len(positions)
+    logger.info(
+        "PixelRush: refining %dx%d latent with %dx%d patches, %d patches total (overlap=%.0f%%)",
+        full_h, full_w, cfg.patch_h, cfg.patch_w, total_patches, cfg.overlap * 100,
+    )
+
+    for idx, (y, x) in enumerate(positions):
+        if idx % 4 == 0:
+            logger.info("PixelRush: patch %d/%d", idx + 1, total_patches)
         patch_0 = coarse_latent[:, :, y:y + cfg.patch_h, x:x + cfg.patch_w]
 
         # 1. Partial DDIM inversion: 0 -> K
@@ -353,7 +366,11 @@ def pixelrush_cascade(
     """
     z = initial_latent
 
-    for _ in range(num_cascade_stages):
+    for stage in range(num_cascade_stages):
+        logger.info(
+            "PixelRush: cascade stage %d/%d — latent shape %s",
+            stage + 1, num_cascade_stages, tuple(z.shape),
+        )
         # Pixel-space cascade upsample: latent → RGB → 2× bicubic → latent
         image = vae_decode(z)
 
@@ -366,6 +383,10 @@ def pixelrush_cascade(
         )
 
         coarse_latent = vae_encode(image_up)
+        logger.info(
+            "PixelRush: upscaled to %s, starting patch refinement",
+            tuple(coarse_latent.shape),
+        )
 
         # Patch-based refinement
         z = refine_latent_once(
@@ -374,5 +395,6 @@ def pixelrush_cascade(
             alpha_bar_at=alpha_bar_at,
             cfg=cfg,
         )
+        logger.info("PixelRush: stage %d complete", stage + 1)
 
     return z

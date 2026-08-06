@@ -66,6 +66,9 @@ def _make_predict_eps(model, positive, negative, cfg_scale):
         return _processed
 
     def predict_eps(latent: torch.Tensor, timestep: int) -> torch.Tensor:
+        # Move latent to model device for inference
+        latent = latent.to(device)
+
         # Convert timestep to sigma
         sigmas = model.model.model_sampling.sigmas
         if timestep < len(sigmas):
@@ -125,15 +128,17 @@ def _make_alpha_bar_at(model):
     return alpha_bar_at
 
 
-def _make_vae_adapters(vae):
+def _make_vae_adapters(vae, device):
     """Create VAE decode/encode adapters.
 
     Returns (vae_decode, vae_encode) callables.
+    All tensors are moved to ``device`` for GPU acceleration.
     """
     def vae_decode(latent: torch.Tensor) -> torch.Tensor:
         # latent: [B, C, H, W] — ComfyUI VAE expects [B, C, H, W]
         if isinstance(latent, dict):
             latent = latent["samples"]
+        latent = latent.to(device)
         # VAE decode expects unscaled latent
         # ComfyUI VAEs handle scaling internally
         decoded = vae.decode(latent)
@@ -144,6 +149,7 @@ def _make_vae_adapters(vae):
 
     def vae_encode(image: torch.Tensor) -> torch.Tensor:
         # image: [B, C, H, W] → VAE expects [B, H, W, C]
+        image = image.to(device)
         if image.dim() == 4 and image.shape[1] == 3:
             image = image.movedim(1, -1)
         encoded = vae.encode(image)
@@ -249,7 +255,11 @@ class PixelRushNode(io.ComfyNode):
         # Create adapters
         predict_eps = _make_predict_eps(model, positive, negative, cfg)
         alpha_bar_at = _make_alpha_bar_at(model)
-        vae_decode, vae_encode = _make_vae_adapters(vae)
+        device = model.load_device if hasattr(model, 'load_device') else torch.device("cpu")
+        vae_decode, vae_encode = _make_vae_adapters(vae, device)
+
+        # Move initial latent to model device for GPU acceleration
+        initial_latent = initial_latent.to(device)
 
         # Run PixelRush cascade
         result_latent = pixelrush_cascade(
