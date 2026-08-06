@@ -128,21 +128,33 @@ def _make_alpha_bar_at(model):
     return alpha_bar_at
 
 
-def _make_vae_adapters(vae, device):
+def _make_vae_adapters(vae, device, model=None):
     """Create VAE decode/encode adapters.
 
     Returns (vae_decode, vae_encode) callables.
     All tensors are moved to ``device`` for GPU acceleration.
     Handles both 2D VAEs (latent_dim=2, 4D latents [B,C,H,W]) and
     3D/video VAEs (latent_dim=3, 5D latents [B,C,T,H,W]).
+    Uses model.process_latent_out/in to convert between model latent
+    format and VAE latent format (needed for Qwen, Krea2, etc.).
     """
     latent_dim = getattr(vae, 'latent_dim', 2)
+    process_latent_out = None
+    process_latent_in = None
+    if model is not None and hasattr(model, 'model'):
+        if hasattr(model.model, 'process_latent_out'):
+            process_latent_out = model.model.process_latent_out
+        if hasattr(model.model, 'process_latent_in'):
+            process_latent_in = model.model.process_latent_in
 
     def vae_decode(latent: torch.Tensor) -> torch.Tensor:
         # latent: [B, C, H, W] — ComfyUI VAE expects [B, C, H, W]
         if isinstance(latent, dict):
             latent = latent["samples"]
         latent = latent.to(device)
+        # Convert from model latent format to VAE latent format
+        if process_latent_out is not None:
+            latent = process_latent_out(latent)
         # For 3D VAEs (video), add temporal dimension: [B,C,H,W] -> [B,C,1,H,W]
         if latent_dim == 3 and latent.ndim == 4:
             latent = latent.unsqueeze(2)
@@ -165,6 +177,9 @@ def _make_vae_adapters(vae, device):
         # For 3D VAEs (video), remove temporal dimension: [B,C,1,H,W] -> [B,C,H,W]
         if latent_dim == 3 and encoded.ndim == 5:
             encoded = encoded.squeeze(2)
+        # Convert from VAE latent format to model latent format
+        if process_latent_in is not None:
+            encoded = process_latent_in(encoded)
         return encoded
 
     return vae_decode, vae_encode
@@ -266,7 +281,7 @@ class PixelRushNode(io.ComfyNode):
         predict_eps = _make_predict_eps(model, positive, negative, cfg)
         alpha_bar_at = _make_alpha_bar_at(model)
         device = model.load_device if hasattr(model, 'load_device') else torch.device("cpu")
-        vae_decode, vae_encode = _make_vae_adapters(vae, device)
+        vae_decode, vae_encode = _make_vae_adapters(vae, device, model)
 
         # Move initial latent to model device for GPU acceleration
         initial_latent = initial_latent.to(device)
