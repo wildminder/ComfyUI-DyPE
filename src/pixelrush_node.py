@@ -22,33 +22,45 @@ logger = logging.getLogger("ComfyUI-DyPE")
 def _make_predict_eps(model, positive, negative, cfg_scale):
     """Create a predict_eps adapter that runs the model with CFG.
 
-    Uses ComfyUI's full conditioning pipeline (process_conds) to properly
-    build model_conds (y, c_crossattn, etc.) from the conditioning input.
+    Uses ComfyUI's full conditioning pipeline:
+      1. ``convert_cond`` — convert tuple conditioning to dict format
+      2. ``process_conds`` — build model_conds (y, c_crossattn, etc.)
+      3. ``get_area_and_mult`` — extract processed conditioning tensors
+      4. ``apply_model`` — run the model
 
     Returns a callable: predict_eps(latent, timestep) -> eps [B, C, H, W]
     """
     import comfy.samplers
+    import comfy.sampler_helpers
+    import comfy.model_management
 
-    # Pre-process conditioning using ComfyUI's full pipeline
-    # process_conds expects {"positive": [...], "negative": [...]}
-    # and returns processed conds with model_conds built
     device = model.load_device if hasattr(model, 'load_device') else torch.device("cpu")
 
-    # We need a noise tensor for process_conds — use a dummy
-    # The actual noise shape doesn't matter for conditioning processing
-    # but process_conds uses it for area resolution
-    _conds_processed = None
+    # Ensure the model is loaded to GPU before we call apply_model
+    comfy.model_management.load_models_gpu([model])
 
-    def _get_processed_conds(latent):
-        nonlocal _conds_processed
-        if _conds_processed is not None:
-            return _conds_processed
+    # Cache for processed conditioning (built once, reused across calls)
+    _processed = None
+
+    def _get_processed(latent):
+        """Build processed conditioning using ComfyUI's canonical pipeline.
+
+        convert_cond converts tuple format [(tensor, dict), ...] to dict format
+        [dict, ...] which process_conds expects.
+        """
+        nonlocal _processed
+        if _processed is not None:
+            return _processed
+        # Step 1: Convert tuple conditioning to dict format
+        pos_converted = comfy.sampler_helpers.convert_cond(positive)
+        neg_converted = comfy.sampler_helpers.convert_cond(negative)
+        conds_dict = {"positive": pos_converted, "negative": neg_converted}
+        # Step 2: Process conds (builds model_conds via encode_model_conds)
         noise = torch.zeros_like(latent)
-        conds_dict = {"positive": positive, "negative": negative}
-        _conds_processed = comfy.samplers.process_conds(
-            model.model, noise, conds_dict, latent.device
+        _processed = comfy.samplers.process_conds(
+            model.model, noise, conds_dict, device
         )
-        return _conds_processed
+        return _processed
 
     def predict_eps(latent: torch.Tensor, timestep: int) -> torch.Tensor:
         # Convert timestep to sigma
@@ -60,23 +72,27 @@ def _make_predict_eps(model, positive, negative, cfg_scale):
         B = latent.shape[0]
         sigma = torch.full((B,), sigma_val, device=latent.device, dtype=latent.dtype)
 
-        # Get processed conditioning
-        conds = _get_processed_conds(latent)
+        # Get processed conditioning (cached after first call)
+        processed = _get_processed(latent)
 
         def run_cond(prompt_type):
-            cond_list = conds.get(prompt_type, [])
+            cond_list = processed.get(prompt_type, [])
             if len(cond_list) == 0:
                 return torch.zeros_like(latent)
             cond = cond_list[0]
-            model_conds = cond.get("model_conds", {})
-            # Build kwargs for apply_model from processed model_conds
-            c = {}
-            for k, v in model_conds.items():
-                # COND objects have a process() method that returns the tensor
-                processed = v.process(latent) if hasattr(v, 'process') else v
-                if processed is not None:
-                    c[k] = processed
-            eps = model.model.apply_model(latent, sigma, **c)
+            # Use get_area_and_mult to properly process COND objects
+            # This calls model_conds[c].process_cond(batch_size, area) internally
+            p = comfy.samplers.get_area_and_mult(cond, latent, sigma)
+            if p is None:
+                return torch.zeros_like(latent)
+            # Build the conditioning dict for apply_model
+            c = dict(p.conditioning)
+            # apply_model requires transformer_options
+            if hasattr(model.model, 'current_patcher'):
+                c['transformer_options'] = model.model.current_patcher.apply_hooks(hooks=None)
+            else:
+                c['transformer_options'] = {}
+            eps = model.model.apply_model(p.input_x, sigma, **c)
             return eps
 
         eps_cond = run_cond("positive")
