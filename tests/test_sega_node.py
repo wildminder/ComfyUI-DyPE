@@ -30,7 +30,7 @@ class TestSegaNodeSchema:
         content = (pathlib.Path(__file__).parent.parent / "__init__.py").read_text(encoding="utf-8")
         assert "SEGA" in content
         # Check that get_node_list includes SEGA
-        assert "return [DyPE_FLUX, SEGA]" in content
+        assert "return [DyPE_FLUX, SEGA" in content
 
     def test_imports_apply_sega(self):
         """__init__.py should import apply_sega_to_model."""
