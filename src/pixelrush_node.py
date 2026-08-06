@@ -161,12 +161,18 @@ def _make_vae_adapters(vae, device, model=None):
         # VAE decode expects unscaled latent
         # ComfyUI VAEs handle scaling internally
         decoded = vae.decode(latent)
+        logger.debug("PixelRush: VAE decode output shape=%s ndim=%d", tuple(decoded.shape), decoded.ndim)
         # For 3D VAEs, decoded may be [B, T, H, W, C] — squeeze temporal dim
         if decoded.ndim == 5:
             decoded = decoded.squeeze(1)  # Remove T dimension (T=1)
+        elif decoded.ndim == 3:
+            # Single image [H, W, C] → add batch dim
+            decoded = decoded.unsqueeze(0)
         # decoded: [B, H, W, C] → [B, C, H, W] for bicubic upscale
         if decoded.dim() == 4 and decoded.shape[-1] == 3:
             decoded = decoded.movedim(-1, 1)
+        elif decoded.dim() == 4 and decoded.shape[1] == 3:
+            pass  # Already [B, C, H, W]
         return decoded
 
     def vae_encode(image: torch.Tensor) -> torch.Tensor:
