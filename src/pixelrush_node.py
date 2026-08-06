@@ -26,12 +26,15 @@ def _make_predict_eps(model, positive, negative, cfg_scale):
     """
     # Extract conditioning tensors from positive/negative
     def predict_eps(latent: torch.Tensor, timestep: int) -> torch.Tensor:
-        # Convert timestep to sigma
+        # Convert timestep to sigma — model_sampling expects 1-D [B] tensor
         sigmas = model.model.model_sampling.sigmas
         if timestep < len(sigmas):
-            sigma = sigmas[timestep].reshape(1, 1, 1, 1).to(latent.device)
+            sigma_val = sigmas[timestep].item()
         else:
-            sigma = sigmas[-1].reshape(1, 1, 1, 1).to(latent.device)
+            sigma_val = sigmas[-1].item()
+        # Create 1-D sigma tensor matching batch size
+        B = latent.shape[0]
+        sigma = torch.full((B,), sigma_val, device=latent.device, dtype=latent.dtype)
 
         # Run model with positive conditioning
         def run_cond(conds):
