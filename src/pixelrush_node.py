@@ -36,8 +36,11 @@ def _make_predict_eps(model, positive, negative, cfg_scale):
 
     device = model.load_device if hasattr(model, 'load_device') else torch.device("cpu")
 
-    # Ensure the model is loaded to GPU before we call apply_model
+    # Ensure the model is loaded to GPU and pre_run is called
+    # pre_run sets model.model.current_patcher = model (the ModelPatcher)
+    # which is required by apply_hooks and prepare_state
     comfy.model_management.load_models_gpu([model])
+    model.pre_run()
 
     # Cache for processed conditioning (built once, reused across calls)
     _processed = None
@@ -88,10 +91,8 @@ def _make_predict_eps(model, positive, negative, cfg_scale):
             # Build the conditioning dict for apply_model
             c = dict(p.conditioning)
             # apply_model requires transformer_options
-            if hasattr(model.model, 'current_patcher'):
-                c['transformer_options'] = model.model.current_patcher.apply_hooks(hooks=None)
-            else:
-                c['transformer_options'] = {}
+            # model is the ModelPatcher; apply_hooks returns the transformer_options dict
+            c['transformer_options'] = model.apply_hooks(hooks=None)
             eps = model.model.apply_model(p.input_x, sigma, **c)
             return eps
 

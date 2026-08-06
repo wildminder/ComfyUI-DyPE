@@ -117,3 +117,19 @@ class TestPredictEpsConditioningPipeline:
             "_make_predict_eps must call load_models_gpu to ensure the model "
             "is on GPU before calling apply_model"
         )
+
+    def test_calls_pre_run(self):
+        """pre_run must be called to set current_patcher on the model."""
+        content = self._read_source()
+        assert "pre_run" in content, (
+            "_make_predict_eps must call model.pre_run() to set "
+            "current_patcher before apply_hooks is called"
+        )
+
+    def test_uses_model_apply_hooks_not_current_patcher(self):
+        """Should use model.apply_hooks, not model.model.current_patcher.apply_hooks."""
+        content = self._read_source()
+        assert "model.apply_hooks" in content, (
+            "_make_predict_eps should use model.apply_hooks (ModelPatcher) "
+            "directly, not model.model.current_patcher.apply_hooks"
+        )
