@@ -161,6 +161,9 @@ def _make_vae_adapters(vae, device, model=None):
         # VAE decode expects unscaled latent
         # ComfyUI VAEs handle scaling internally
         decoded = vae.decode(latent)
+        # For 3D VAEs, decoded may be [B, T, H, W, C] — squeeze temporal dim
+        if decoded.ndim == 5:
+            decoded = decoded.squeeze(1)  # Remove T dimension (T=1)
         # decoded: [B, H, W, C] → [B, C, H, W] for bicubic upscale
         if decoded.dim() == 4 and decoded.shape[-1] == 3:
             decoded = decoded.movedim(-1, 1)
