@@ -22,10 +22,19 @@ logger = logging.getLogger("ComfyUI-DyPE")
 def _make_predict_eps(model, positive, negative, cfg_scale):
     """Create a predict_eps adapter that runs the model with CFG.
 
+    Uses ComfyUI's conditioning pipeline (encode_model_conds) to properly
+    build model_conds (y, c_crossattn, etc.) from the conditioning input.
+
     Returns a callable: predict_eps(latent, timestep) -> eps [B, C, H, W]
     """
+    import comfy.samplers
+
+    # Pre-process conditioning using ComfyUI's encode_model_conds
+    # This builds the proper model_conds dict (y, c_crossattn, etc.)
+    device = model.load_device if hasattr(model, 'load_device') else torch.device("cpu")
+
     def predict_eps(latent: torch.Tensor, timestep: int) -> torch.Tensor:
-        # Convert timestep to sigma — model_sampling expects 1-D [B] tensor
+        # Convert timestep to sigma
         sigmas = model.model.model_sampling.sigmas
         if timestep < len(sigmas):
             sigma_val = sigmas[timestep].item()
@@ -34,37 +43,36 @@ def _make_predict_eps(model, positive, negative, cfg_scale):
         B = latent.shape[0]
         sigma = torch.full((B,), sigma_val, device=latent.device, dtype=latent.dtype)
 
-        # Run model with conditioning
-        def run_cond(conds):
+        # Build noise tensor for conditioning processing
+        noise = torch.zeros_like(latent)
+
+        # Process conditioning using ComfyUI's pipeline
+        def run_cond(conds, prompt_type):
             if conds is None or len(conds) == 0:
                 return torch.zeros_like(latent)
-            cond = conds[0]
-            c_crossattn = cond[0] if isinstance(cond[0], torch.Tensor) else None
-            extra = cond[1] if len(cond) > 1 else {}
-
-            # Build kwargs for apply_model — pass conditioning extras
-            # so the model can build adm/y internally via encode_adm()
-            kwargs = {}
-            if c_crossattn is not None:
-                kwargs["c_crossattn"] = c_crossattn.to(latent.device, latent.dtype)
-
-            # Pass through conditioning extras (pooled_output, width, height, etc.)
-            # The model's extra_conds()/encode_adm() will handle these
-            if isinstance(extra, dict):
-                for key in ("pooled_output", "width", "height", "crop_w", "crop_h",
-                            "aesthetic_score", "target_size", "original_size"):
-                    if key in extra:
-                        val = extra[key]
-                        if isinstance(val, torch.Tensor):
-                            kwargs[key] = val.to(latent.device, latent.dtype)
-                        else:
-                            kwargs[key] = val
-
-            eps = model.model.apply_model(latent, sigma, **kwargs)
+            # Deep copy conds to avoid mutation
+            import copy
+            conds_copy = copy.deepcopy(conds)
+            # Encode model conds (builds y, c_crossattn from pooled_output etc.)
+            conds_encoded = comfy.samplers.encode_model_conds(
+                model.model.extra_conds, conds_copy, noise, latent.device, prompt_type
+            )
+            # Extract the model_conds dict from the first cond
+            cond = conds_encoded[0]
+            model_conds = cond.get("model_conds", {})
+            # Build kwargs for apply_model from model_conds
+            c = {}
+            for k, v in model_conds.items():
+                c[k] = v.process(latent) if hasattr(v, 'process') else v
+            # Also pass through any non-model_cond params
+            for k in ("control", "transformer_options"):
+                if k in cond:
+                    c[k] = cond[k]
+            eps = model.model.apply_model(latent, sigma, **c)
             return eps
 
-        eps_cond = run_cond(positive)
-        eps_uncond = run_cond(negative)
+        eps_cond = run_cond(positive, "positive")
+        eps_uncond = run_cond(negative, "negative")
 
         # CFG
         return eps_uncond + cfg_scale * (eps_cond - eps_uncond)
