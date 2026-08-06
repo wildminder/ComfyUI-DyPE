@@ -306,10 +306,13 @@ def refine_latent_once(
 
         # 1. Partial DDIM inversion: 0 -> K
         eps_inv = predict_eps(patch_0, timestep=0)
+        # Ensure eps is on the same device as the patch
+        eps_inv = eps_inv.to(patch_0.device)
         patch_k = ddim_forward_one_step(patch_0, eps_inv, alpha_k)
 
         # 2. One-step denoise: K -> 0
         eps_pred = predict_eps(patch_k, timestep=cfg.k_timestep)
+        eps_pred = eps_pred.to(patch_k.device)
 
         # 3. Noise injection
         eps_rand = torch.randn_like(eps_pred)
@@ -383,6 +386,9 @@ def pixelrush_cascade(
         )
 
         coarse_latent = vae_encode(image_up)
+        # Ensure coarse_latent is on the same device as the model output
+        # (VAE may return on CPU even if input was on GPU)
+        coarse_latent = coarse_latent.to(image_up.device)
         logger.info(
             "PixelRush: upscaled to %s, starting patch refinement",
             tuple(coarse_latent.shape),
