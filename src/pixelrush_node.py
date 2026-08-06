@@ -22,16 +22,33 @@ logger = logging.getLogger("ComfyUI-DyPE")
 def _make_predict_eps(model, positive, negative, cfg_scale):
     """Create a predict_eps adapter that runs the model with CFG.
 
-    Uses ComfyUI's conditioning pipeline (encode_model_conds) to properly
+    Uses ComfyUI's full conditioning pipeline (process_conds) to properly
     build model_conds (y, c_crossattn, etc.) from the conditioning input.
 
     Returns a callable: predict_eps(latent, timestep) -> eps [B, C, H, W]
     """
     import comfy.samplers
 
-    # Pre-process conditioning using ComfyUI's encode_model_conds
-    # This builds the proper model_conds dict (y, c_crossattn, etc.)
+    # Pre-process conditioning using ComfyUI's full pipeline
+    # process_conds expects {"positive": [...], "negative": [...]}
+    # and returns processed conds with model_conds built
     device = model.load_device if hasattr(model, 'load_device') else torch.device("cpu")
+
+    # We need a noise tensor for process_conds — use a dummy
+    # The actual noise shape doesn't matter for conditioning processing
+    # but process_conds uses it for area resolution
+    _conds_processed = None
+
+    def _get_processed_conds(latent):
+        nonlocal _conds_processed
+        if _conds_processed is not None:
+            return _conds_processed
+        noise = torch.zeros_like(latent)
+        conds_dict = {"positive": positive, "negative": negative}
+        _conds_processed = comfy.samplers.process_conds(
+            model.model, noise, conds_dict, latent.device
+        )
+        return _conds_processed
 
     def predict_eps(latent: torch.Tensor, timestep: int) -> torch.Tensor:
         # Convert timestep to sigma
@@ -43,36 +60,27 @@ def _make_predict_eps(model, positive, negative, cfg_scale):
         B = latent.shape[0]
         sigma = torch.full((B,), sigma_val, device=latent.device, dtype=latent.dtype)
 
-        # Build noise tensor for conditioning processing
-        noise = torch.zeros_like(latent)
+        # Get processed conditioning
+        conds = _get_processed_conds(latent)
 
-        # Process conditioning using ComfyUI's pipeline
-        def run_cond(conds, prompt_type):
-            if conds is None or len(conds) == 0:
+        def run_cond(prompt_type):
+            cond_list = conds.get(prompt_type, [])
+            if len(cond_list) == 0:
                 return torch.zeros_like(latent)
-            # Deep copy conds to avoid mutation
-            import copy
-            conds_copy = copy.deepcopy(conds)
-            # Encode model conds (builds y, c_crossattn from pooled_output etc.)
-            conds_encoded = comfy.samplers.encode_model_conds(
-                model.model.extra_conds, conds_copy, noise, latent.device, prompt_type
-            )
-            # Extract the model_conds dict from the first cond
-            cond = conds_encoded[0]
+            cond = cond_list[0]
             model_conds = cond.get("model_conds", {})
-            # Build kwargs for apply_model from model_conds
+            # Build kwargs for apply_model from processed model_conds
             c = {}
             for k, v in model_conds.items():
-                c[k] = v.process(latent) if hasattr(v, 'process') else v
-            # Also pass through any non-model_cond params
-            for k in ("control", "transformer_options"):
-                if k in cond:
-                    c[k] = cond[k]
+                # COND objects have a process() method that returns the tensor
+                processed = v.process(latent) if hasattr(v, 'process') else v
+                if processed is not None:
+                    c[k] = processed
             eps = model.model.apply_model(latent, sigma, **c)
             return eps
 
-        eps_cond = run_cond(positive, "positive")
-        eps_uncond = run_cond(negative, "negative")
+        eps_cond = run_cond("positive")
+        eps_uncond = run_cond("negative")
 
         # CFG
         return eps_uncond + cfg_scale * (eps_cond - eps_uncond)
