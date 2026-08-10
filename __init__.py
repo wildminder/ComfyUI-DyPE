@@ -2,6 +2,8 @@ import torch
 from comfy_api.latest import ComfyExtension, io
 from .src.patch_utils import apply_dype_to_model, apply_sega_to_model
 from .src.pixelrush_node import PixelRushNode
+from .src.freescale_node import FreeScaleNode
+from .src.qwen2d_vae_patch import install_qwen2d_patch
 
 class DyPE_FLUX(io.ComfyNode):
     """
@@ -226,8 +228,12 @@ class SEGA(io.ComfyNode):
 
 
 class DyPEExtension(ComfyExtension):
+    async def on_load(self) -> None:
+        """Install Qwen2D VAE patch on extension load."""
+        install_qwen2d_patch()
+
     async def get_node_list(self) -> list[type[io.ComfyNode]]:
-        return [DyPE_FLUX, SEGA, PixelRushNode]
+        return [DyPE_FLUX, SEGA, PixelRushNode, FreeScaleNode]
 
 async def comfy_entrypoint() -> DyPEExtension:
     return DyPEExtension()

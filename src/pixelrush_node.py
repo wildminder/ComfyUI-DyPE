@@ -135,36 +135,23 @@ def _make_vae_adapters(vae, device, model=None):
     All tensors are moved to ``device`` for GPU acceleration.
     Handles both 2D VAEs (latent_dim=2, 4D latents [B,C,H,W]) and
     3D/video VAEs (latent_dim=3, 5D latents [B,C,T,H,W]).
-    Uses model.process_latent_out/in to convert between model latent
-    format and VAE latent format (needed for Qwen, Krea2, etc.).
     """
     latent_dim = getattr(vae, 'latent_dim', 2)
-    process_latent_out = None
-    process_latent_in = None
-    if model is not None and hasattr(model, 'model'):
-        if hasattr(model.model, 'process_latent_out'):
-            process_latent_out = model.model.process_latent_out
-        if hasattr(model.model, 'process_latent_in'):
-            process_latent_in = model.model.process_latent_in
 
     def vae_decode(latent: torch.Tensor) -> torch.Tensor:
         # latent: [B, C, H, W] — ComfyUI VAE expects [B, C, H, W]
         if isinstance(latent, dict):
             latent = latent["samples"]
         latent = latent.to(device)
-        # Convert from model latent format to VAE latent format
-        if process_latent_out is not None:
-            latent = process_latent_out(latent)
         # For 3D VAEs (video), add temporal dimension: [B,C,H,W] -> [B,C,1,H,W]
         if latent_dim == 3 and latent.ndim == 4:
             latent = latent.unsqueeze(2)
         # VAE decode expects unscaled latent
         # ComfyUI VAEs handle scaling internally
         decoded = vae.decode(latent)
-        logger.info("PixelRush: VAE decode output shape=%s ndim=%d", tuple(decoded.shape), decoded.ndim)
-        # For 3D VAEs, decoded may be [B, T, H, W, C] — squeeze temporal dim
+        # For 3D VAEs, decoded is [B, T, H, W, C] — take first temporal frame
         if decoded.ndim == 5:
-            decoded = decoded.squeeze(1)  # Remove T dimension (T=1)
+            decoded = decoded[:, 0]  # [B, H, W, C]
         elif decoded.ndim == 3:
             # Single image [H, W, C] → add batch dim
             decoded = decoded.unsqueeze(0)
@@ -173,12 +160,6 @@ def _make_vae_adapters(vae, device, model=None):
             decoded = decoded.movedim(-1, 1)
         elif decoded.dim() == 4 and decoded.shape[1] == 3:
             pass  # Already [B, C, H, W]
-        else:
-            # Fallback: if shape is unexpected, try to reshape to [B, C, H, W]
-            logger.warning("PixelRush: unexpected VAE decode shape %s, attempting reshape", tuple(decoded.shape))
-            if decoded.ndim == 4:
-                # Assume [B, H, W, C] and move channel to dim 1
-                decoded = decoded.movedim(-1, 1)
         return decoded
 
     def vae_encode(image: torch.Tensor) -> torch.Tensor:
@@ -189,12 +170,9 @@ def _make_vae_adapters(vae, device, model=None):
         encoded = vae.encode(image)
         if isinstance(encoded, dict):
             encoded = encoded["samples"]
-        # For 3D VAEs (video), remove temporal dimension: [B,C,1,H,W] -> [B,C,H,W]
+        # For 3D VAEs (video), take first temporal frame: [B,C,T,H,W] -> [B,C,H,W]
         if latent_dim == 3 and encoded.ndim == 5:
-            encoded = encoded.squeeze(2)
-        # Convert from VAE latent format to model latent format
-        if process_latent_in is not None:
-            encoded = process_latent_in(encoded)
+            encoded = encoded[:, :, 0]
         return encoded
 
     return vae_decode, vae_encode
