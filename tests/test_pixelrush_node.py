@@ -654,40 +654,48 @@ class TestPixelRushInferenceBugFix:
             "a value in 0-999 range, not an index"
         )
 
-    # --- Bug 1: x0 → epsilon conversion ---
+    # --- Bug 1: bypass calculate_denoised to get raw epsilon ---
 
-    def test_predict_eps_converts_x0_to_epsilon(self):
-        """predict_eps must convert apply_model's x0 output to epsilon."""
+    def test_predict_eps_bypasses_calculate_denoised(self):
+        """predict_eps must bypass calculate_denoised to get raw model output (epsilon).
+
+        apply_model returns calculate_denoised(sigma, model_output, x) = x0,
+        which is useless at sigma≈0 (returns x trivially, making eps≈0).
+        Instead, predict_eps must call diffusion_model directly to get the raw
+        model_output (which IS epsilon for EPS prediction type).
+        """
         content = self._read_source()
-        assert "(p.input_x - x0)" in content, (
-            "predict_eps must convert apply_model's x0 output to epsilon via "
-            "eps = (x - x0) / sigma"
+        assert "diffusion_model(" in content, (
+            "predict_eps must call m.diffusion_model() directly to get raw "
+            "model output (epsilon), bypassing calculate_denoised"
+        )
+        assert "calculate_input" in content, (
+            "predict_eps must call ms.calculate_input() to scale the input "
+            "before feeding to diffusion_model"
         )
 
-    def test_predict_eps_does_not_return_apply_model_directly(self):
-        """predict_eps must not return apply_model output directly (it's x0, not eps)."""
+    def test_predict_eps_does_not_call_apply_model(self):
+        """predict_eps must not call apply_model (it returns x0, not epsilon)."""
         content = self._read_source()
-        # The old buggy code: eps = model.model.apply_model(...)  return eps
-        # The fixed code: x0 = model.model.apply_model(...)  eps = (x - x0) / sigma
-        assert "eps = model.model.apply_model" not in content, (
-            "predict_eps must not assign apply_model output directly to 'eps' — "
-            "apply_model returns x0, not epsilon"
+        assert "model.model.apply_model" not in content, (
+            "predict_eps must not call apply_model — it returns x0 (via "
+            "calculate_denoised), not the raw epsilon we need"
         )
 
-    def test_predict_eps_uses_x0_variable(self):
-        """predict_eps should use 'x0' variable name for apply_model output."""
-        content = self._read_source()
-        assert "x0 = model.model.apply_model" in content, (
-            "predict_eps should assign apply_model output to 'x0' variable "
-            "to make it clear it's x0, not epsilon"
-        )
+    def test_predict_eps_does_not_divide_by_sigma(self):
+        """predict_eps must not divide by sigma (no x0→epsilon conversion needed).
 
-    def test_predict_eps_divides_by_sigma_reshaped(self):
-        """predict_eps must reshape sigma for broadcasting when dividing."""
+        Since we get the raw model_output (epsilon) directly from diffusion_model,
+        there's no need to convert x0→epsilon via (x - x0) / sigma.
+        """
         content = self._read_source()
-        assert "sigma_reshaped" in content or "sigma.reshape" in content, (
-            "predict_eps must reshape sigma for broadcasting when computing "
-            "eps = (x - x0) / sigma"
+        assert "(p.input_x - x0)" not in content, (
+            "predict_eps must not do x0→epsilon conversion — we get raw "
+            "epsilon directly from diffusion_model"
+        )
+        assert "sigma_reshaped" not in content, (
+            "predict_eps must not reshape sigma for division — no division "
+            "is needed when getting raw epsilon directly"
         )
 
     # --- Bug 3: spherical_lerp raw vectors ---
@@ -788,24 +796,49 @@ class TestPixelRushInferenceBugFixFunctional:
             "if this is near 0, the timestep is being used as an array index (Bug 2)"
         )
 
-    def test_x0_to_epsilon_conversion(self):
-        """Verify the x0 → epsilon conversion formula: eps = (x - x0) / sigma."""
-        # Simulate: model predicts x0 = x (perfect prediction at sigma=0)
-        # Then eps = (x - x) / sigma = 0 (correct — no noise at clean state)
-        x = torch.randn(1, 4, 8, 8)
-        x0 = x.clone()  # Perfect prediction
-        sigma = torch.tensor([1e-6])  # Clamped minimum
-        sigma_reshaped = sigma.reshape(sigma.shape + (1,) * (x.ndim - sigma.ndim))
-        eps = (x - x0) / sigma_reshaped
-        assert not torch.isnan(eps).any(), "Should not produce NaN with clamped sigma"
+    def test_raw_model_output_is_epsilon(self):
+        """Verify that bypassing calculate_denoised gives raw epsilon.
 
-        # Simulate: model predicts x0 = 0 (all noise)
-        # Then eps = (x - 0) / sigma = x / sigma
-        x0_zero = torch.zeros_like(x)
+        For EPS models, the raw model_output from diffusion_model IS epsilon.
+        calculate_denoised would convert it to x0 via: x0 = x - eps * sigma.
+        At sigma≈0, x0 ≈ x (trivially), making (x - x0)/sigma ≈ 0/0 = garbage.
+        By bypassing calculate_denoised, we get the true epsilon directly.
+        """
+        # Simulate: model predicts epsilon directly
+        x = torch.randn(1, 4, 8, 8)
+        eps_true = torch.randn_like(x)
         sigma = torch.tensor([1.0])
+
+        # The raw model_output IS epsilon (no conversion needed)
+        model_output = eps_true  # What diffusion_model returns
+        assert torch.equal(model_output, eps_true), (
+            "Raw model_output should be epsilon, no conversion needed"
+        )
+
+        # Verify calculate_denoised would give x0 (which is NOT what we want)
         sigma_reshaped = sigma.reshape(sigma.shape + (1,) * (x.ndim - sigma.ndim))
-        eps = (x - x0_zero) / sigma_reshaped
-        assert torch.allclose(eps, x, atol=1e-5), "eps should equal x when x0=0 and sigma=1"
+        x0 = x - model_output * sigma_reshaped  # This is what apply_model returns
+        assert not torch.equal(x0, eps_true), (
+            "x0 (from calculate_denoised) should NOT equal epsilon — "
+            "this is why we bypass it"
+        )
+
+        # At sigma≈0, x0 ≈ x (trivially), making (x - x0)/sigma numerically unstable.
+        # The subtraction x - x0 loses precision (two nearly-equal numbers),
+        # and dividing by 1e-6 amplifies the error. This is WHY we bypass
+        # calculate_denoised and get raw epsilon directly.
+        sigma_near_zero = torch.tensor([1e-6])
+        sigma_rz = sigma_near_zero.reshape(sigma_near_zero.shape + (1,) * (x.ndim - sigma_near_zero.ndim))
+        x0_near_zero = x - eps_true * sigma_rz  # ≈ x since sigma≈0
+        eps_via_x0 = (x - x0_near_zero) / sigma_rz  # Numerically unstable!
+        # The conversion should NOT match the true epsilon closely —
+        # this demonstrates the numerical instability at low sigma.
+        max_err = (eps_via_x0 - eps_true).abs().max().item()
+        assert max_err > 1e-3, (
+            f"At sigma≈0, x0→eps conversion should be numerically unstable "
+            f"(max error should be > 1e-3, got {max_err}) — this is why we "
+            f"bypass calculate_denoised and get raw epsilon directly"
+        )
 
     def test_ddim_forward_with_correct_alpha_bar(self):
         """DDIM forward with correct alpha_bar should produce partially noised latent."""

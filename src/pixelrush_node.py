@@ -116,14 +116,52 @@ def _make_predict_eps(model, positive, negative, cfg_scale, latent_dimensions=2)
             # apply_model requires transformer_options
             # model is the ModelPatcher; apply_hooks returns the transformer_options dict
             c['transformer_options'] = model.apply_hooks(hooks=None)
-            # apply_model returns x0 (predicted clean latent), NOT epsilon.
-            # For EPS: calculate_denoised returns x - model_output * sigma = x0
-            # We need epsilon: eps = (x - x0) / sigma
-            x0 = model.model.apply_model(p.input_x, sigma, **c)
-            # Reshape sigma for broadcasting: [B] → [B, 1, 1, ...]
-            sigma_reshaped = sigma.reshape(sigma.shape + (1,) * (x0.ndim - sigma.ndim))
-            eps = (p.input_x - x0) / sigma_reshaped
-            return eps
+
+            # We need the raw model output (epsilon for EPS models), NOT x0.
+            # apply_model returns calculate_denoised(sigma, model_output, x) = x0,
+            # which is useless at sigma≈0 (returns x trivially).
+            # Instead, replicate _apply_model's logic but skip calculate_denoised
+            # to get the raw model_output (epsilon for EPS prediction type).
+            m = model.model
+            ms = m.model_sampling
+            xc = ms.calculate_input(sigma, p.input_x)
+            if c.get('c_concat') is not None:
+                xc = torch.cat([xc] + [comfy.model_management.cast_to_device(
+                    c['c_concat'], xc.device, xc.dtype)], dim=1)
+            dtype = m.get_dtype_inference()
+            xc = xc.to(dtype)
+            t = ms.timestep(sigma).float()
+            device = xc.device
+            context = c.get('c_crossattn')
+            if context is not None:
+                context = comfy.model_management.cast_to_device(context, device, dtype)
+            extra_conds = {}
+            for o in c:
+                if o in ('c_crossattn', 'c_concat', 'transformer_options'):
+                    continue
+                extra = c[o]
+                if hasattr(extra, 'dtype'):
+                    extra = comfy.model_management.cast_to_device(extra, device, dtype)
+                elif isinstance(extra, list):
+                    ex = []
+                    for ext in extra:
+                        ex.append(comfy.model_management.cast_to_device(ext, device, dtype))
+                    extra = ex
+                extra_conds[o] = extra
+            t = m.process_timestep(t, x=p.input_x, **extra_conds)
+            to = c['transformer_options'].copy()
+            to["prefetch_dynamic_vbars"] = (
+                m.current_patcher is not None and m.current_patcher.is_dynamic()
+            )
+            model_output = m.diffusion_model(
+                xc, t, context=context, control=c.get('control'),
+                transformer_options=to, **extra_conds,
+            )
+            if len(model_output) > 1 and not torch.is_tensor(model_output):
+                import comfy.utils
+                model_output, _ = comfy.utils.pack_latents(model_output)
+            # model_output is the raw prediction (epsilon for EPS models)
+            return model_output.float()
 
         eps_cond = run_cond("positive")
         eps_uncond = run_cond("negative")
