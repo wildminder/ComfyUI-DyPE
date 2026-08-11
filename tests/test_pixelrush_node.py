@@ -598,3 +598,249 @@ class TestPixelRushProgressBar:
         # All calls should have num_stages == 2
         for call in callback_calls:
             assert call[3] == 2, f"num_stages should be 2, got {call[3]}"
+
+
+@pytest.mark.unit
+class TestPixelRushInferenceBugFix:
+    """Tests for the inference bug fixes (timestep/sigma conversion, x0→epsilon).
+
+    Bug 1: apply_model returns x0, not epsilon — must convert via (x - x0) / sigma
+    Bug 2: timestep used as array index — must use model_sampling.sigma(timestep)
+    Bug 3: spherical_lerp uses unit vectors — must use raw vectors to match reference
+    """
+
+    def _read_source(self):
+        return (pathlib.Path(__file__).parent.parent / "src" / "pixelrush_node.py").read_text(encoding="utf-8")
+
+    # --- Bug 2: timestep → sigma conversion ---
+
+    def test_predict_eps_uses_model_sampling_sigma(self):
+        """predict_eps must use model_sampling.sigma() for timestep conversion."""
+        content = self._read_source()
+        assert "model_sampling.sigma" in content, (
+            "predict_eps must use model_sampling.sigma(timestep) to convert "
+            "timestep (0-999) to sigma, not use timestep as array index"
+        )
+
+    def test_predict_eps_does_not_use_timestep_as_index(self):
+        """predict_eps must not use timestep as an index into sigmas array."""
+        content = self._read_source()
+        assert "sigmas[timestep]" not in content, (
+            "predict_eps must not use sigmas[timestep] — timestep is a value "
+            "in 0-999 range, not an index into the sigmas array"
+        )
+
+    def test_predict_eps_clamps_sigma_minimum(self):
+        """predict_eps must clamp sigma to avoid division by zero at timestep 0."""
+        content = self._read_source()
+        assert "1e-6" in content or "max(sigma_val" in content, (
+            "predict_eps must clamp sigma to a minimum (1e-6) to avoid "
+            "division by zero when extracting epsilon at timestep 0"
+        )
+
+    def test_alpha_bar_at_uses_model_sampling_sigma(self):
+        """alpha_bar_at must use model_sampling.sigma() for timestep conversion."""
+        content = self._read_source()
+        assert "model_sampling.sigma" in content, (
+            "alpha_bar_at must use model_sampling.sigma(timestep) to convert "
+            "timestep to sigma before computing alpha_bar"
+        )
+
+    def test_alpha_bar_at_does_not_use_index(self):
+        """alpha_bar_at must not use timestep as an array index."""
+        content = self._read_source()
+        assert "alphas_cumprod[timestep]" not in content, (
+            "alpha_bar_at must not use alphas_cumprod[timestep] — timestep is "
+            "a value in 0-999 range, not an index"
+        )
+
+    # --- Bug 1: x0 → epsilon conversion ---
+
+    def test_predict_eps_converts_x0_to_epsilon(self):
+        """predict_eps must convert apply_model's x0 output to epsilon."""
+        content = self._read_source()
+        assert "(p.input_x - x0)" in content, (
+            "predict_eps must convert apply_model's x0 output to epsilon via "
+            "eps = (x - x0) / sigma"
+        )
+
+    def test_predict_eps_does_not_return_apply_model_directly(self):
+        """predict_eps must not return apply_model output directly (it's x0, not eps)."""
+        content = self._read_source()
+        # The old buggy code: eps = model.model.apply_model(...)  return eps
+        # The fixed code: x0 = model.model.apply_model(...)  eps = (x - x0) / sigma
+        assert "eps = model.model.apply_model" not in content, (
+            "predict_eps must not assign apply_model output directly to 'eps' — "
+            "apply_model returns x0, not epsilon"
+        )
+
+    def test_predict_eps_uses_x0_variable(self):
+        """predict_eps should use 'x0' variable name for apply_model output."""
+        content = self._read_source()
+        assert "x0 = model.model.apply_model" in content, (
+            "predict_eps should assign apply_model output to 'x0' variable "
+            "to make it clear it's x0, not epsilon"
+        )
+
+    def test_predict_eps_divides_by_sigma_reshaped(self):
+        """predict_eps must reshape sigma for broadcasting when dividing."""
+        content = self._read_source()
+        assert "sigma_reshaped" in content or "sigma.reshape" in content, (
+            "predict_eps must reshape sigma for broadcasting when computing "
+            "eps = (x - x0) / sigma"
+        )
+
+    # --- Bug 3: spherical_lerp raw vectors ---
+
+    def test_spherical_lerp_uses_raw_vectors(self):
+        """spherical_lerp must use a_flat/b_flat (raw), not a_unit/b_unit."""
+        content = (pathlib.Path(__file__).parent.parent / "src" / "pixelrush.py").read_text(encoding="utf-8")
+        assert "a_flat" in content, "spherical_lerp should use a_flat (raw vectors)"
+        assert "a_unit" not in content or "a_unit = a_flat / a_norm" in content, (
+            "spherical_lerp should not use a_unit in the direction computation"
+        )
+
+
+@pytest.mark.unit
+class TestPixelRushInferenceBugFixFunctional:
+    """Functional tests for the inference bug fixes with mock objects."""
+
+    def _make_mock_model_sampling(self):
+        """Create a mock model_sampling with sigma() method.
+
+        Simulates ModelSamplingDiscrete.sigma() which maps timestep (0-999)
+        to sigma by interpolating in log-space across the sigma schedule.
+        The schedule has ~20 entries, but timesteps can be 0-999.
+        """
+        import types
+
+        ms = types.SimpleNamespace()
+        # Mock sigmas array (typical 20-step schedule)
+        # Use a small minimum instead of 0 to avoid log(0) = -inf
+        ms.sigmas = torch.linspace(0.01, 14.0, 20)
+        ms.log_sigmas = ms.sigmas.log()
+
+        def sigma(timestep):
+            # ModelSamplingDiscrete.sigma() maps timestep (0-999) to sigma
+            # by treating timestep as a continuous index into log_sigmas.
+            # timestep=0 → sigmas[0], timestep=999 → sigmas[-1]
+            # Scale timestep from 0-999 to 0-(len-1)
+            max_ts = 999.0
+            t = torch.clamp(timestep.float(), min=0, max=max_ts)
+            t_scaled = t * (len(ms.sigmas) - 1) / max_ts
+            low_idx = t_scaled.floor().long().clamp(0, len(ms.sigmas) - 1)
+            high_idx = t_scaled.ceil().long().clamp(0, len(ms.sigmas) - 1)
+            w = t_scaled.frac()
+            log_sigma = (1 - w) * ms.log_sigmas[low_idx] + w * ms.log_sigmas[high_idx]
+            return log_sigma.exp()
+
+        ms.sigma = sigma
+        return ms
+
+    def test_alpha_bar_at_returns_reasonable_values(self):
+        """alpha_bar_at should return reasonable values for various timesteps."""
+        import sys
+        sys.path.insert(0, str(pathlib.Path(__file__).parent.parent))
+        from src.pixelrush_node import _make_alpha_bar_at
+        import types
+
+        model = types.SimpleNamespace()
+        model.model = types.SimpleNamespace()
+        model.model.model_sampling = self._make_mock_model_sampling()
+        model.load_device = torch.device("cpu")
+
+        alpha_bar_at = _make_alpha_bar_at(model)
+
+        # timestep=0 should give alpha_bar ≈ 1.0 (clean)
+        ab_0 = alpha_bar_at(0)
+        assert 0.9 < ab_0 <= 1.0, f"alpha_bar(0) should be ~1.0, got {ab_0}"
+
+        # timestep=249 should give alpha_bar between 0 and 1 (not 0!)
+        ab_249 = alpha_bar_at(249)
+        assert 0 < ab_249 < 1.0, f"alpha_bar(249) should be in (0, 1), got {ab_249}"
+
+        # timestep=999 should give small alpha_bar (high noise)
+        ab_999 = alpha_bar_at(999)
+        assert 0 < ab_999 < ab_249, f"alpha_bar(999) should be < alpha_bar(249), got {ab_999}"
+
+        # Different timesteps should give different alpha_bars
+        assert ab_0 != ab_249, "Different timesteps should give different alpha_bars"
+
+    def test_alpha_bar_at_249_not_near_zero(self):
+        """alpha_bar_at(249) should NOT be near zero (the old bug returned 0)."""
+        import sys
+        sys.path.insert(0, str(pathlib.Path(__file__).parent.parent))
+        from src.pixelrush_node import _make_alpha_bar_at
+        import types
+
+        model = types.SimpleNamespace()
+        model.model = types.SimpleNamespace()
+        model.model.model_sampling = self._make_mock_model_sampling()
+        model.load_device = torch.device("cpu")
+
+        alpha_bar_at = _make_alpha_bar_at(model)
+        ab_249 = alpha_bar_at(249)
+
+        # The old bug returned alpha_bar ≈ 0 (using sigmas[-1] which is max sigma)
+        # The fix should return a reasonable value
+        assert ab_249 > 0.01, (
+            f"alpha_bar(249) should be > 0.01, got {ab_249} — "
+            "if this is near 0, the timestep is being used as an array index (Bug 2)"
+        )
+
+    def test_x0_to_epsilon_conversion(self):
+        """Verify the x0 → epsilon conversion formula: eps = (x - x0) / sigma."""
+        # Simulate: model predicts x0 = x (perfect prediction at sigma=0)
+        # Then eps = (x - x) / sigma = 0 (correct — no noise at clean state)
+        x = torch.randn(1, 4, 8, 8)
+        x0 = x.clone()  # Perfect prediction
+        sigma = torch.tensor([1e-6])  # Clamped minimum
+        sigma_reshaped = sigma.reshape(sigma.shape + (1,) * (x.ndim - sigma.ndim))
+        eps = (x - x0) / sigma_reshaped
+        assert not torch.isnan(eps).any(), "Should not produce NaN with clamped sigma"
+
+        # Simulate: model predicts x0 = 0 (all noise)
+        # Then eps = (x - 0) / sigma = x / sigma
+        x0_zero = torch.zeros_like(x)
+        sigma = torch.tensor([1.0])
+        sigma_reshaped = sigma.reshape(sigma.shape + (1,) * (x.ndim - sigma.ndim))
+        eps = (x - x0_zero) / sigma_reshaped
+        assert torch.allclose(eps, x, atol=1e-5), "eps should equal x when x0=0 and sigma=1"
+
+    def test_ddim_forward_with_correct_alpha_bar(self):
+        """DDIM forward with correct alpha_bar should produce partially noised latent."""
+        import sys
+        sys.path.insert(0, str(pathlib.Path(__file__).parent.parent))
+        from src.pixelrush import ddim_forward_one_step, ddim_reverse_one_step_to_zero
+
+        z_0 = torch.randn(1, 4, 8, 8)
+        eps = torch.randn_like(z_0)
+
+        # With correct alpha_bar (e.g., 0.5), z_K should be a mix of z_0 and eps
+        alpha_bar = 0.5
+        z_K = ddim_forward_one_step(z_0, eps, alpha_bar)
+        expected = (0.5 ** 0.5) * z_0 + (0.5 ** 0.5) * eps
+        assert torch.allclose(z_K, expected, atol=1e-5), (
+            "DDIM forward with alpha_bar=0.5 should produce sqrt(0.5)*z_0 + sqrt(0.5)*eps"
+        )
+
+        # Reverse should recover z_0 (approximately, with different eps)
+        z_0_hat = ddim_reverse_one_step_to_zero(z_K, eps, alpha_bar)
+        assert torch.allclose(z_0_hat, z_0, atol=1e-4), (
+            "DDIM reverse with same eps should recover z_0"
+        )
+
+    def test_ddim_forward_with_alpha_bar_zero_produces_noise(self):
+        """DDIM forward with alpha_bar=0 (old bug) produces pure noise."""
+        import sys
+        sys.path.insert(0, str(pathlib.Path(__file__).parent.parent))
+        from src.pixelrush import ddim_forward_one_step
+
+        z_0 = torch.randn(1, 4, 8, 8)
+        eps = torch.randn_like(z_0)
+
+        # With alpha_bar=0 (the old bug), z_K = 0*z_0 + 1*eps = eps (pure noise!)
+        z_K = ddim_forward_one_step(z_0, eps, 0.0)
+        assert torch.allclose(z_K, eps, atol=1e-5), (
+            "DDIM forward with alpha_bar=0 produces pure noise (this was the bug)"
+        )

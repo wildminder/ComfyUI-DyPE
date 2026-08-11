@@ -98,10 +98,10 @@ def spherical_lerp(a: Tensor, b: Tensor, t: float, eps: float = 1e-7) -> Tensor:
 
     t_tensor = torch.full_like(omega, t)
 
-    # Spherical direction (use unit vectors, not raw)
+    # Spherical direction (use raw vectors, matching reference code)
     direction = (
-        torch.sin((1.0 - t_tensor) * omega) / sin_omega * a_unit
-        + torch.sin(t_tensor * omega) / sin_omega * b_unit
+        torch.sin((1.0 - t_tensor) * omega) / sin_omega * a_flat
+        + torch.sin(t_tensor * omega) / sin_omega * b_flat
     )
 
     # Interpolate magnitudes separately (linear)

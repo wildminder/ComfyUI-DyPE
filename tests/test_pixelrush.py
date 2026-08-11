@@ -22,19 +22,27 @@ from src.pixelrush import (
 
 @pytest.mark.unit
 class TestSphericalLerp:
-    def test_t_zero_approximates_a(self):
-        """t=0 should approximately return a (small numerical error from acos clamp)."""
+    def test_t_zero_proportional_to_a(self):
+        """t=0 should return a value proportional to a (reference uses raw vectors
+        in direction, so result = a * norm(a) at t=0)."""
         a = torch.randn(2, 4, 8, 8)
         b = torch.randn(2, 4, 8, 8)
         result = spherical_lerp(a, b, t=0.0)
-        assert torch.allclose(result, a, atol=1e-3)
+        # Reference code: direction = a_flat, magnitude = a_norm
+        # So result = a_flat * a_norm = a * norm(a)
+        a_norm = a.flatten(1).norm(dim=1, keepdim=True)
+        expected = a * a_norm.view(-1, 1, 1, 1)
+        assert torch.allclose(result, expected, atol=1e-3)
 
-    def test_t_one_approximates_b(self):
-        """t=1 should approximately return b (small numerical error from acos clamp)."""
+    def test_t_one_proportional_to_b(self):
+        """t=1 should return a value proportional to b (reference uses raw vectors
+        in direction, so result = b * norm(b) at t=1)."""
         a = torch.randn(2, 4, 8, 8)
         b = torch.randn(2, 4, 8, 8)
         result = spherical_lerp(a, b, t=1.0)
-        assert torch.allclose(result, b, atol=1e-3)
+        b_norm = b.flatten(1).norm(dim=1, keepdim=True)
+        expected = b * b_norm.view(-1, 1, 1, 1)
+        assert torch.allclose(result, expected, atol=1e-3)
 
     def test_midpoint_between(self):
         a = torch.randn(1, 4, 4, 4)
@@ -44,12 +52,20 @@ class TestSphericalLerp:
         assert result.shape == a.shape
 
     def test_parallel_vectors_linear(self):
-        """SLERP of parallel vectors should approximate linear interpolation."""
+        """SLERP of parallel vectors: direction = 0.5*a + 0.5*b, magnitude = 0.5*|a| + 0.5*|b|.
+        Result = (0.5*a + 0.5*b) * (0.5*|a| + 0.5*|b|)."""
         a = torch.ones(1, 8)
         b = torch.ones(1, 8) * 3.0
         result = spherical_lerp(a, b, t=0.5)
-        # For parallel vectors, SLERP ≈ linear interpolation
-        assert torch.allclose(result, torch.ones(1, 8) * 2.0, atol=0.1)
+        # For parallel vectors (omega≈0): sin(0.5*omega)/sin(omega) ≈ 0.5
+        # direction = 0.5 * a_flat + 0.5 * b_flat
+        # magnitude = 0.5 * norm_a + 0.5 * norm_b
+        norm_a = a.flatten(1).norm(dim=1, keepdim=True)
+        norm_b = b.flatten(1).norm(dim=1, keepdim=True)
+        direction = 0.5 * a + 0.5 * b  # = 0.5*1 + 0.5*3 = 2.0
+        magnitude = 0.5 * norm_a + 0.5 * norm_b
+        expected = direction * magnitude
+        assert torch.allclose(result, expected, atol=0.1)
 
     def test_preserves_shape(self):
         a = torch.randn(2, 3, 16, 16)

@@ -84,12 +84,14 @@ def _make_predict_eps(model, positive, negative, cfg_scale, latent_dimensions=2)
         if is_3d and was_4d:
             latent = latent.unsqueeze(2)  # [B, C, 1, H, W]
 
-        # Convert timestep to sigma
-        sigmas = model.model.model_sampling.sigmas
-        if timestep < len(sigmas):
-            sigma_val = sigmas[timestep].item()
-        else:
-            sigma_val = sigmas[-1].item()
+        # Convert timestep (0-999) to sigma using model_sampling.sigma().
+        # The timestep is a value in the model's internal timestep space,
+        # NOT an index into the sigmas array (which has only ~20 entries).
+        ts_tensor = torch.tensor([float(timestep)], device=device)
+        sigma_val = model.model.model_sampling.sigma(ts_tensor).item()
+        # Clamp to small minimum to avoid division-by-zero in epsilon extraction
+        # (timestep=0 gives sigma=0, which would make eps = (x - x0) / 0 = NaN)
+        sigma_val = max(sigma_val, 1e-6)
         B = latent.shape[0]
         sigma = torch.full((B,), sigma_val, device=latent.device, dtype=latent.dtype)
 
@@ -114,7 +116,13 @@ def _make_predict_eps(model, positive, negative, cfg_scale, latent_dimensions=2)
             # apply_model requires transformer_options
             # model is the ModelPatcher; apply_hooks returns the transformer_options dict
             c['transformer_options'] = model.apply_hooks(hooks=None)
-            eps = model.model.apply_model(p.input_x, sigma, **c)
+            # apply_model returns x0 (predicted clean latent), NOT epsilon.
+            # For EPS: calculate_denoised returns x - model_output * sigma = x0
+            # We need epsilon: eps = (x - x0) / sigma
+            x0 = model.model.apply_model(p.input_x, sigma, **c)
+            # Reshape sigma for broadcasting: [B] → [B, 1, 1, ...]
+            sigma_reshaped = sigma.reshape(sigma.shape + (1,) * (x0.ndim - sigma.ndim))
+            eps = (p.input_x - x0) / sigma_reshaped
             return eps
 
         eps_cond = run_cond("positive")
@@ -135,16 +143,20 @@ def _make_predict_eps(model, positive, negative, cfg_scale, latent_dimensions=2)
 def _make_alpha_bar_at(model):
     """Create an alpha_bar_at adapter from the model's sigma schedule.
 
+    Converts timestep (0-999) to sigma via model_sampling.sigma(), then
+    computes alpha_bar = 1 / (sigma^2 + 1).
+
     Returns a callable: alpha_bar_at(timestep) -> float
     """
-    sigmas = model.model.model_sampling.sigmas
-    # alpha_bar = 1 / (sigma^2 + 1)
-    alphas_cumprod = 1.0 / (sigmas ** 2 + 1.0)
+    model_sampling = model.model.model_sampling
 
     def alpha_bar_at(timestep: int) -> float:
-        if timestep < len(alphas_cumprod):
-            return alphas_cumprod[timestep].item()
-        return alphas_cumprod[-1].item()
+        # Convert timestep to sigma using the model's internal conversion
+        ts_tensor = torch.tensor([float(timestep)], device=model.load_device
+                                 if hasattr(model, 'load_device') else torch.device("cpu"))
+        sigma = model_sampling.sigma(ts_tensor)
+        alpha_bar = 1.0 / (sigma ** 2 + 1.0)
+        return alpha_bar.item()
 
     return alpha_bar_at
 
