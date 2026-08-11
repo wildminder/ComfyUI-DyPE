@@ -450,3 +450,151 @@ class TestPixelRushVAEAdaptersFunctional:
         # predict_eps should have received 4D patches
         for shape in eps_shapes:
             assert len(shape) == 4, f"predict_eps should receive 4D, got {len(shape)}D shape {shape}"
+
+
+@pytest.mark.unit
+class TestPixelRushProgressBar:
+    """Tests for progress bar integration in PixelRush node."""
+
+    def _read_source(self):
+        return (pathlib.Path(__file__).parent.parent / "src" / "pixelrush_node.py").read_text(encoding="utf-8")
+
+    def test_execute_creates_progress_bar(self):
+        """execute must create a comfy.utils.ProgressBar."""
+        content = self._read_source()
+        assert "ProgressBar" in content, (
+            "PixelRush execute must create a comfy.utils.ProgressBar for "
+            "native ComfyUI progress tracking"
+        )
+
+    def test_execute_passes_progress_callback(self):
+        """execute must pass progress_callback to pixelrush_cascade."""
+        content = self._read_source()
+        assert "progress_callback" in content, (
+            "PixelRush execute must pass a progress_callback to pixelrush_cascade"
+        )
+
+    def test_execute_calls_update_absolute(self):
+        """execute must call pbar.update_absolute to update progress."""
+        content = self._read_source()
+        assert "update_absolute" in content, (
+            "PixelRush execute must call pbar.update_absolute to update the progress bar"
+        )
+
+    def test_execute_precomputes_total_patches(self):
+        """execute must pre-compute total patches across all cascade stages."""
+        content = self._read_source()
+        assert "total_patches" in content, (
+            "PixelRush execute must pre-compute total_patches for the progress bar"
+        )
+
+    def test_refine_latent_once_accepts_progress_callback(self):
+        """refine_latent_once must accept a progress_callback parameter."""
+        content = (pathlib.Path(__file__).parent.parent / "src" / "pixelrush.py").read_text(encoding="utf-8")
+        assert "progress_callback" in content, (
+            "refine_latent_once must accept a progress_callback parameter"
+        )
+
+    def test_pixelrush_cascade_accepts_progress_callback(self):
+        """pixelrush_cascade must accept a progress_callback parameter."""
+        content = (pathlib.Path(__file__).parent.parent / "src" / "pixelrush.py").read_text(encoding="utf-8")
+        # The function signature should include progress_callback
+        assert "progress_callback" in content, (
+            "pixelrush_cascade must accept a progress_callback parameter"
+        )
+
+    def test_progress_callback_called_per_patch(self):
+        """refine_latent_once should call progress_callback after each patch."""
+        import sys
+        sys.path.insert(0, str(pathlib.Path(__file__).parent.parent))
+        from src.pixelrush import refine_latent_once, PixelRushConfig
+
+        # Track callback invocations
+        callback_calls = []
+
+        def progress_callback(patch_idx, total_patches):
+            callback_calls.append((patch_idx, total_patches))
+
+        coarse_latent = torch.randn(1, 4, 64, 64)
+
+        def predict_eps(latent, timestep):
+            return torch.randn_like(latent)
+
+        def alpha_bar_at(timestep):
+            return 0.5
+
+        cfg = PixelRushConfig(
+            patch_h=32, patch_w=32, overlap=0.5,
+            k_timestep=249, noise_lambda=0.95,
+            gaussian_sigma=8.0, gaussian_kernel_size=41,
+        )
+
+        result = refine_latent_once(
+            coarse_latent=coarse_latent,
+            predict_eps=predict_eps,
+            alpha_bar_at=alpha_bar_at,
+            cfg=cfg,
+            progress_callback=progress_callback,
+        )
+
+        # Should have been called once per patch
+        assert len(callback_calls) > 0, "progress_callback should have been called"
+        # Last call should have patch_idx == total_patches
+        last_idx, last_total = callback_calls[-1]
+        assert last_idx == last_total, (
+            f"Last callback should have patch_idx == total_patches, "
+            f"got {last_idx} != {last_total}"
+        )
+
+    def test_cascade_progress_callback_receives_stage_info(self):
+        """pixelrush_cascade should pass stage info to progress_callback."""
+        import sys
+        sys.path.insert(0, str(pathlib.Path(__file__).parent.parent))
+        from src.pixelrush import pixelrush_cascade, PixelRushConfig
+
+        callback_calls = []
+
+        def progress_callback(patch_idx, total_patches, stage, num_stages):
+            callback_calls.append((patch_idx, total_patches, stage, num_stages))
+
+        def vae_decode(latent):
+            if isinstance(latent, dict):
+                latent = latent["samples"]
+            return latent[:, :3]
+
+        def vae_encode(image):
+            b = image.shape[0]
+            h, w = image.shape[-2], image.shape[-1]
+            return torch.randn(b, 4, h, w)
+
+        def predict_eps(latent, timestep):
+            return torch.randn_like(latent)
+
+        def alpha_bar_at(timestep):
+            return 0.5
+
+        cfg = PixelRushConfig(
+            patch_h=32, patch_w=32, overlap=0.5,
+            k_timestep=249, noise_lambda=0.95,
+            gaussian_sigma=8.0, gaussian_kernel_size=41,
+        )
+
+        initial_latent = torch.randn(1, 4, 32, 32)
+        result = pixelrush_cascade(
+            initial_latent=initial_latent,
+            num_cascade_stages=2,
+            vae_decode=vae_decode,
+            vae_encode=vae_encode,
+            predict_eps=predict_eps,
+            alpha_bar_at=alpha_bar_at,
+            cfg=cfg,
+            progress_callback=progress_callback,
+        )
+
+        # Should have calls from both stages
+        stages_seen = set(call[2] for call in callback_calls)
+        assert 0 in stages_seen, "Should have calls from stage 0"
+        assert 1 in stages_seen, "Should have calls from stage 1"
+        # All calls should have num_stages == 2
+        for call in callback_calls:
+            assert call[3] == 2, f"num_stages should be 2, got {call[3]}"

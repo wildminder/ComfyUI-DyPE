@@ -244,6 +244,7 @@ def refine_latent_once(
     predict_eps: Callable[[Tensor, int], Tensor],
     alpha_bar_at: Callable[[int], Tensor | float],
     cfg: PixelRushConfig,
+    progress_callback: Callable[[int, int], None] | None = None,
 ) -> Tensor:
     """Apply one PixelRush refinement stage to a coarse latent.
 
@@ -259,6 +260,9 @@ def refine_latent_once(
         ``alpha_bar_at(K) -> alpha_cumprod[K]``.
     cfg : PixelRushConfig
         Hyperparameters.
+    progress_callback : callable, optional
+        ``progress_callback(patch_idx, total_patches)`` called after each
+        patch is refined.  Used for ComfyUI progress bar integration.
 
     Returns
     -------
@@ -327,6 +331,10 @@ def refine_latent_once(
         )
         weight_sum[:, :, y:y + cfg.patch_h, x:x + cfg.patch_w] += feather
 
+        # 6. Progress callback
+        if progress_callback is not None:
+            progress_callback(idx + 1, total_patches)
+
     return output_sum / weight_sum.clamp_min(cfg.eps)
 
 
@@ -343,6 +351,7 @@ def pixelrush_cascade(
     predict_eps: Callable[[Tensor, int], Tensor],
     alpha_bar_at: Callable[[int], Tensor | float],
     cfg: PixelRushConfig,
+    progress_callback: Callable[[int, int, int, int], None] | None = None,
 ) -> Tensor:
     """PixelRush cascade: repeatedly upscale and refine.
 
@@ -361,6 +370,10 @@ def pixelrush_cascade(
     alpha_bar_at : callable
         ``alpha_bar_at(timestep) -> alpha_bar``.
     cfg : PixelRushConfig
+    progress_callback : callable, optional
+        ``progress_callback(patch_idx, total_patches, stage, num_stages)``
+        called after each patch is refined.  Used for ComfyUI progress
+        bar integration.
 
     Returns
     -------
@@ -400,11 +413,18 @@ def pixelrush_cascade(
         )
 
         # Patch-based refinement
+        if progress_callback is not None:
+            def stage_callback(patch_idx, total_patches):
+                progress_callback(patch_idx, total_patches, stage, num_cascade_stages)
+        else:
+            stage_callback = None
+
         z = refine_latent_once(
             coarse_latent=coarse_latent,
             predict_eps=predict_eps,
             alpha_bar_at=alpha_bar_at,
             cfg=cfg,
+            progress_callback=stage_callback,
         )
         logger.info("PixelRush: stage %d complete", stage + 1)
 

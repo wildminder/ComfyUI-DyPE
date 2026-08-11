@@ -388,6 +388,34 @@ class PixelRushNode(io.ComfyNode):
         else:
             initial_latent_4d = initial_latent
 
+        # Pre-compute total patches across all cascade stages for the progress bar.
+        # Each stage doubles the latent spatial dimensions.
+        from .pixelrush import patch_positions
+
+        total_patches = 0
+        stage_patch_counts = []
+        cur_h, cur_w = patch_h, patch_w
+        for stage in range(num_cascade_stages):
+            # After VAE decode → 2x bicubic → VAE encode, latent is 2x in each dim
+            cur_h = cur_h * 2
+            cur_w = cur_w * 2
+            n = len(list(patch_positions(
+                full_h=cur_h, full_w=cur_w,
+                patch_h=patch_h, patch_w=patch_w,
+                overlap=overlap,
+            )))
+            stage_patch_counts.append(n)
+            total_patches += n
+
+        # Progress bar
+        pbar = comfy.utils.ProgressBar(total_patches)
+        patches_done = [0]  # mutable counter for closure
+
+        def progress_callback(patch_idx, total_patches_in_stage, stage, num_stages):
+            # Accumulate patches from previous stages + current patch
+            prev_patches = sum(stage_patch_counts[:stage]) if stage > 0 else 0
+            pbar.update_absolute(prev_patches + patch_idx)
+
         # Run PixelRush cascade (works in 4D spatial)
         result_latent_4d = pixelrush_cascade(
             initial_latent=initial_latent_4d,
@@ -397,7 +425,11 @@ class PixelRushNode(io.ComfyNode):
             predict_eps=predict_eps,
             alpha_bar_at=alpha_bar_at,
             cfg=cfg_obj,
+            progress_callback=progress_callback,
         )
+
+        # Mark progress bar as complete
+        pbar.update_absolute(total_patches)
 
         # For 3D latent models, unsqueeze back to 5D for the output.
         # The downstream VAEDecode node will call process_latent_out on this.
