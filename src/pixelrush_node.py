@@ -19,7 +19,7 @@ from .pixelrush import PixelRushConfig, pixelrush_cascade
 logger = logging.getLogger("ComfyUI-DyPE")
 
 
-def _make_predict_eps(model, positive, negative, cfg_scale):
+def _make_predict_eps(model, positive, negative, cfg_scale, latent_dimensions=2):
     """Create a predict_eps adapter that runs the model with CFG.
 
     Uses ComfyUI's full conditioning pipeline:
@@ -28,6 +28,11 @@ def _make_predict_eps(model, positive, negative, cfg_scale):
       3. ``get_area_and_mult`` — extract processed conditioning tensors
       4. ``apply_model`` — run the model
 
+    For 3D latent models (latent_dimensions=3), the core PixelRush algorithm
+    works in 4D spatial [B, C, H, W], but the model expects 5D [B, C, T, H, W].
+    This adapter unsqueezes 4D patches to 5D before calling apply_model, and
+    squeezes the 5D eps output back to 4D.
+
     Returns a callable: predict_eps(latent, timestep) -> eps [B, C, H, W]
     """
     import comfy.samplers
@@ -35,6 +40,7 @@ def _make_predict_eps(model, positive, negative, cfg_scale):
     import comfy.model_management
 
     device = model.load_device if hasattr(model, 'load_device') else torch.device("cpu")
+    is_3d = latent_dimensions == 3
 
     # Ensure the model is loaded to GPU and pre_run is called
     # pre_run sets model.model.current_patcher = model (the ModelPatcher)
@@ -45,11 +51,14 @@ def _make_predict_eps(model, positive, negative, cfg_scale):
     # Cache for processed conditioning (built once, reused across calls)
     _processed = None
 
-    def _get_processed(latent):
+    def _get_processed(latent_5d):
         """Build processed conditioning using ComfyUI's canonical pipeline.
 
         convert_cond converts tuple format [(tensor, dict), ...] to dict format
         [dict, ...] which process_conds expects.
+
+        ``latent_5d`` must be 5D for 3D latent models so that conditioning
+        area/mask dimensions match what get_area_and_mult expects.
         """
         nonlocal _processed
         if _processed is not None:
@@ -59,7 +68,7 @@ def _make_predict_eps(model, positive, negative, cfg_scale):
         neg_converted = comfy.sampler_helpers.convert_cond(negative)
         conds_dict = {"positive": pos_converted, "negative": neg_converted}
         # Step 2: Process conds (builds model_conds via encode_model_conds)
-        noise = torch.zeros_like(latent)
+        noise = torch.zeros_like(latent_5d)
         _processed = comfy.samplers.process_conds(
             model.model, noise, conds_dict, device
         )
@@ -68,6 +77,12 @@ def _make_predict_eps(model, positive, negative, cfg_scale):
     def predict_eps(latent: torch.Tensor, timestep: int) -> torch.Tensor:
         # Move latent to model device for inference
         latent = latent.to(device)
+
+        # For 3D latent models, unsqueeze 4D [B,C,H,W] to 5D [B,C,1,H,W]
+        # The model's _forward expects 5D for temporal models.
+        was_4d = latent.ndim == 4
+        if is_3d and was_4d:
+            latent = latent.unsqueeze(2)  # [B, C, 1, H, W]
 
         # Convert timestep to sigma
         sigmas = model.model.model_sampling.sigmas
@@ -106,7 +121,13 @@ def _make_predict_eps(model, positive, negative, cfg_scale):
         eps_uncond = run_cond("negative")
 
         # CFG
-        return eps_uncond + cfg_scale * (eps_cond - eps_uncond)
+        eps = eps_uncond + cfg_scale * (eps_cond - eps_uncond)
+
+        # For 3D latent models, squeeze 5D eps back to 4D for the core algorithm
+        if is_3d and eps.ndim == 5 and was_4d:
+            eps = eps.squeeze(2)  # [B, C, H, W]
+
+        return eps
 
     return predict_eps
 
@@ -135,44 +156,79 @@ def _make_vae_adapters(vae, device, model=None):
     All tensors are moved to ``device`` for GPU acceleration.
     Handles both 2D VAEs (latent_dim=2, 4D latents [B,C,H,W]) and
     3D/video VAEs (latent_dim=3, 5D latents [B,C,T,H,W]).
+
+    Uses model.process_latent_out/in to convert between model latent
+    format and VAE latent format.
+
+    For 3D latent models (Wan21, Krea2, Qwen, Anima), the model's
+    ``process_latent_out``/``process_latent_in`` use 5D ``latents_mean``/
+    ``latents_std`` with shape ``[1, C, 1, 1, 1]``.  Calling these on a 4D
+    tensor causes a broadcasting misalignment that corrupts the batch
+    dimension (see plan 2026-08-10-freescale-krea2-5d-latent-fix.md).
+
+    Therefore, for 3D latent models:
+    - ``vae_decode`` accepts 5D latents and calls ``process_latent_out``
+      directly on the 5D tensor.
+    - ``vae_encode`` returns 5D latents (with singleton temporal dim) so
+      they can be passed directly to the sampler.
     """
     latent_dim = getattr(vae, 'latent_dim', 2)
+    process_latent_out = None
+    process_latent_in = None
+    if model is not None and hasattr(model, 'model'):
+        if hasattr(model.model, 'process_latent_out'):
+            process_latent_out = model.model.process_latent_out
+        if hasattr(model.model, 'process_latent_in'):
+            process_latent_in = model.model.process_latent_in
 
     def vae_decode(latent: torch.Tensor) -> torch.Tensor:
-        # latent: [B, C, H, W] — ComfyUI VAE expects [B, C, H, W]
         if isinstance(latent, dict):
             latent = latent["samples"]
         latent = latent.to(device)
-        # For 3D VAEs (video), add temporal dimension: [B,C,H,W] -> [B,C,1,H,W]
+        # Convert from model latent format to VAE latent format.
+        # For 3D latent models, process_latent_out expects 5D input.
+        if process_latent_out is not None:
+            if latent_dim == 3:
+                # Ensure 5D for process_latent_out
+                if latent.ndim == 4:
+                    latent = latent.unsqueeze(2)  # [B, C, 1, H, W]
+                latent = process_latent_out(latent)
+            else:
+                latent = process_latent_out(latent)
+        # For 3D VAEs, ensure temporal dimension is present for vae.decode
         if latent_dim == 3 and latent.ndim == 4:
             latent = latent.unsqueeze(2)
-        # VAE decode expects unscaled latent
-        # ComfyUI VAEs handle scaling internally
         decoded = vae.decode(latent)
-        # For 3D VAEs, decoded is [B, T, H, W, C] — take first temporal frame
         if decoded.ndim == 5:
-            decoded = decoded[:, 0]  # [B, H, W, C]
+            decoded = decoded[:, 0]
         elif decoded.ndim == 3:
-            # Single image [H, W, C] → add batch dim
             decoded = decoded.unsqueeze(0)
-        # decoded: [B, H, W, C] → [B, C, H, W] for bicubic upscale
         if decoded.dim() == 4 and decoded.shape[-1] == 3:
             decoded = decoded.movedim(-1, 1)
         elif decoded.dim() == 4 and decoded.shape[1] == 3:
-            pass  # Already [B, C, H, W]
+            pass
         return decoded
 
     def vae_encode(image: torch.Tensor) -> torch.Tensor:
-        # image: [B, C, H, W] → VAE expects [B, H, W, C]
         image = image.to(device)
         if image.dim() == 4 and image.shape[1] == 3:
             image = image.movedim(1, -1)
         encoded = vae.encode(image)
         if isinstance(encoded, dict):
             encoded = encoded["samples"]
-        # For 3D VAEs (video), take first temporal frame: [B,C,T,H,W] -> [B,C,H,W]
+        # For 3D VAEs, take first temporal frame to get 4D
         if latent_dim == 3 and encoded.ndim == 5:
             encoded = encoded[:, :, 0]
+        # Convert from VAE latent format to model latent format.
+        # For 3D latent models, process_latent_in expects 5D input and
+        # we return 5D so the latent can be passed directly to the sampler.
+        if process_latent_in is not None:
+            if latent_dim == 3:
+                if encoded.ndim == 4:
+                    encoded = encoded.unsqueeze(2)  # [B, C, 1, H, W]
+                encoded = process_latent_in(encoded)
+            else:
+                encoded = process_latent_in(encoded)
         return encoded
 
     return vae_decode, vae_encode
@@ -247,16 +303,65 @@ class PixelRushNode(io.ComfyNode):
                 num_cascade_stages=1, k_timestep=249, noise_lambda=0.95,
                 overlap=0.50, gaussian_sigma=8.0, gaussian_kernel_size=41,
                 patch_h=0, patch_w=0) -> io.NodeOutput:
+        import comfy.utils
+
         # Get initial latent
         if isinstance(latent_image, dict):
             initial_latent = latent_image["samples"]
         else:
             initial_latent = latent_image
 
+        device = model.load_device if hasattr(model, 'load_device') else torch.device("cpu")
+
+        # Get model's latent format info
+        model_latent_channels = getattr(model.model.latent_format, 'latent_channels', None)
+        latent_dimensions = getattr(model.model.latent_format, 'latent_dimensions', 2)
+        process_latent_in = getattr(model.model, 'process_latent_in', None)
+
+        # Convert input latent to model's internal format if channels don't match.
+        # EmptyLatentImage may produce fewer channels than the model expects
+        # (e.g., 4 channels for a 16-channel Krea2/Wan21 model).
+        # Use repeat_to_batch_size (like ComfyUI's fix_empty_latent_channels)
+        # instead of zero-padding, which produces garbage.
+        if model_latent_channels is not None and initial_latent.shape[1] != model_latent_channels:
+            is_empty = torch.count_nonzero(initial_latent) == 0
+            if is_empty:
+                logger.info(
+                    "PixelRush: empty input latent has %d channels, model expects %d — repeating channels",
+                    initial_latent.shape[1], model_latent_channels,
+                )
+                initial_latent = comfy.utils.repeat_to_batch_size(
+                    initial_latent, model_latent_channels, dim=1,
+                )
+            else:
+                logger.warning(
+                    "PixelRush: non-empty input latent has %d channels, model expects %d — "
+                    "channel mismatch may produce unexpected results",
+                    initial_latent.shape[1], model_latent_channels,
+                )
+
+        # Move initial latent to model device for GPU acceleration
+        initial_latent = initial_latent.to(device)
+
+        # Convert initial latent to model format (process_latent_in).
+        # In normal ComfyUI sampling, the guider calls process_latent_in before
+        # apply_model. Since PixelRush calls apply_model directly via predict_eps,
+        # we must convert here. For 3D latent models, process_latent_in expects
+        # 5D input [B, C, T, H, W] — passing 4D causes broadcasting misalignment
+        # with 5D latents_mean/std (see plan 2026-08-10-freescale-krea2-5d-latent-fix.md).
+        if process_latent_in is not None:
+            if latent_dimensions == 3:
+                if initial_latent.ndim == 4:
+                    initial_latent = initial_latent.unsqueeze(2)  # [B, C, 1, H, W]
+            initial_latent = process_latent_in(initial_latent)
+
         # Auto-detect patch size from native resolution
-        if patch_h == 0 or patch_w == 0:
-            # Use the initial latent size as patch size
+        # Handle both 4D [B,C,H,W] and 5D [B,C,T,H,W]
+        if initial_latent.ndim == 5:
+            _, _, _, h, w = initial_latent.shape
+        else:
             _, _, h, w = initial_latent.shape
+        if patch_h == 0 or patch_w == 0:
             patch_h = h if patch_h == 0 else patch_h
             patch_w = w if patch_w == 0 else patch_w
 
@@ -270,18 +375,22 @@ class PixelRushNode(io.ComfyNode):
             gaussian_kernel_size=gaussian_kernel_size,
         )
 
-        # Create adapters
-        predict_eps = _make_predict_eps(model, positive, negative, cfg)
+        # Create adapters — predict_eps needs to know if model is 3D latent
+        predict_eps = _make_predict_eps(model, positive, negative, cfg, latent_dimensions)
         alpha_bar_at = _make_alpha_bar_at(model)
-        device = model.load_device if hasattr(model, 'load_device') else torch.device("cpu")
         vae_decode, vae_encode = _make_vae_adapters(vae, device, model)
 
-        # Move initial latent to model device for GPU acceleration
-        initial_latent = initial_latent.to(device)
+        # For 3D latent models, squeeze temporal dim for the core algorithm
+        # (which works in 4D spatial). predict_eps will unsqueeze back to 5D
+        # before calling apply_model.
+        if latent_dimensions == 3 and initial_latent.ndim == 5:
+            initial_latent_4d = initial_latent.squeeze(2)  # [B, C, H, W]
+        else:
+            initial_latent_4d = initial_latent
 
-        # Run PixelRush cascade
-        result_latent = pixelrush_cascade(
-            initial_latent=initial_latent,
+        # Run PixelRush cascade (works in 4D spatial)
+        result_latent_4d = pixelrush_cascade(
+            initial_latent=initial_latent_4d,
             num_cascade_stages=num_cascade_stages,
             vae_decode=vae_decode,
             vae_encode=vae_encode,
@@ -289,5 +398,12 @@ class PixelRushNode(io.ComfyNode):
             alpha_bar_at=alpha_bar_at,
             cfg=cfg_obj,
         )
+
+        # For 3D latent models, unsqueeze back to 5D for the output.
+        # The downstream VAEDecode node will call process_latent_out on this.
+        if latent_dimensions == 3 and result_latent_4d.ndim == 4:
+            result_latent = result_latent_4d.unsqueeze(2)  # [B, C, 1, H, W]
+        else:
+            result_latent = result_latent_4d
 
         return io.NodeOutput({"samples": result_latent})

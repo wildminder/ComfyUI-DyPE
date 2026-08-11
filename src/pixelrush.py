@@ -389,6 +389,11 @@ def pixelrush_cascade(
         # Ensure coarse_latent is on the same device as the model output
         # (VAE may return on CPU even if input was on GPU)
         coarse_latent = coarse_latent.to(image_up.device)
+        # For 3D latent models, vae_encode may return 5D [B,C,T,H,W].
+        # Squeeze temporal dim for the 4D spatial core algorithm.
+        # predict_eps will unsqueeze back to 5D before calling apply_model.
+        if coarse_latent.ndim == 5:
+            coarse_latent = coarse_latent.squeeze(2)  # [B, C, H, W]
         logger.info(
             "PixelRush: upscaled to %s, starting patch refinement",
             tuple(coarse_latent.shape),
