@@ -38,6 +38,7 @@ def _make_predict_eps(model, positive, negative, cfg_scale, latent_dimensions=2)
     import comfy.samplers
     import comfy.sampler_helpers
     import comfy.model_management
+    import comfy.utils
 
     device = model.load_device if hasattr(model, 'load_device') else torch.device("cpu")
     is_3d = latent_dimensions == 3
@@ -158,7 +159,6 @@ def _make_predict_eps(model, positive, negative, cfg_scale, latent_dimensions=2)
                 transformer_options=to, **extra_conds,
             )
             if len(model_output) > 1 and not torch.is_tensor(model_output):
-                import comfy.utils
                 model_output, _ = comfy.utils.pack_latents(model_output)
             # model_output is the raw prediction (epsilon for EPS models)
             return model_output.float()
