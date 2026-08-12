@@ -245,6 +245,9 @@ def refine_latent_once(
     alpha_bar_at: Callable[[int], Tensor | float],
     cfg: PixelRushConfig,
     progress_callback: Callable[[int, int], None] | None = None,
+    forward_step: Callable[[Tensor, Tensor, Tensor], Tensor] | None = None,
+    reverse_step: Callable[[Tensor, Tensor, Tensor], Tensor] | None = None,
+    sigma_at: Callable[[int], float] | None = None,
 ) -> Tensor:
     """Apply one PixelRush refinement stage to a coarse latent.
 
@@ -257,12 +260,24 @@ def refine_latent_once(
         ``predict_eps(latent, timestep) -> [B, C, H, W]`` epsilon prediction
         (should already include CFG).
     alpha_bar_at : callable
-        ``alpha_bar_at(K) -> alpha_cumprod[K]``.
+        ``alpha_bar_at(K) -> alpha_cumprod[K]``.  Used only when ``forward_step``
+        / ``reverse_step`` are not provided (EPS-only fallback).
     cfg : PixelRushConfig
         Hyperparameters.
     progress_callback : callable, optional
         ``progress_callback(patch_idx, total_patches)`` called after each
         patch is refined.  Used for ComfyUI progress bar integration.
+    forward_step : callable, optional
+        ``forward_step(x_0, eps, sigma) -> x_K``.  Uses the model's own
+        ``noise_scaling`` so the forward (0→K) step is correct for all
+        prediction types (EPS, CONST/flow, V_PREDICTION, ...).
+    reverse_step : callable, optional
+        ``reverse_step(x_K, eps_injected, sigma) -> x_0_hat``.  Uses the
+        inverse of ``noise_scaling`` so the reverse (K→0) step is correct for
+        all prediction types.
+    sigma_at : callable, optional
+        ``sigma_at(timestep) -> sigma float``.  Used to get the sigma at
+        timestep K for the forward/reverse adapters.
 
     Returns
     -------
@@ -274,7 +289,17 @@ def refine_latent_once(
         "Patch dimensions must not exceed the latent."
     )
 
-    alpha_k = alpha_bar_at(cfg.k_timestep)
+    # Sigma at timestep K (used by forward_step/reverse_step adapters).
+    # Falls back to alpha_bar for the EPS-only DDIM path.
+    if sigma_at is not None:
+        sigma_k = sigma_at(cfg.k_timestep)
+        sigma_k_tensor = torch.tensor(
+            [sigma_k], device=coarse_latent.device, dtype=coarse_latent.dtype
+        )
+    else:
+        sigma_k = None
+        sigma_k_tensor = None
+        alpha_k = alpha_bar_at(cfg.k_timestep)
 
     # Overlap-add buffers
     output_sum = torch.zeros_like(coarse_latent)
@@ -308,11 +333,14 @@ def refine_latent_once(
             logger.info("PixelRush: patch %d/%d", idx + 1, total_patches)
         patch_0 = coarse_latent[:, :, y:y + cfg.patch_h, x:x + cfg.patch_w]
 
-        # 1. Partial DDIM inversion: 0 -> K
+        # 1. Partial inversion: 0 -> K
         eps_inv = predict_eps(patch_0, timestep=0)
         # Ensure eps is on the same device as the patch
         eps_inv = eps_inv.to(patch_0.device)
-        patch_k = ddim_forward_one_step(patch_0, eps_inv, alpha_k)
+        if forward_step is not None:
+            patch_k = forward_step(patch_0, eps_inv, sigma_k_tensor)
+        else:
+            patch_k = ddim_forward_one_step(patch_0, eps_inv, alpha_k)
 
         # 2. One-step denoise: K -> 0
         eps_pred = predict_eps(patch_k, timestep=cfg.k_timestep)
@@ -322,8 +350,11 @@ def refine_latent_once(
         eps_rand = torch.randn_like(eps_pred)
         eps_injected = spherical_lerp(eps_pred, eps_rand, t=cfg.noise_lambda)
 
-        # 4. Reverse DDIM step: K -> 0
-        refined_patch = ddim_reverse_one_step_to_zero(patch_k, eps_injected, alpha_k)
+        # 4. Reverse step: K -> 0
+        if reverse_step is not None:
+            refined_patch = reverse_step(patch_k, eps_injected, sigma_k_tensor)
+        else:
+            refined_patch = ddim_reverse_one_step_to_zero(patch_k, eps_injected, alpha_k)
 
         # 5. Gaussian-feather overlap-add
         output_sum[:, :, y:y + cfg.patch_h, x:x + cfg.patch_w] += (
@@ -352,6 +383,9 @@ def pixelrush_cascade(
     alpha_bar_at: Callable[[int], Tensor | float],
     cfg: PixelRushConfig,
     progress_callback: Callable[[int, int, int, int], None] | None = None,
+    forward_step: Callable[[Tensor, Tensor, Tensor], Tensor] | None = None,
+    reverse_step: Callable[[Tensor, Tensor, Tensor], Tensor] | None = None,
+    sigma_at: Callable[[int], float] | None = None,
 ) -> Tensor:
     """PixelRush cascade: repeatedly upscale and refine.
 
@@ -368,12 +402,20 @@ def pixelrush_cascade(
     predict_eps : callable
         ``predict_eps(latent, timestep) -> eps`` (with CFG).
     alpha_bar_at : callable
-        ``alpha_bar_at(timestep) -> alpha_bar``.
+        ``alpha_bar_at(timestep) -> alpha_bar``.  Used only when the
+        forward/reverse adapters are not provided (EPS-only fallback).
     cfg : PixelRushConfig
     progress_callback : callable, optional
         ``progress_callback(patch_idx, total_patches, stage, num_stages)``
         called after each patch is refined.  Used for ComfyUI progress
         bar integration.
+    forward_step : callable, optional
+        ``forward_step(x_0, eps, sigma) -> x_K`` (model's noise_scaling).
+    reverse_step : callable, optional
+        ``reverse_step(x_K, eps_injected, sigma) -> x_0_hat`` (inverse of
+        noise_scaling).
+    sigma_at : callable, optional
+        ``sigma_at(timestep) -> sigma float``.
 
     Returns
     -------
@@ -425,6 +467,9 @@ def pixelrush_cascade(
             alpha_bar_at=alpha_bar_at,
             cfg=cfg,
             progress_callback=stage_callback,
+            forward_step=forward_step,
+            reverse_step=reverse_step,
+            sigma_at=sigma_at,
         )
         logger.info("PixelRush: stage %d complete", stage + 1)
 

@@ -19,6 +19,86 @@ from .pixelrush import PixelRushConfig, pixelrush_cascade
 logger = logging.getLogger("ComfyUI-DyPE")
 
 
+def _detect_prediction_type(model_sampling):
+    """Detect the model's prediction type from its model_sampling MRO.
+
+    ComfyUI uses different prediction types:
+      - ``CONST`` (flow matching, e.g. FLUX): model predicts velocity v = eps - x0
+      - ``EPS``: model predicts epsilon directly
+      - ``V_PREDICTION``: model predicts v-prediction
+      - ``X0``: model predicts x0 directly
+
+    The PixelRush DDIM equations assume epsilon prediction. For non-EPS models
+    we must convert the raw model output to epsilon using the correct formula.
+    """
+    mro_names = [c.__name__ for c in type(model_sampling).__mro__]
+    if "CONST" in mro_names or "IMG_TO_IMG_FLOW" in mro_names:
+        return "const"
+    if "V_PREDICTION" in mro_names:
+        return "v_prediction"
+    if "X0" in mro_names:
+        return "x0"
+    if "EPS" in mro_names:
+        return "eps"
+    return "eps"
+
+
+def _make_model_output_to_eps(model_sampling, prediction_type):
+    """Create a function converting raw model output to epsilon.
+
+    Uses numerically-stable formulas (no division by sigma at sigma≈0):
+
+    - EPS: eps = model_output (raw output IS epsilon)
+    - CONST (flow): eps = x_t + model_output * (1 - sigma)
+      (derivation: v = eps - x0, x0 = x_t - v*sigma → eps = v + x0 = x_t + v*(1-sigma))
+    - V_PREDICTION: eps = x_t*sigma/(sigma^2+sd^2) + model_output*sd/(sigma^2+sd^2)^0.5
+    - X0: eps = (x_t - model_output) / sigma (clamped; unstable at sigma≈0)
+    """
+    sd = getattr(model_sampling, "sigma_data", 1.0)
+
+    def model_output_to_eps(model_output, x_t, sigma):
+        sigma_r = sigma.reshape(sigma.shape + (1,) * (x_t.ndim - sigma.ndim))
+        if prediction_type == "eps":
+            return model_output
+        elif prediction_type == "const":
+            return x_t + model_output * (1.0 - sigma_r)
+        elif prediction_type == "v_prediction":
+            denom = sigma_r ** 2 + sd ** 2
+            return x_t * sigma_r / denom + model_output * sd / denom.sqrt()
+        elif prediction_type == "x0":
+            sigma_safe = sigma_r.clamp_min(1e-6)
+            return (x_t - model_output) / sigma_safe
+        else:
+            return model_output
+
+    return model_output_to_eps
+
+
+def _make_eps_to_x0(model_sampling, prediction_type):
+    """Create a function converting epsilon to x0 (inverse of noise_scaling).
+
+    - EPS: x0 = x_t - sigma * eps
+    - CONST (flow): x0 = (x_t - sigma * eps) / (1 - sigma)
+    - V_PREDICTION: x0 = x_t - sigma * eps
+    - X0: x0 = model_output (already x0)
+    """
+    def eps_to_x0(x_t, eps, sigma):
+        sigma_r = sigma.reshape(sigma.shape + (1,) * (x_t.ndim - sigma.ndim))
+        if prediction_type == "eps":
+            return x_t - sigma_r * eps
+        elif prediction_type == "const":
+            one_minus_sigma = (1.0 - sigma_r).clamp_min(1e-6)
+            return (x_t - sigma_r * eps) / one_minus_sigma
+        elif prediction_type == "v_prediction":
+            return x_t - sigma_r * eps
+        elif prediction_type == "x0":
+            return eps  # already x0
+        else:
+            return x_t - sigma_r * eps
+
+    return eps_to_x0
+
+
 def _make_predict_eps(model, positive, negative, cfg_scale, latent_dimensions=2):
     """Create a predict_eps adapter that runs the model with CFG.
 
@@ -26,11 +106,15 @@ def _make_predict_eps(model, positive, negative, cfg_scale, latent_dimensions=2)
       1. ``convert_cond`` — convert tuple conditioning to dict format
       2. ``process_conds`` — build model_conds (y, c_crossattn, etc.)
       3. ``get_area_and_mult`` — extract processed conditioning tensors
-      4. ``apply_model`` — run the model
+      4. ``diffusion_model`` — run the model (raw output)
+
+    The raw model output is converted to epsilon using the model's prediction
+    type (EPS, CONST/flow, V_PREDICTION, X0). This is critical: FLUX uses
+    CONST (flow matching) where the raw output is velocity, not epsilon.
 
     For 3D latent models (latent_dimensions=3), the core PixelRush algorithm
     works in 4D spatial [B, C, H, W], but the model expects 5D [B, C, T, H, W].
-    This adapter unsqueezes 4D patches to 5D before calling apply_model, and
+    This adapter unsqueezes 4D patches to 5D before calling diffusion_model, and
     squeezes the 5D eps output back to 4D.
 
     Returns a callable: predict_eps(latent, timestep) -> eps [B, C, H, W]
@@ -48,6 +132,12 @@ def _make_predict_eps(model, positive, negative, cfg_scale, latent_dimensions=2)
     # which is required by apply_hooks and prepare_state
     comfy.model_management.load_models_gpu([model])
     model.pre_run()
+
+    # Detect prediction type and create conversion functions
+    model_sampling = model.model.model_sampling
+    prediction_type = _detect_prediction_type(model_sampling)
+    model_output_to_eps = _make_model_output_to_eps(model_sampling, prediction_type)
+    logger.info("PixelRush: detected model prediction type '%s'", prediction_type)
 
     # Cache for processed conditioning (built once, reused across calls)
     _processed = None
@@ -118,11 +208,8 @@ def _make_predict_eps(model, positive, negative, cfg_scale, latent_dimensions=2)
             # model is the ModelPatcher; apply_hooks returns the transformer_options dict
             c['transformer_options'] = model.apply_hooks(hooks=None)
 
-            # We need the raw model output (epsilon for EPS models), NOT x0.
-            # apply_model returns calculate_denoised(sigma, model_output, x) = x0,
-            # which is useless at sigma≈0 (returns x trivially).
-            # Instead, replicate _apply_model's logic but skip calculate_denoised
-            # to get the raw model_output (epsilon for EPS prediction type).
+            # Replicate _apply_model's logic but skip calculate_denoised to get
+            # the raw model_output (velocity for CONST, epsilon for EPS, etc.)
             m = model.model
             ms = m.model_sampling
             xc = ms.calculate_input(sigma, p.input_x)
@@ -160,8 +247,11 @@ def _make_predict_eps(model, positive, negative, cfg_scale, latent_dimensions=2)
             )
             if len(model_output) > 1 and not torch.is_tensor(model_output):
                 model_output, _ = comfy.utils.pack_latents(model_output)
-            # model_output is the raw prediction (epsilon for EPS models)
-            return model_output.float()
+            # Convert raw model output to epsilon using the prediction type.
+            # For CONST/flow (FLUX), model_output is velocity v = eps - x0,
+            # so eps = x_t + v*(1-sigma). This is stable at sigma≈0.
+            eps = model_output_to_eps(model_output.float(), p.input_x, sigma)
+            return eps
 
         eps_cond = run_cond("positive")
         eps_uncond = run_cond("negative")
@@ -176,6 +266,51 @@ def _make_predict_eps(model, positive, negative, cfg_scale, latent_dimensions=2)
         return eps
 
     return predict_eps
+
+
+def _make_forward_step(model):
+    """Create a forward_step adapter using the model's noise_scaling.
+
+    forward_step(x_0, eps, sigma) -> x_K  (noises x_0 to timestep K)
+    Uses the model's own noise schedule, which is correct for all
+    prediction types (EPS, CONST/flow, V_PREDICTION, etc.).
+    """
+    ms = model.model.model_sampling
+
+    def forward_step(x_0, eps, sigma):
+        return ms.noise_scaling(sigma, eps, x_0)
+
+    return forward_step
+
+
+def _make_reverse_step(model):
+    """Create a reverse_step adapter using eps_to_x0.
+
+    reverse_step(x_K, eps_injected, sigma) -> x_0_hat
+    Converts injected epsilon back to x0 using the inverse of noise_scaling,
+    which is correct for all prediction types.
+    """
+    ms = model.model.model_sampling
+    prediction_type = _detect_prediction_type(ms)
+    eps_to_x0 = _make_eps_to_x0(ms, prediction_type)
+
+    def reverse_step(x_K, eps_injected, sigma):
+        return eps_to_x0(x_K, eps_injected, sigma)
+
+    return reverse_step
+
+
+def _make_sigma_at(model):
+    """Create a sigma_at adapter: timestep (0-999) -> sigma float."""
+    ms = model.model.model_sampling
+
+    def sigma_at(timestep):
+        ts_tensor = torch.tensor([float(timestep)], device=model.load_device
+                                 if hasattr(model, 'load_device') else torch.device("cpu"))
+        sigma_val = ms.sigma(ts_tensor).item()
+        return max(sigma_val, 1e-6)
+
+    return sigma_at
 
 
 def _make_alpha_bar_at(model):
@@ -429,6 +564,10 @@ class PixelRushNode(io.ComfyNode):
         predict_eps = _make_predict_eps(model, positive, negative, cfg, latent_dimensions)
         alpha_bar_at = _make_alpha_bar_at(model)
         vae_decode, vae_encode = _make_vae_adapters(vae, device, model)
+        # Model-agnostic forward/reverse steps (handle CONST/flow, V_PRED, EPS)
+        forward_step = _make_forward_step(model)
+        reverse_step = _make_reverse_step(model)
+        sigma_at = _make_sigma_at(model)
 
         # For 3D latent models, squeeze temporal dim for the core algorithm
         # (which works in 4D spatial). predict_eps will unsqueeze back to 5D
@@ -476,6 +615,9 @@ class PixelRushNode(io.ComfyNode):
             alpha_bar_at=alpha_bar_at,
             cfg=cfg_obj,
             progress_callback=progress_callback,
+            forward_step=forward_step,
+            reverse_step=reverse_step,
+            sigma_at=sigma_at,
         )
 
         # Mark progress bar as complete

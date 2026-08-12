@@ -877,3 +877,216 @@ class TestPixelRushInferenceBugFixFunctional:
         assert torch.allclose(z_K, eps, atol=1e-5), (
             "DDIM forward with alpha_bar=0 produces pure noise (this was the bug)"
         )
+
+
+@pytest.mark.unit
+class TestPixelRushPredictionTypeDetection:
+    """Tests for prediction-type detection and epsilon conversion.
+
+    The critical bug: FLUX uses CONST (flow-matching) prediction where the
+    raw model output is velocity v = eps - x0, NOT epsilon. Treating velocity
+    as epsilon produces pure noise. We must detect the prediction type and
+    convert correctly.
+    """
+
+    def _make_mock_model_sampling(self, prediction_type):
+        """Create a mock model_sampling with the given prediction type's MRO."""
+        if prediction_type == "const":
+            ConstClass = type("CONST", (), {})
+            ModelSampling = type("ModelSampling", (ConstClass,), {})
+        elif prediction_type == "eps":
+            EpsClass = type("EPS", (), {})
+            ModelSampling = type("ModelSampling", (EpsClass,), {})
+        elif prediction_type == "v_prediction":
+            EpsClass = type("EPS", (), {})
+            VPClass = type("V_PREDICTION", (EpsClass,), {})
+            ModelSampling = type("ModelSampling", (VPClass,), {})
+        else:
+            raise ValueError(f"Unknown prediction_type: {prediction_type}")
+        ms = ModelSampling()
+        ms.sigma_data = 1.0
+        return ms
+
+    def test_detect_const_prediction_type(self):
+        import sys
+        sys.path.insert(0, str(pathlib.Path(__file__).parent.parent))
+        from src.pixelrush_node import _detect_prediction_type
+
+        ms = self._make_mock_model_sampling("const")
+        assert _detect_prediction_type(ms) == "const"
+
+    def test_detect_eps_prediction_type(self):
+        import sys
+        sys.path.insert(0, str(pathlib.Path(__file__).parent.parent))
+        from src.pixelrush_node import _detect_prediction_type
+
+        ms = self._make_mock_model_sampling("eps")
+        assert _detect_prediction_type(ms) == "eps"
+
+    def test_detect_v_prediction_type(self):
+        import sys
+        sys.path.insert(0, str(pathlib.Path(__file__).parent.parent))
+        from src.pixelrush_node import _detect_prediction_type
+
+        ms = self._make_mock_model_sampling("v_prediction")
+        assert _detect_prediction_type(ms) == "v_prediction"
+
+    def test_const_conversion_velocity_to_epsilon(self):
+        """For CONST/flow, raw output is velocity v = eps - x0.
+
+        eps = x_t + v * (1 - sigma)  (stable at sigma≈0)
+        """
+        import sys
+        sys.path.insert(0, str(pathlib.Path(__file__).parent.parent))
+        from src.pixelrush_node import _make_model_output_to_eps
+
+        ms = self._make_mock_model_sampling("const")
+        converter = _make_model_output_to_eps(ms, "const")
+
+        x_t = torch.randn(1, 4, 8, 8)
+        eps_true = torch.randn_like(x_t)
+        sigma = torch.tensor([0.5])
+
+        # velocity v = eps - x0, and x0 = x_t - v*sigma
+        # So v = eps - (x_t - v*sigma) → v = (eps - x_t) / (1 - sigma)
+        v = (eps_true - x_t) / (1.0 - 0.5)
+
+        eps_converted = converter(v, x_t, sigma)
+        assert torch.allclose(eps_converted, eps_true, atol=1e-5), (
+            "CONST conversion should recover epsilon from velocity"
+        )
+
+    def test_const_conversion_at_sigma_zero(self):
+        """At sigma=0, CONST conversion: eps = x_t + v * 1 = x_t + v.
+
+        For a clean image, v ≈ -x_t (since eps≈0), so eps ≈ 0. This is
+        stable (no division by sigma).
+        """
+        import sys
+        sys.path.insert(0, str(pathlib.Path(__file__).parent.parent))
+        from src.pixelrush_node import _make_model_output_to_eps
+
+        ms = self._make_mock_model_sampling("const")
+        converter = _make_model_output_to_eps(ms, "const")
+
+        x_t = torch.randn(1, 4, 8, 8)
+        sigma = torch.tensor([0.0])
+
+        # velocity for clean image: v = eps - x0 = 0 - x_t = -x_t
+        v = -x_t
+        eps_converted = converter(v, x_t, sigma)
+        # eps = x_t + v*1 = x_t - x_t = 0
+        assert torch.allclose(eps_converted, torch.zeros_like(x_t), atol=1e-5), (
+            "CONST conversion at sigma=0 with clean image should give eps≈0"
+        )
+
+    def test_eps_conversion_is_identity(self):
+        """For EPS, raw output IS epsilon (identity)."""
+        import sys
+        sys.path.insert(0, str(pathlib.Path(__file__).parent.parent))
+        from src.pixelrush_node import _make_model_output_to_eps
+
+        ms = self._make_mock_model_sampling("eps")
+        converter = _make_model_output_to_eps(ms, "eps")
+
+        x_t = torch.randn(1, 4, 8, 8)
+        model_output = torch.randn_like(x_t)
+        sigma = torch.tensor([0.5])
+
+        eps_converted = converter(model_output, x_t, sigma)
+        assert torch.equal(eps_converted, model_output), (
+            "EPS conversion should be identity (raw output IS epsilon)"
+        )
+
+    def test_const_eps_to_x0(self):
+        """For CONST/flow, x0 = (x_t - sigma*eps) / (1 - sigma)."""
+        import sys
+        sys.path.insert(0, str(pathlib.Path(__file__).parent.parent))
+        from src.pixelrush_node import _make_eps_to_x0
+
+        ms = self._make_mock_model_sampling("const")
+        converter = _make_eps_to_x0(ms, "const")
+
+        x_t = torch.randn(1, 4, 8, 8)
+        eps = torch.randn_like(x_t)
+        sigma = torch.tensor([0.5])
+
+        # x_t = sigma*eps + (1-sigma)*x0 → x0 = (x_t - sigma*eps) / (1-sigma)
+        x0_true = (x_t - 0.5 * eps) / (1.0 - 0.5)
+        x0_converted = converter(x_t, eps, sigma)
+        assert torch.allclose(x0_converted, x0_true, atol=1e-5), (
+            "CONST eps_to_x0 should match (x_t - sigma*eps) / (1-sigma)"
+        )
+
+    def test_eps_eps_to_x0(self):
+        """For EPS, x0 = x_t - sigma*eps."""
+        import sys
+        sys.path.insert(0, str(pathlib.Path(__file__).parent.parent))
+        from src.pixelrush_node import _make_eps_to_x0
+
+        ms = self._make_mock_model_sampling("eps")
+        converter = _make_eps_to_x0(ms, "eps")
+
+        x_t = torch.randn(1, 4, 8, 8)
+        eps = torch.randn_like(x_t)
+        sigma = torch.tensor([0.5])
+
+        x0_true = x_t - 0.5 * eps
+        x0_converted = converter(x_t, eps, sigma)
+        assert torch.allclose(x0_converted, x0_true, atol=1e-5), (
+            "EPS eps_to_x0 should match x_t - sigma*eps"
+        )
+
+    def test_source_uses_prediction_type_detection(self):
+        """Source must detect prediction type and convert model output."""
+        content = (pathlib.Path(__file__).parent.parent / "src" / "pixelrush_node.py").read_text(encoding="utf-8")
+        assert "_detect_prediction_type" in content, (
+            "predict_eps must detect the model's prediction type"
+        )
+        assert "_make_model_output_to_eps" in content, (
+            "predict_eps must convert raw model output to epsilon using the "
+            "prediction type (CONST/flow, EPS, V_PREDICTION, X0)"
+        )
+        assert "model_output_to_eps(" in content, (
+            "run_cond must call model_output_to_eps to convert raw output"
+        )
+
+    def test_source_uses_noise_scaling_for_forward(self):
+        """Source must use model's noise_scaling for the forward step."""
+        content = (pathlib.Path(__file__).parent.parent / "src" / "pixelrush_node.py").read_text(encoding="utf-8")
+        assert "_make_forward_step" in content, (
+            "Node must create a forward_step adapter using noise_scaling"
+        )
+        assert "ms.noise_scaling" in content, (
+            "forward_step must use model_sampling.noise_scaling"
+        )
+
+    def test_source_uses_eps_to_x0_for_reverse(self):
+        """Source must use eps_to_x0 for the reverse step."""
+        content = (pathlib.Path(__file__).parent.parent / "src" / "pixelrush_node.py").read_text(encoding="utf-8")
+        assert "_make_reverse_step" in content, (
+            "Node must create a reverse_step adapter using eps_to_x0"
+        )
+        assert "_make_eps_to_x0" in content, (
+            "reverse_step must use _make_eps_to_x0 (inverse of noise_scaling)"
+        )
+
+    def test_refine_latent_once_accepts_adapters(self):
+        """refine_latent_once must accept forward_step/reverse_step/sigma_at."""
+        content = (pathlib.Path(__file__).parent.parent / "src" / "pixelrush.py").read_text(encoding="utf-8")
+        assert "forward_step:" in content, "refine_latent_once must accept forward_step"
+        assert "reverse_step:" in content, "refine_latent_once must accept reverse_step"
+        assert "sigma_at:" in content, "refine_latent_once must accept sigma_at"
+
+    def test_pixelrush_cascade_passes_adapters(self):
+        """pixelrush_cascade must pass adapters to refine_latent_once."""
+        content = (pathlib.Path(__file__).parent.parent / "src" / "pixelrush.py").read_text(encoding="utf-8")
+        assert "forward_step=forward_step" in content, (
+            "pixelrush_cascade must pass forward_step to refine_latent_once"
+        )
+        assert "reverse_step=reverse_step" in content, (
+            "pixelrush_cascade must pass reverse_step to refine_latent_once"
+        )
+        assert "sigma_at=sigma_at" in content, (
+            "pixelrush_cascade must pass sigma_at to refine_latent_once"
+        )
