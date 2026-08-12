@@ -98,10 +98,12 @@ def spherical_lerp(a: Tensor, b: Tensor, t: float, eps: float = 1e-7) -> Tensor:
 
     t_tensor = torch.full_like(omega, t)
 
-    # Spherical direction (use raw vectors, matching reference code)
+    # Spherical direction uses UNIT vectors. Using raw vectors (a_flat/b_flat)
+    # would square the norm whenever |a| != |b| (always true here: eps_pred≈0,
+    # eps_rand≈1), making eps_inj ~60x too large and the output pure noise.
     direction = (
-        torch.sin((1.0 - t_tensor) * omega) / sin_omega * a_flat
-        + torch.sin(t_tensor * omega) / sin_omega * b_flat
+        torch.sin((1.0 - t_tensor) * omega) / sin_omega * a_unit
+        + torch.sin(t_tensor * omega) / sin_omega * b_unit
     )
 
     # Interpolate magnitudes separately (linear)

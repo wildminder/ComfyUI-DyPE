@@ -23,26 +23,22 @@ from src.pixelrush import (
 @pytest.mark.unit
 class TestSphericalLerp:
     def test_t_zero_proportional_to_a(self):
-        """t=0 should return a value proportional to a (reference uses raw vectors
-        in direction, so result = a * norm(a) at t=0)."""
+        """t=0 must return exactly a (unit-vector SLERP: direction=a_unit,
+        magnitude=a_norm -> a_unit*a_norm = a)."""
         a = torch.randn(2, 4, 8, 8)
         b = torch.randn(2, 4, 8, 8)
         result = spherical_lerp(a, b, t=0.0)
-        # Reference code: direction = a_flat, magnitude = a_norm
-        # So result = a_flat * a_norm = a * norm(a)
-        a_norm = a.flatten(1).norm(dim=1, keepdim=True)
-        expected = a * a_norm.view(-1, 1, 1, 1)
-        assert torch.allclose(result, expected, atol=1e-3)
+        # Correct SLERP uses unit vectors: at t=0, direction = a_unit, magnitude = a_norm
+        # -> result = a_unit * a_norm = a (exactly)
+        assert torch.allclose(result, a, atol=1e-5)
 
     def test_t_one_proportional_to_b(self):
-        """t=1 should return a value proportional to b (reference uses raw vectors
-        in direction, so result = b * norm(b) at t=1)."""
+        """t=1 must return exactly b (unit-vector SLERP: direction=b_unit,
+        magnitude=b_norm -> b_unit*b_norm = b)."""
         a = torch.randn(2, 4, 8, 8)
         b = torch.randn(2, 4, 8, 8)
         result = spherical_lerp(a, b, t=1.0)
-        b_norm = b.flatten(1).norm(dim=1, keepdim=True)
-        expected = b * b_norm.view(-1, 1, 1, 1)
-        assert torch.allclose(result, expected, atol=1e-3)
+        assert torch.allclose(result, b, atol=1e-5)
 
     def test_midpoint_between(self):
         a = torch.randn(1, 4, 4, 4)
@@ -52,19 +48,21 @@ class TestSphericalLerp:
         assert result.shape == a.shape
 
     def test_parallel_vectors_linear(self):
-        """SLERP of parallel vectors: direction = 0.5*a + 0.5*b, magnitude = 0.5*|a| + 0.5*|b|.
-        Result = (0.5*a + 0.5*b) * (0.5*|a| + 0.5*|b|)."""
+        """SLERP of parallel vectors: result = unit * (0.5*|a| + 0.5*|b|).
+
+        Using unit vectors, the direction for parallel a,b is just the shared
+        unit vector, so result = unit * interpolated_magnitude (NOT squared).
+        """
         a = torch.ones(1, 8)
         b = torch.ones(1, 8) * 3.0
         result = spherical_lerp(a, b, t=0.5)
-        # For parallel vectors (omega≈0): sin(0.5*omega)/sin(omega) ≈ 0.5
-        # direction = 0.5 * a_flat + 0.5 * b_flat
+        # For parallel vectors (omega≈0): direction = 0.5*a_unit + 0.5*b_unit = unit
         # magnitude = 0.5 * norm_a + 0.5 * norm_b
         norm_a = a.flatten(1).norm(dim=1, keepdim=True)
         norm_b = b.flatten(1).norm(dim=1, keepdim=True)
-        direction = 0.5 * a + 0.5 * b  # = 0.5*1 + 0.5*3 = 2.0
+        unit = a / norm_a
         magnitude = 0.5 * norm_a + 0.5 * norm_b
-        expected = direction * magnitude
+        expected = unit * magnitude  # = 2.0 per element
         assert torch.allclose(result, expected, atol=0.1)
 
     def test_preserves_shape(self):

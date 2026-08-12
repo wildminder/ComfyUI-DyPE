@@ -698,14 +698,46 @@ class TestPixelRushInferenceBugFix:
             "is needed when getting raw epsilon directly"
         )
 
-    # --- Bug 3: spherical_lerp raw vectors ---
+    # --- Bug 3: spherical_lerp must use UNIT vectors (not raw) ---
 
-    def test_spherical_lerp_uses_raw_vectors(self):
-        """spherical_lerp must use a_flat/b_flat (raw), not a_unit/b_unit."""
+    def test_spherical_lerp_uses_unit_vectors(self):
+        """spherical_lerp must use a_unit/b_unit in the direction, not raw a_flat/b_flat.
+
+        Using raw vectors squares the norm whenever |a| != |b| (always true for
+        eps_pred≈0 vs eps_rand≈1), making eps_inj ~60x too large -> pure noise.
+        """
         content = (pathlib.Path(__file__).parent.parent / "src" / "pixelrush.py").read_text(encoding="utf-8")
-        assert "a_flat" in content, "spherical_lerp should use a_flat (raw vectors)"
-        assert "a_unit" not in content or "a_unit = a_flat / a_norm" in content, (
-            "spherical_lerp should not use a_unit in the direction computation"
+        assert "a_unit" in content, "spherical_lerp should define a_unit"
+        assert "b_unit" in content, "spherical_lerp should define b_unit"
+        # The direction term must use a_unit/b_unit, NOT a_flat/b_flat.
+        assert "sin_omega * a_flat" not in content, (
+            "spherical_lerp direction must use a_unit (unit vector), not a_flat (raw)"
+        )
+        assert "sin_omega * b_flat" not in content, (
+            "spherical_lerp direction must use b_unit (unit vector), not b_flat (raw)"
+        )
+
+    def test_spherical_lerp_does_not_explode_norm(self):
+        """Regression: slerp of two different-magnitude vectors must not square the norm.
+
+        slerp(eps_pred (norm~6), eps_rand (norm~64), 0.95) must yield a result
+        whose norm is ~ the interpolated magnitude (~61), NOT ~3900 (squared).
+        """
+        import sys
+        sys.path.insert(0, str(pathlib.Path(__file__).parent.parent))
+        from src.pixelrush import spherical_lerp
+        import torch
+        torch.manual_seed(0)
+        a = 0.1 * torch.randn(1, 4, 32, 32)   # eps_pred-like (small norm)
+        b = torch.randn(1, 4, 32, 32)          # eps_rand-like (large norm)
+        out = spherical_lerp(a, b, t=0.95)
+        out_norm = out.flatten(1).norm(dim=1).item()
+        # Interpolated magnitude should be ~ (1-0.95)*||a|| + 0.95*||b||
+        expected_mag = 0.05 * a.flatten(1).norm().item() + 0.95 * b.flatten(1).norm().item()
+        # Allow 2x tolerance; a squared norm would be ~60x larger.
+        assert out_norm < 2.0 * expected_mag, (
+            f"slerp exploded the norm: got {out_norm:.1f}, expected ~{expected_mag:.1f} "
+            f"(squared-norm bug would give ~{expected_mag**2:.1f})"
         )
 
 
