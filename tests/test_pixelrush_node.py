@@ -1090,3 +1090,68 @@ class TestPixelRushPredictionTypeDetection:
         assert "sigma_at=sigma_at" in content, (
             "pixelrush_cascade must pass sigma_at to refine_latent_once"
         )
+
+
+@pytest.mark.unit
+class TestPixelRushKTimestepScaling:
+    """Tests for k_timestep scaling to model's native timestep range.
+
+    FLUX/CONST-flow models use 0-1 timestep range; EPS/SD models use 0-999.
+    Passing k_timestep=249 (paper default for EPS) to a FLUX model gives
+    sigma>1 (invalid), making 1-sigma negative -> pure noise.
+    """
+
+    def _make_mock_model(self, timestep_range):
+        """Create a mock model with the given timestep range at sigma_max."""
+        import types
+
+        model = types.SimpleNamespace()
+        model_sampling = types.SimpleNamespace()
+        model_sampling.sigma_max = 1.0 if timestep_range == "01" else 14.6
+        model_sampling.timestep = lambda sigma: sigma if timestep_range == "01" else sigma * 999.0 / 14.6
+        model.model = types.SimpleNamespace()
+        model.model.model_sampling = model_sampling
+        return model
+
+    def test_scale_k_timestep_flux_01_range(self):
+        """For FLUX (0-1 range), k_timestep=249 should scale to ~0.249."""
+        import sys
+        sys.path.insert(0, str(pathlib.Path(__file__).parent.parent))
+        from src.pixelrush_node import _scale_k_timestep
+
+        model = self._make_mock_model("01")
+        scaled = _scale_k_timestep(model, 249)
+        assert abs(scaled - 249 / 999.0) < 1e-6, (
+            f"FLUX k_timestep should scale 249 -> {249/999.0:.4f}, got {scaled}"
+        )
+
+    def test_scale_k_timestep_eps_0999_range(self):
+        """For EPS (0-999 range), k_timestep=249 should be unchanged."""
+        import sys
+        sys.path.insert(0, str(pathlib.Path(__file__).parent.parent))
+        from src.pixelrush_node import _scale_k_timestep
+
+        model = self._make_mock_model("0999")
+        scaled = _scale_k_timestep(model, 249)
+        assert scaled == 249, (
+            f"EPS k_timestep should be unchanged (249), got {scaled}"
+        )
+
+    def test_scale_k_timestep_flux_small_value(self):
+        """For FLUX, k_timestep=50 should scale to ~0.05."""
+        import sys
+        sys.path.insert(0, str(pathlib.Path(__file__).parent.parent))
+        from src.pixelrush_node import _scale_k_timestep
+
+        model = self._make_mock_model("01")
+        scaled = _scale_k_timestep(model, 50)
+        assert abs(scaled - 50 / 999.0) < 1e-6, (
+            f"FLUX k_timestep should scale 50 -> {50/999.0:.4f}, got {scaled}"
+        )
+
+    def test_source_uses_scale_k_timestep(self):
+        """Source must use _scale_k_timestep in execute."""
+        content = (pathlib.Path(__file__).parent.parent / "src" / "pixelrush_node.py").read_text(encoding="utf-8")
+        assert "_scale_k_timestep(" in content, (
+            "execute must call _scale_k_timestep to scale k_timestep to model range"
+        )

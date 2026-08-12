@@ -19,6 +19,32 @@ from .pixelrush import PixelRushConfig, pixelrush_cascade
 logger = logging.getLogger("ComfyUI-DyPE")
 
 
+def _scale_k_timestep(model, k_timestep):
+    """Scale k_timestep to the model's native timestep range.
+
+    EPS/SD models use 0-999 timesteps; FLUX/CONST-flow models use 0-1.
+    Passing k_timestep=249 (paper default for EPS) to a FLUX model gives
+    sigma>1 (invalid), making 1-sigma negative in eps_to_x0 -> pure noise.
+
+    Returns the scaled k_timestep (0-1 range for flow models, unchanged for EPS).
+    """
+    try:
+        ms = model.model.model_sampling
+        sigma_max = ms.sigma_max
+        timestep_at_max = ms.timestep(sigma_max)
+        if timestep_at_max <= 1.0 + 1e-3:
+            # 0-1 timestep range (FLUX/CONST flow): scale 0-999 -> 0-1
+            scaled = k_timestep / 999.0
+            logger.info(
+                "PixelRush: model uses 0-1 timestep range, scaling k_timestep %d -> %.4f",
+                k_timestep, scaled,
+            )
+            return scaled
+    except Exception as e:
+        logger.warning("PixelRush: could not detect timestep range (%s), using raw k_timestep", e)
+    return k_timestep
+
+
 def _detect_prediction_type(model_sampling):
     """Detect the model's prediction type from its model_sampling MRO.
 
@@ -550,11 +576,17 @@ class PixelRushNode(io.ComfyNode):
             patch_h = h if patch_h == 0 else patch_h
             patch_w = w if patch_w == 0 else patch_w
 
+        # Scale k_timestep to the model's native timestep range.
+        # EPS/SD models use 0-999; FLUX/CONST-flow models use 0-1.
+        # Passing k_timestep=249 (paper default for EPS) to a FLUX model
+        # gives sigma>1 (invalid), making 1-sigma negative -> pure noise.
+        k_timestep_scaled = _scale_k_timestep(model, k_timestep)
+
         cfg_obj = PixelRushConfig(
             patch_h=patch_h,
             patch_w=patch_w,
             overlap=overlap,
-            k_timestep=k_timestep,
+            k_timestep=k_timestep_scaled,
             noise_lambda=noise_lambda,
             gaussian_sigma=gaussian_sigma,
             gaussian_kernel_size=gaussian_kernel_size,
