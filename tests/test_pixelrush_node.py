@@ -1187,3 +1187,84 @@ class TestPixelRushKTimestepScaling:
         assert "_scale_k_timestep(" in content, (
             "execute must call _scale_k_timestep to scale k_timestep to model range"
         )
+
+
+@pytest.mark.unit
+class TestPrepareInitialLatent:
+    """Tests for _prepare_initial_latent (regression guard for the SDXL
+    UnboundLocalError: cfg_obj referenced before assignment in execute).
+
+    The guard that decides whether to apply process_latent_in to the initial
+    latent was previously inlined in execute and referenced cfg_obj (defined
+    later). Extracting it into this helper makes operate_in_vae_space an
+    explicit parameter, so it can never be undefined.
+    """
+
+    def _import_helper(self):
+        import sys
+        sys.path.insert(0, str(pathlib.Path(__file__).parent.parent))
+        from src.pixelrush_node import _prepare_initial_latent
+        return _prepare_initial_latent
+
+    def test_vae_space_skips_process_latent_in(self):
+        """operate_in_vae_space=True must NOT call process_latent_in (SDXL fix)."""
+        helper = self._import_helper()
+        latent = torch.randn(1, 4, 32, 32)
+        calls = []
+        def process_latent_in(x):
+            calls.append(1)
+            return x * 0.13025
+        out = helper(latent, process_latent_in, latent_dimensions=2,
+                     operate_in_vae_space=True)
+        assert len(calls) == 0, "process_latent_in must be skipped in VAE space"
+        assert torch.equal(out, latent), "latent must be unchanged in VAE space"
+
+    def test_model_space_applies_process_latent_in(self):
+        """operate_in_vae_space=False must call process_latent_in (legacy path)."""
+        helper = self._import_helper()
+        latent = torch.randn(1, 4, 32, 32)
+        calls = []
+        def process_latent_in(x):
+            calls.append(1)
+            return x * 0.13025
+        out = helper(latent, process_latent_in, latent_dimensions=2,
+                     operate_in_vae_space=False)
+        assert len(calls) == 1, "process_latent_in must be called in model space"
+        assert torch.allclose(out, latent * 0.13025)
+
+    def test_none_process_latent_in_is_noop(self):
+        """process_latent_in=None must be a no-op in both modes."""
+        helper = self._import_helper()
+        latent = torch.randn(1, 4, 32, 32)
+        out_vae = helper(latent, None, latent_dimensions=2, operate_in_vae_space=True)
+        out_model = helper(latent, None, latent_dimensions=2, operate_in_vae_space=False)
+        assert torch.equal(out_vae, latent)
+        assert torch.equal(out_model, latent)
+
+    def test_3d_unsqueezes_before_process_latent_in(self):
+        """3D model-space path must unsqueeze 4D -> 5D before process_latent_in."""
+        helper = self._import_helper()
+        latent = torch.randn(1, 4, 32, 32)  # 4D
+        seen_shape = {}
+        def process_latent_in(x):
+            seen_shape["shape"] = tuple(x.shape)
+            return x
+        out = helper(latent, process_latent_in, latent_dimensions=3,
+                     operate_in_vae_space=False)
+        assert seen_shape["shape"] == (1, 4, 1, 32, 32), (
+            f"3D process_latent_in should receive 5D, got {seen_shape['shape']}"
+        )
+        assert tuple(out.shape) == (1, 4, 1, 32, 32)
+
+    def test_3d_vae_space_skips_process_latent_in(self):
+        """3D VAE-space path must NOT call process_latent_in and keep 4D."""
+        helper = self._import_helper()
+        latent = torch.randn(1, 4, 32, 32)
+        calls = []
+        def process_latent_in(x):
+            calls.append(1)
+            return x
+        out = helper(latent, process_latent_in, latent_dimensions=3,
+                     operate_in_vae_space=True)
+        assert len(calls) == 0
+        assert tuple(out.shape) == (1, 4, 32, 32)

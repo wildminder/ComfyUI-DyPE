@@ -125,7 +125,8 @@ def _make_eps_to_x0(model_sampling, prediction_type):
     return eps_to_x0
 
 
-def _make_predict_eps(model, positive, negative, cfg_scale, latent_dimensions=2):
+def _make_predict_eps(model, positive, negative, cfg_scale, latent_dimensions=2,
+                      operate_in_vae_space=True):
     """Create a predict_eps adapter that runs the model with CFG.
 
     Uses ComfyUI's full conditioning pipeline:
@@ -143,6 +144,14 @@ def _make_predict_eps(model, positive, negative, cfg_scale, latent_dimensions=2)
     This adapter unsqueezes 4D patches to 5D before calling diffusion_model, and
     squeezes the 5D eps output back to 4D.
 
+    When ``operate_in_vae_space`` is True, the adapter accepts a VAE-space latent
+    (std ≈ 1) and returns a VAE-space epsilon. It converts to model space via
+    ``process_latent_in`` before running the model and converts the epsilon back
+    via ``process_latent_out``. This keeps the core algorithm in a space where
+    the fixed-magnitude noise injection (std ≈ 0.95) is comparable to the signal
+    (std ≈ 1), which is required for models whose ``process_latent_in`` scales
+    the latent (e.g. SDXL ``scale_factor=0.13025``).
+
     Returns a callable: predict_eps(latent, timestep) -> eps [B, C, H, W]
     """
     import comfy.samplers
@@ -152,6 +161,18 @@ def _make_predict_eps(model, positive, negative, cfg_scale, latent_dimensions=2)
 
     device = model.load_device if hasattr(model, 'load_device') else torch.device("cpu")
     is_3d = latent_dimensions == 3
+
+    # Capture latent-space converters. When operating in VAE space, the adapter
+    # converts VAE latents -> model space before the model call and converts the
+    # resulting epsilon back to VAE space. When None (no process_latent_in/out
+    # on the model, or legacy mode), the conversions are no-ops.
+    process_latent_in = getattr(model.model, 'process_latent_in', None)
+    process_latent_out = getattr(model.model, 'process_latent_out', None)
+    if not operate_in_vae_space:
+        # Legacy mode: execute() already applied process_latent_in; eps stays in
+        # model space. Disable the conversions here.
+        process_latent_in = None
+        process_latent_out = None
 
     # Ensure the model is loaded to GPU and pre_run is called
     # pre_run sets model.model.current_patcher = model (the ModelPatcher)
@@ -200,6 +221,12 @@ def _make_predict_eps(model, positive, negative, cfg_scale, latent_dimensions=2)
         was_4d = latent.ndim == 4
         if is_3d and was_4d:
             latent = latent.unsqueeze(2)  # [B, C, 1, H, W]
+
+        # When operating in VAE space, convert the input latent to model space
+        # before running the model. process_latent_in applies the latent
+        # format's scale_factor (e.g. SDXL 0.13025) and mean/std shifts.
+        if process_latent_in is not None:
+            latent = process_latent_in(latent)
 
         # Convert timestep (0-999) to sigma using model_sampling.sigma().
         # The timestep is a value in the model's internal timestep space,
@@ -289,17 +316,33 @@ def _make_predict_eps(model, positive, negative, cfg_scale, latent_dimensions=2)
         if is_3d and eps.ndim == 5 and was_4d:
             eps = eps.squeeze(2)  # [B, C, H, W]
 
+        # When operating in VAE space, the input latent was converted to model
+        # space via process_latent_in before the model call, but the returned
+        # epsilon is intentionally NOT converted back. The model predicts noise
+        # with std ≈ 1 in model space; the VAE-space latent also has std ≈ 1.
+        # Keeping the epsilon at std ≈ 1 (numerically comparable to the latent)
+        # is what makes the fixed-magnitude noise injection (std ≈ 0.95) balanced
+        # against the signal, instead of being scaled down by scale_factor and
+        # drowned out. forward_step/reverse_step then operate directly in VAE
+        # space (no latent conversion), so x (std ≈ 1) and eps (std ≈ 1) stay
+        # comparable throughout.
         return eps
 
     return predict_eps
 
 
-def _make_forward_step(model):
+def _make_forward_step(model, operate_in_vae_space=True):
     """Create a forward_step adapter using the model's noise_scaling.
 
     forward_step(x_0, eps, sigma) -> x_K  (noises x_0 to timestep K)
     Uses the model's own noise schedule, which is correct for all
     prediction types (EPS, CONST/flow, V_PREDICTION, etc.).
+
+    When ``operate_in_vae_space`` is True (default), ``x_0`` and ``eps`` both
+    arrive in VAE space with std ≈ 1 (the epsilon is NOT scaled by
+    process_latent_out — see _make_predict_eps). The DDIM forward is applied
+    directly in VAE space, so the fixed-magnitude noise injection stays
+    balanced against the signal. No latent<->model conversion happens here.
     """
     ms = model.model.model_sampling
 
@@ -309,12 +352,16 @@ def _make_forward_step(model):
     return forward_step
 
 
-def _make_reverse_step(model):
+def _make_reverse_step(model, operate_in_vae_space=True):
     """Create a reverse_step adapter using eps_to_x0.
 
     reverse_step(x_K, eps_injected, sigma) -> x_0_hat
     Converts injected epsilon back to x0 using the inverse of noise_scaling,
     which is correct for all prediction types.
+
+    When ``operate_in_vae_space`` is True (default), ``x_K`` and ``eps_injected``
+    both arrive in VAE space with std ≈ 1, so the DDIM reverse is applied
+    directly in VAE space. No latent<->model conversion happens here.
     """
     ms = model.model.model_sampling
     prediction_type = _detect_prediction_type(ms)
@@ -360,7 +407,7 @@ def _make_alpha_bar_at(model):
     return alpha_bar_at
 
 
-def _make_vae_adapters(vae, device, model=None):
+def _make_vae_adapters(vae, device, model=None, operate_in_vae_space=True):
     """Create VAE decode/encode adapters.
 
     Returns (vae_decode, vae_encode) callables.
@@ -369,13 +416,17 @@ def _make_vae_adapters(vae, device, model=None):
     3D/video VAEs (latent_dim=3, 5D latents [B,C,T,H,W]).
 
     Uses model.process_latent_out/in to convert between model latent
-    format and VAE latent format.
+    format and VAE latent format — UNLESS ``operate_in_vae_space`` is True,
+    in which case the latent already lives in VAE space and the adapters must
+    NOT apply process_latent_out/in (that would re-scale an already-VAE-space
+    latent and corrupt it). The adapters then only handle shape (3D unsqueeze)
+    and the raw vae.decode/encode calls.
 
     For 3D latent models (Wan21, Krea2, Qwen, Anima), the model's
     ``process_latent_out``/``process_latent_in`` use 5D ``latents_mean``/
     ``latents_std`` with shape ``[1, C, 1, 1, 1]``.  Calling these on a 4D
     tensor causes a broadcasting misalignment that corrupts the batch
-    dimension (see plan 2026-08-10-freescale-krea2-5d-latent-fix.md).
+    (see plan 2026-08-10-freescale-krea2-5d-latent-fix.md).
 
     Therefore, for 3D latent models:
     - ``vae_decode`` accepts 5D latents and calls ``process_latent_out``
@@ -391,6 +442,11 @@ def _make_vae_adapters(vae, device, model=None):
             process_latent_out = model.model.process_latent_out
         if hasattr(model.model, 'process_latent_in'):
             process_latent_in = model.model.process_latent_in
+    # When operating in VAE space, the latent is already in VAE format; the
+    # adapters must not re-apply the model<->VAE scaling.
+    if operate_in_vae_space:
+        process_latent_out = None
+        process_latent_in = None
 
     def vae_decode(latent: torch.Tensor) -> torch.Tensor:
         if isinstance(latent, dict):
@@ -430,9 +486,9 @@ def _make_vae_adapters(vae, device, model=None):
         # For 3D VAEs, take first temporal frame to get 4D
         if latent_dim == 3 and encoded.ndim == 5:
             encoded = encoded[:, :, 0]
-        # Convert from VAE latent format to model latent format.
-        # For 3D latent models, process_latent_in expects 5D input and
-        # we return 5D so the latent can be passed directly to the sampler.
+        # Convert from VAE latent format to model latent format (legacy path).
+        # In VAE-space mode (operate_in_vae_space=True) process_latent_in is
+        # None, so no scaling is applied and the latent stays in VAE space.
         if process_latent_in is not None:
             if latent_dim == 3:
                 if encoded.ndim == 4:
@@ -440,9 +496,54 @@ def _make_vae_adapters(vae, device, model=None):
                 encoded = process_latent_in(encoded)
             else:
                 encoded = process_latent_in(encoded)
+        # For 3D latent models, always return 5D [B, C, 1, H, W] (singleton
+        # temporal dim) so the latent can be passed directly to the sampler /
+        # core algorithm (which squeezes to 4D). This is independent of whether
+        # process_latent_in scaling was applied.
+        if latent_dim == 3 and encoded.ndim == 4:
+            encoded = encoded.unsqueeze(2)  # [B, C, 1, H, W]
         return encoded
 
     return vae_decode, vae_encode
+
+
+def _prepare_initial_latent(initial_latent, process_latent_in, latent_dimensions,
+                             operate_in_vae_space):
+    """Convert the initial latent to model format ONLY when not in VAE space.
+
+    When ``operate_in_vae_space`` is True (default), the latent stays in VAE
+    space (std ≈ 1) and the adapters convert to model space internally. This is
+    required for models whose ``process_latent_in`` scales the latent down (e.g.
+    SDXL ``scale_factor=0.13025``), otherwise the fixed-magnitude noise
+    injection would dominate the signal.
+
+    When ``operate_in_vae_space`` is False (legacy path), ``process_latent_in``
+    is applied here. For 3D latent models, ``process_latent_in`` expects 5D input
+    ``[B, C, T, H, W]`` — a 4D latent is unsqueezed first to avoid broadcasting
+    misalignment with 5D ``latents_mean``/``latents_std``.
+
+    Parameters
+    ----------
+    initial_latent : Tensor
+        ``[B, C, H, W]`` (or ``[B, C, T, H, W]`` for 3D) latent at native res.
+    process_latent_in : callable or None
+        Model's ``process_latent_in`` (scales latent to model space), or None.
+    latent_dimensions : int
+        2 for 2D VAEs, 3 for 3D/video VAEs.
+    operate_in_vae_space : bool
+        If True, skip ``process_latent_in`` (latent already in VAE space).
+
+    Returns
+    -------
+    Tensor
+        The (possibly converted) initial latent.
+    """
+    if process_latent_in is not None and not operate_in_vae_space:
+        if latent_dimensions == 3:
+            if initial_latent.ndim == 4:
+                initial_latent = initial_latent.unsqueeze(2)  # [B, C, 1, H, W]
+        initial_latent = process_latent_in(initial_latent)
+    return initial_latent
 
 
 class PixelRushNode(io.ComfyNode):
@@ -554,17 +655,26 @@ class PixelRushNode(io.ComfyNode):
         # Move initial latent to model device for GPU acceleration
         initial_latent = initial_latent.to(device)
 
-        # Convert initial latent to model format (process_latent_in).
+        # PixelRush runs in VAE latent space by default (std ≈ 1). The adapters
+        # convert to model space internally. Set to False only to use the legacy
+        # model-space path.
+        operate_in_vae_space = True
+
+        # Convert initial latent to model format (process_latent_in) ONLY when
+        # NOT operating in VAE space. When operate_in_vae_space is True, the
+        # latent stays in VAE space (std ≈ 1) and the adapters convert to model
+        # space internally. This is required for models whose process_latent_in
+        # scales the latent down (e.g. SDXL scale_factor=0.13025), otherwise the
+        # fixed-magnitude noise injection would dominate the signal.
         # In normal ComfyUI sampling, the guider calls process_latent_in before
         # apply_model. Since PixelRush calls apply_model directly via predict_eps,
-        # we must convert here. For 3D latent models, process_latent_in expects
-        # 5D input [B, C, T, H, W] — passing 4D causes broadcasting misalignment
-        # with 5D latents_mean/std (see plan 2026-08-10-freescale-krea2-5d-latent-fix.md).
-        if process_latent_in is not None:
-            if latent_dimensions == 3:
-                if initial_latent.ndim == 4:
-                    initial_latent = initial_latent.unsqueeze(2)  # [B, C, 1, H, W]
-            initial_latent = process_latent_in(initial_latent)
+        # we must convert here (legacy path). For 3D latent models,
+        # process_latent_in expects 5D input [B, C, T, H, W] — passing 4D causes
+        # broadcasting misalignment with 5D latents_mean/std
+        # (see plan 2026-08-10-freescale-krea2-5d-latent-fix.md).
+        initial_latent = _prepare_initial_latent(
+            initial_latent, process_latent_in, latent_dimensions, operate_in_vae_space
+        )
 
         # Auto-detect patch size from native resolution
         # Handle both 4D [B,C,H,W] and 5D [B,C,T,H,W]
@@ -590,15 +700,21 @@ class PixelRushNode(io.ComfyNode):
             noise_lambda=noise_lambda,
             gaussian_sigma=gaussian_sigma,
             gaussian_kernel_size=gaussian_kernel_size,
+            operate_in_vae_space=operate_in_vae_space,
         )
 
         # Create adapters — predict_eps needs to know if model is 3D latent
-        predict_eps = _make_predict_eps(model, positive, negative, cfg, latent_dimensions)
+        predict_eps = _make_predict_eps(
+            model, positive, negative, cfg, latent_dimensions,
+            operate_in_vae_space=cfg_obj.operate_in_vae_space,
+        )
         alpha_bar_at = _make_alpha_bar_at(model)
-        vae_decode, vae_encode = _make_vae_adapters(vae, device, model)
+        vae_decode, vae_encode = _make_vae_adapters(
+            vae, device, model, operate_in_vae_space=cfg_obj.operate_in_vae_space,
+        )
         # Model-agnostic forward/reverse steps (handle CONST/flow, V_PRED, EPS)
-        forward_step = _make_forward_step(model)
-        reverse_step = _make_reverse_step(model)
+        forward_step = _make_forward_step(model, operate_in_vae_space=cfg_obj.operate_in_vae_space)
+        reverse_step = _make_reverse_step(model, operate_in_vae_space=cfg_obj.operate_in_vae_space)
         sigma_at = _make_sigma_at(model)
 
         # For 3D latent models, squeeze temporal dim for the core algorithm

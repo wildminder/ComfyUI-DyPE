@@ -176,7 +176,50 @@ Using the node is straightforward and designed for minimal workflow disruption.
 
 <p align="right">(<a href="#readme-top">back to top</a>)</p>
 
+## 🚀 PixelRush Node
+
+**PixelRush** is a training-free, cascade-based high-resolution generation node. It turns
+high-resolution generation into a sequence of coarse-to-fine cascade refinements: generate a
+native-resolution image, upscale it, then use a single partial DDIM inversion + single
+denoising step per overlapping latent patch to add detail rather than regenerate the whole
+image from noise. Works with any ComfyUI model (SDXL, SD1.5, FLUX, Qwen, etc.).
+
+### VAE-space operation (important)
+
+PixelRush **operates entirely in VAE latent space** (latent std ≈ 1). The injected model
+adapters convert to model space internally (via `process_latent_in`) only when running the
+diffusion model, and the predicted epsilon is returned at std ≈ 1 (it is **not** scaled back
+by `process_latent_out`).
+
+This is required for models whose `process_latent_in` scales the latent down — most notably
+**SDXL** (`scale_factor = 0.13025`). If the algorithm ran in model space, the latent would
+have std ≈ 0.13 while the fixed-magnitude noise injection has std ≈ 0.95, so noise would
+dominate the signal ~6× and the output would look "totally noisy". Running in VAE space keeps
+the noise injection (std ≈ 0.95) balanced against the signal (std ≈ 1), exactly as the
+reference PixelRush implementation expects.
+
+The behavior is controlled by the `operate_in_vae_space` flag on `PixelRushConfig`
+(**default: `True`**). Setting it to `False` restores the legacy model-space path (only as a
+fallback; the VAE-space path is the recommended default).
+
+### Usage
+
+1. Load your model (e.g. `Load Checkpoint` for SDXL, `Flux` loader, `Qwen Image` loader).
+2. Generate a base latent at native resolution (e.g. `Empty Latent Image` at 1024×1024 for SDXL).
+3. Add the **PixelRush** node and connect `model`, `vae`, `positive`, `negative`, and the base `latent_image`.
+4. Set `num_cascade_stages` (1 = 2× upscale, 2 = 4×, 3 = 8×) and tune `noise_lambda` / `overlap` / `patch_h` / `patch_w`.
+5. The node outputs a refined latent — connect it to a `VAE Decode` node.
+
+> [!NOTE]
+> PixelRush calls the diffusion model directly (not through ComfyUI's sampler/guider), so it
+> performs its own CFG and prediction-type conversion (EPS, CONST/flow, V_PREDICTION, X0).
+
 ## Changelog
+
+#### PixelRush — SDXL noise-dominance fix
+*   **VAE-space operation:** PixelRush now runs entirely in VAE latent space (std ≈ 1) and converts to model space only inside the `predict_eps` adapter. This fixes the SDXL "totally noisy" output caused by `process_latent_in` scaling the latent down to std ≈ 0.13 (noise injection std ≈ 0.95 then dominated ~6×).
+*   **`operate_in_vae_space` flag:** added to `PixelRushConfig` (default `True`). `False` restores the legacy model-space path as a fallback.
+*   **Regression tests:** added `TestPixelRushCascadeVAESpace` guarding `out.std()/z0.std() < 2.0` for a realistic SDXL mock (was > 6 before the fix).
 
 #### v2.5.0
 *   **SEGA Node:** Added **SEGA** (Spectral-Energy Guided Attention) — a new node that computes per-RoPE-dimension mscale from the latent's Fourier spectrum at each denoising step. Content-aware attention sharpening for FLUX/Qwen. Uses NTK as base extrapolation with per-dim spectral refinement.

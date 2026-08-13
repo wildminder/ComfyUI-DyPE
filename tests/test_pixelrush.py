@@ -411,3 +411,119 @@ class TestPixelRushCascade:
             expected = 32 * (2 ** stages)
             assert result.shape[2] == expected
             assert result.shape[3] == expected
+
+
+# ---------------------------------------------------------------------------
+# PixelRushConfig: operate_in_vae_space flag (plan 2026-08-12)
+# ---------------------------------------------------------------------------
+
+@pytest.mark.unit
+class TestPixelRushConfigVAESpace:
+    def test_default_operate_in_vae_space_true(self):
+        """Default must be True (algorithm runs in VAE space)."""
+        cfg = PixelRushConfig(patch_h=32, patch_w=32)
+        assert cfg.operate_in_vae_space is True
+
+    def test_override_operate_in_vae_space_false(self):
+        """Can be set to False (legacy model-space path)."""
+        cfg = PixelRushConfig(patch_h=32, patch_w=32, operate_in_vae_space=False)
+        assert cfg.operate_in_vae_space is False
+
+
+# ---------------------------------------------------------------------------
+# Regression: SDXL noise-dominance fix (plan 2026-08-12)
+# ---------------------------------------------------------------------------
+
+@pytest.mark.unit
+class TestPixelRushCascadeVAESpace:
+    """Regression tests for the SDXL 'totally noisy' bug.
+
+    Root cause: SDXL's process_latent_in scales the latent down by
+    scale_factor=0.13025, so the latent has std≈0.13 in model space while the
+    noise injection has std≈0.95. Operating the algorithm in VAE space (std≈1)
+    keeps the noise balanced against the signal.
+    """
+
+    def _identity_vae_decode(self):
+        def decode(z):
+            return z  # identity (4ch passthrough)
+        return decode
+
+    def _identity_vae_encode(self):
+        def encode(x):
+            return x  # identity (4ch passthrough)
+        return encode
+
+    def _realistic_predict_eps(self, seed=0):
+        """Mock a real SDXL: small epsilon (std 0.1) for clean latents."""
+        def predict_eps(latent, timestep):
+            g = torch.Generator().manual_seed(seed)
+            return 0.1 * torch.randn(
+                latent.shape, generator=g, device=latent.device, dtype=latent.dtype
+            )
+        return predict_eps
+
+    def _vae_space_forward_step(self):
+        def forward_step(x_0, eps, sigma):
+            return x_0 + sigma * eps
+        return forward_step
+
+    def _vae_space_reverse_step(self):
+        def reverse_step(x_K, eps_inj, sigma):
+            return x_K - sigma * eps_inj
+        return reverse_step
+
+    def _sigma_at(self):
+        def sigma_at(t):
+            return 0.867  # SDXL sigma at K=249
+        return sigma_at
+
+    def _alpha_bar_at(self):
+        def alpha_bar_at(t):
+            return 1.0 / (0.867 ** 2 + 1.0)
+        return alpha_bar_at
+
+    def _run_cascade(self, cfg):
+        torch.manual_seed(0)
+        z0 = torch.randn(1, 4, 32, 32)  # VAE space, std≈1
+        result = pixelrush_cascade(
+            z0, num_cascade_stages=1,
+            vae_decode=self._identity_vae_decode(),
+            vae_encode=self._identity_vae_encode(),
+            predict_eps=self._realistic_predict_eps(),
+            alpha_bar_at=self._alpha_bar_at(),
+            cfg=cfg,
+            forward_step=self._vae_space_forward_step(),
+            reverse_step=self._vae_space_reverse_step(),
+            sigma_at=self._sigma_at(),
+        )
+        return z0, result
+
+    def test_vae_space_cascade_signal_dominated(self):
+        """Full cascade on a realistic SDXL mock must be signal-dominated.
+
+        Regression guard for the 'totally noisy' bug: out.std / z0.std < 2.0.
+        (Before the VAE-space fix this ratio was > 6.)
+        """
+        cfg = PixelRushConfig(
+            patch_h=32, patch_w=32, overlap=0.5, k_timestep=249,
+            noise_lambda=0.95, operate_in_vae_space=True,
+        )
+        z0, result = self._run_cascade(cfg)
+        ratio = result.std() / z0.std()
+        assert ratio < 2.0, (
+            f"Output noise dominates signal (ratio={ratio:.2f}); expected < 2.0"
+        )
+
+    def test_vae_space_cascade_correlates_with_input(self):
+        """Output should positively correlate with the input (structure kept)."""
+        import torch.nn.functional as F
+        cfg = PixelRushConfig(
+            patch_h=32, patch_w=32, overlap=0.5, k_timestep=249,
+            noise_lambda=0.95, operate_in_vae_space=True,
+        )
+        z0, result = self._run_cascade(cfg)
+        res_down = F.interpolate(
+            result, size=z0.shape[2:], mode="bilinear", align_corners=False
+        )
+        assert (res_down * z0).sum() > 0, "Output should correlate with input"
