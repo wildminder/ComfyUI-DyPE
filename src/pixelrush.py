@@ -359,8 +359,19 @@ def refine_latent_once(
         eps_pred = eps_pred.to(patch_k.device)
 
         # 3. Noise injection
+        # The model's own prediction (eps_pred) carries the high-frequency detail
+        # of the image. The original PixelRush paper injects a slerp between
+        # eps_pred and a random vector with noise_lambda=0.95, i.e. 95% RANDOM
+        # noise. Because each patch's random component is independent, it averages
+        # out across overlapping patches (overlap 0.5 -> ~4 patches/pixel), leaving
+        # the smoothed bicubic upscale dominant and producing a "compressed" look.
+        #
+        # Fix: keep eps_pred as the PRIMARY denoising signal and add only a
+        # controlled random perturbation scaled by noise_lambda. This preserves
+        # the model's detail prediction (which drives sharpness) while still
+        # injecting stochasticity for patch-to-patch diversity.
         eps_rand = torch.randn_like(eps_pred)
-        eps_injected = spherical_lerp(eps_pred, eps_rand, t=cfg.noise_lambda)
+        eps_injected = eps_pred + cfg.noise_lambda * eps_rand
 
         # 4. Reverse step: K -> 0
         if reverse_step is not None:

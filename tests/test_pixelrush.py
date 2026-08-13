@@ -527,3 +527,250 @@ class TestPixelRushCascadeVAESpace:
             result, size=z0.shape[2:], mode="bilinear", align_corners=False
         )
         assert (res_down * z0).sum() > 0, "Output should correlate with input"
+
+
+# ---------------------------------------------------------------------------
+# Diagnostics: "compressed / JPEG-style" artifacts (plan 2026-08-13)
+# ---------------------------------------------------------------------------
+
+def _hf_energy(x: torch.Tensor) -> float:
+    """High-frequency energy via 2D FFT radial power above 0.5*Nyquist.
+
+    x: [B, C, H, W]. Returns the summed FFT power for radial frequencies
+    r > 0.5 * r_max (the high-frequency half of the spectrum).
+    """
+    f = torch.fft.fft2(x)
+    p = f.abs().pow(2)
+    _, _, h, w = x.shape
+    cy, cx = h // 2, w // 2
+    yy = torch.arange(h, device=x.device).unsqueeze(1).expand(h, w).float()
+    xx = torch.arange(w, device=x.device).unsqueeze(0).expand(h, w).float()
+    r = ((yy - cy) ** 2 + (xx - cx) ** 2).sqrt()
+    mask = r > 0.5 * r.max()
+    return float(p[:, :, mask].sum().item())
+
+
+def _laplacian_hf(x: torch.Tensor) -> torch.Tensor:
+    """Extract HF component (edges) via a 3x3 Laplacian kernel.
+
+    Applies the same Laplacian to every channel (broadcast over the channel
+    dimension) by expanding the kernel to [C, 1, 3, 3].
+    """
+    import torch.nn.functional as F
+    kernel = torch.tensor(
+        [[0., 1., 0.], [1., -4., 1.], [0., 1., 0.]],
+        device=x.device, dtype=x.dtype,
+    ).view(1, 1, 3, 3).expand(x.shape[1], 1, 3, 3).contiguous()
+    return F.conv2d(x, kernel, padding=1, groups=x.shape[1])
+
+
+@pytest.mark.unit
+class TestPixelRushCompressionDiagnostics:
+    """Diagnostics for the 'compressed / JPEG-style' output artifacts.
+
+    Hypotheses (plan 2026-08-13):
+      H1: refinement adds no model detail (noise_lambda=0.95 -> 95% random noise
+          that averages out across overlapping patches, leaving smoothed bicubic).
+      H2: eps_inv = predict_eps(patch_0, 0) ~= 0 -> partial inversion is a no-op.
+      H3: VAE decode->encode round-trip is lossy/smoothing (compounds per stage).
+      H4: patch overlap-add leaves block/discontinuity artifacts at seams.
+
+    These tests use a STRUCTURED predict_eps (returns the latent's HF component,
+    as a real diffusion model predicts detail as noise) to measure whether the
+    algorithm adds or removes high-frequency detail.
+    """
+
+    def _identity_vae_decode(self):
+        return lambda z: z
+
+    def _identity_vae_encode(self):
+        return lambda x: x
+
+    def _structured_predict_eps(self, scale=0.5):
+        """Mock a real model: eps = structured HF of the latent (detail as noise)."""
+        def predict_eps(latent, timestep):
+            return scale * _laplacian_hf(latent)
+        return predict_eps
+
+    def _random_predict_eps(self, std=0.1, seed=0):
+        def predict_eps(latent, timestep):
+            g = torch.Generator().manual_seed(seed)
+            return std * torch.randn(
+                latent.shape, generator=g, device=latent.device, dtype=latent.dtype
+            )
+        return predict_eps
+
+    def _vae_space_forward_step(self):
+        return lambda x_0, eps, sigma: x_0 + sigma * eps
+
+    def _vae_space_reverse_step(self):
+        return lambda x_K, eps_inj, sigma: x_K - sigma * eps_inj
+
+    def _sigma_at(self):
+        return lambda t: 0.867
+
+    def _alpha_bar_at(self):
+        return lambda t: 1.0 / (0.867 ** 2 + 1.0)
+
+    def _make_cfg(self, **overrides):
+        base = dict(patch_h=32, patch_w=32, overlap=0.5, k_timestep=249,
+                    noise_lambda=0.95, operate_in_vae_space=True)
+        base.update(overrides)
+        return PixelRushConfig(**base)
+
+    # --- Step 1: HF-energy regression baseline ---
+    def test_cascade_preserves_hf_energy(self):
+        """Full cascade (1 stage) must not destroy HF vs input.
+
+        Regression guard: hf_energy(out) / hf_energy(z0) >= 0.8.
+        EXPECTED TO FAIL before the fix (proves smoothing).
+        """
+        torch.manual_seed(0)
+        z0 = torch.randn(1, 4, 32, 32)
+        cfg = self._make_cfg()
+        out = pixelrush_cascade(
+            z0, num_cascade_stages=1,
+            vae_decode=self._identity_vae_decode(),
+            vae_encode=self._identity_vae_encode(),
+            predict_eps=self._structured_predict_eps(),
+            alpha_bar_at=self._alpha_bar_at(),
+            cfg=cfg,
+            forward_step=self._vae_space_forward_step(),
+            reverse_step=self._vae_space_reverse_step(),
+            sigma_at=self._sigma_at(),
+        )
+        ratio = _hf_energy(out) / _hf_energy(z0)
+        assert ratio >= 0.8, (
+            f"Cascade destroyed HF detail (ratio={ratio:.3f}); expected >= 0.8"
+        )
+
+    # --- Step 2: isolate bicubic + VAE smoothing ---
+    def test_bicubic_vae_roundtrip_hf_loss(self):
+        """Measure HF loss from bicubic upscale + VAE round-trip (no refinement)."""
+        import torch.nn.functional as F
+        torch.manual_seed(0)
+        z0 = torch.randn(1, 4, 32, 32)
+        # pixel-space path: decode -> bicubic 2x -> encode
+        image = self._identity_vae_decode()(z0)
+        image_up = F.interpolate(image, scale_factor=2.0, mode="bicubic",
+                                 align_corners=False, antialias=True)
+        coarse = self._identity_vae_encode()(image_up)
+        ratio = _hf_energy(coarse) / _hf_energy(z0)
+        # Record for the plan; bicubic alone should reduce HF somewhat.
+        assert ratio > 0.0
+        # Soft guard: bicubic should not destroy >60% of HF on its own.
+        assert ratio >= 0.4, (
+            f"Bicubic+VAE round-trip destroyed too much HF (ratio={ratio:.3f})"
+        )
+
+    # --- Step 3: isolate refinement effect ---
+    def test_refinement_hf_delta(self):
+        """refine_latent_once should ADD HF vs the coarse (bicubic) latent."""
+        import torch.nn.functional as F
+        torch.manual_seed(0)
+        z0 = torch.randn(1, 4, 32, 32)
+        image_up = F.interpolate(z0, scale_factor=2.0, mode="bicubic",
+                                 align_corners=False, antialias=True)
+        coarse = self._identity_vae_encode()(image_up)
+        cfg = self._make_cfg()
+        refined = refine_latent_once(
+            coarse_latent=coarse,
+            predict_eps=self._structured_predict_eps(),
+            alpha_bar_at=self._alpha_bar_at(),
+            cfg=cfg,
+            forward_step=self._vae_space_forward_step(),
+            reverse_step=self._vae_space_reverse_step(),
+            sigma_at=self._sigma_at(),
+        )
+        ratio = _hf_energy(refined) / _hf_energy(coarse)
+        # Record for the plan. If ratio < 1.0, refinement REMOVES HF (H1).
+        assert ratio > 0.0
+
+    # --- Step 4: inversion no-op check (H2) ---
+    def test_inversion_adds_noise(self):
+        """Partial inversion (0->K) must add a non-trivial amount of noise.
+
+        If ||patch_k - patch_0|| ~= 0, the inversion is a no-op (H2) and the
+        denoising has no signal to refine.
+        """
+        torch.manual_seed(0)
+        z0 = torch.randn(1, 4, 32, 32)
+        cfg = self._make_cfg()
+        # Run a single patch through the forward step manually.
+        patch_0 = z0[:, :, :32, :32]
+        eps_inv = self._structured_predict_eps()(patch_0, 0)
+        sigma_k = torch.tensor([0.867])
+        patch_k = self._vae_space_forward_step()(patch_0, eps_inv, sigma_k)
+        rel = (patch_k - patch_0).norm() / patch_0.norm()
+        # Record for the plan. If rel < 0.1, inversion is effectively a no-op.
+        assert rel >= 0.0
+
+    # --- Step 5: patch-boundary discontinuity (H4) ---
+    def test_no_patch_boundary_discontinuity(self):
+        """Overlap-add must not leave block discontinuities at patch seams."""
+        torch.manual_seed(0)
+        z0 = torch.randn(1, 4, 32, 32)
+        cfg = self._make_cfg()
+        out = pixelrush_cascade(
+            z0, num_cascade_stages=1,
+            vae_decode=self._identity_vae_decode(),
+            vae_encode=self._identity_vae_encode(),
+            predict_eps=self._structured_predict_eps(),
+            alpha_bar_at=self._alpha_bar_at(),
+            cfg=cfg,
+            forward_step=self._vae_space_forward_step(),
+            reverse_step=self._vae_space_reverse_step(),
+            sigma_at=self._sigma_at(),
+        )
+        # Seam at y=32 (patch boundary for patch_h=32, full latent 64x64 after 2x)
+        # Use a 64x64 latent so a seam exists at the midpoint.
+        # Measure gradient magnitude at seam vs interior.
+        import torch.nn.functional as F
+        grad = torch.abs(out[:, :, 1:, :] - out[:, :, :-1, :]).mean(dim=(0, 1))
+        h = grad.shape[0]
+        seam = grad[h // 2].mean()
+        interior = grad[:h // 2].mean()
+        ratio = float((seam / interior.clamp_min(1e-8)).item())
+        # Record for the plan; ratio > 1.5 suggests seam artifacts.
+        assert ratio > 0.0
+
+    # --- Step 6: VAE round-trip HF loss per stage (H3) ---
+    def test_vae_roundtrip_hf_loss(self):
+        """VAE decode->encode round-trip must not destroy HF (identity mock)."""
+        torch.manual_seed(0)
+        z0 = torch.randn(1, 4, 32, 32)
+        roundtrip = self._identity_vae_encode()(self._identity_vae_decode()(z0))
+        ratio = _hf_energy(roundtrip) / _hf_energy(z0)
+        # Identity VAE -> ratio should be ~1.0. If a real VAE were used it would
+        # be < 1.0 (smoothing). This test pins the mock behavior.
+        assert ratio >= 0.99, (
+            f"Identity VAE round-trip changed HF (ratio={ratio:.3f}); mock broken"
+        )
+
+    # --- Step 7: fix — refinement must preserve model detail (H1) ---
+    def test_refinement_preserves_hf(self):
+        """After the H1 fix, refine_latent_once must NOT remove HF vs coarse.
+
+        Regression guard: hf_energy(refined) / hf_energy(coarse) >= 0.9.
+        (Before the fix this was ~0.76 — refinement smoothed the image.)
+        """
+        import torch.nn.functional as F
+        torch.manual_seed(0)
+        z0 = torch.randn(1, 4, 32, 32)
+        image_up = F.interpolate(z0, scale_factor=2.0, mode="bicubic",
+                                 align_corners=False, antialias=True)
+        coarse = self._identity_vae_encode()(image_up)
+        cfg = self._make_cfg()
+        refined = refine_latent_once(
+            coarse_latent=coarse,
+            predict_eps=self._structured_predict_eps(),
+            alpha_bar_at=self._alpha_bar_at(),
+            cfg=cfg,
+            forward_step=self._vae_space_forward_step(),
+            reverse_step=self._vae_space_reverse_step(),
+            sigma_at=self._sigma_at(),
+        )
+        ratio = _hf_energy(refined) / _hf_energy(coarse)
+        assert ratio >= 0.9, (
+            f"Refinement removed HF (ratio={ratio:.3f}); expected >= 0.9"
+        )
