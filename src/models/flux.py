@@ -6,12 +6,7 @@ class PosEmbedFlux(DyPEBasePosEmbed):
     DyPE Implementation for Standard ComfyUI Flux Models.
     Output Format: Rotation Matrix (concatenated) -> (B, 1, L, D)
     """
-    def forward(self, ids: torch.Tensor) -> torch.Tensor:
-        pos = ids.float()
-        freqs_dtype = torch.bfloat16 if pos.device.type == 'cuda' else torch.float32
-        
-        components = self.get_components(pos, freqs_dtype)
-        
+    def format_components(self, components, ids: torch.Tensor) -> torch.Tensor:
         emb_parts = []
         for cos, sin in components:
             cos_reshaped = cos.view(*cos.shape[:-1], -1, 2)[..., :1]
@@ -20,6 +15,11 @@ class PosEmbedFlux(DyPEBasePosEmbed):
             row2 = torch.cat([sin_reshaped, cos_reshaped], dim=-1)
             matrix = torch.stack([row1, row2], dim=-2)
             emb_parts.append(matrix)
-            
+
         emb = torch.cat(emb_parts, dim=-3)
         return emb.unsqueeze(1).to(ids.device)
+
+    def forward(self, ids: torch.Tensor) -> torch.Tensor:
+        pos = ids.float()
+        freqs_dtype = torch.bfloat16 if pos.device.type == 'cuda' else torch.float32
+        return self.format_components(self.get_components(pos, freqs_dtype), ids)

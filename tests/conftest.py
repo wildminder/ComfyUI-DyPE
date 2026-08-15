@@ -4,10 +4,15 @@ Provides mock objects that simulate ComfyUI's model structure
 without requiring a full ComfyUI installation.
 """
 import sys
+import os
 import types
 import copy
 import torch
 import pytest
+
+# Make the tests/ directory importable so shared helpers such as
+# ``_spa_math_helpers`` can be imported as a flat module.
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 
 # --- Mock ComfyUI modules so tests can run standalone ---
@@ -77,6 +82,33 @@ try:
     MockModelPatcher = None
 except ImportError:
     MockModelPatcher = _create_mock_comfy_modules()
+
+
+@pytest.fixture(autouse=True)
+def _install_mock_attention_module():
+    """Provide ``comfy.ldm.modules.attention`` with a pristine SDPA ``optimized_attention``.
+
+    The SPA hook patches the *module-level* ``comfy.ldm.modules.attention.optimized_attention``.
+    Under pytest ``comfy`` is a mock module, so ``comfy.ldm.modules.attention`` does not exist
+    by default.  This fixture builds the dotted import chain and resets ``optimized_attention`` to
+    a plain scaled-dot-product-attention shim (scale=1.0, matching the HRDiT reference) before
+    EVERY test, so the hook installs/uninstalls in isolation and never leaks across tests.
+    """
+    import torch.nn.functional as F
+
+    comfy_ldm = sys.modules.setdefault("comfy.ldm", types.ModuleType("comfy.ldm"))
+    comfy_ldm_modules = sys.modules.setdefault(
+        "comfy.ldm.modules", types.ModuleType("comfy.ldm.modules")
+    )
+    attn_mod = sys.modules.setdefault(
+        "comfy.ldm.modules.attention", types.ModuleType("comfy.ldm.modules.attention")
+    )
+
+    def _sdpa(q, k, v, heads, skip_reshape=False, mask=None, transformer_options=None, **kw):
+        return F.scaled_dot_product_attention(q, k, v, scale=1.0, dropout_p=0.0, is_causal=False)
+
+    attn_mod.optimized_attention = _sdpa
+    yield attn_mod
 
 
 @pytest.fixture

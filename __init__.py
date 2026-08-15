@@ -1,6 +1,7 @@
 import torch
 from comfy_api.latest import ComfyExtension, io
 from .src.patch_utils import apply_dype_to_model, apply_sega_to_model
+from .src.spa import apply_spa_to_model
 from .src.pixelrush_node import PixelRushNode
 from .src.freescale_node import FreeScaleNode
 from .src.qwen2d_vae_patch import install_qwen2d_patch
@@ -227,13 +228,106 @@ class SEGA(io.ComfyNode):
         return io.NodeOutput(patched_model)
 
 
+class SPA(io.ComfyNode):
+    """
+    Applies SPA (Spatial Position Alignment, HRDiT 2608.07003) to a model.
+
+    SPA bundles each spatial axis into groups of N tokens (the paper's bundle
+    size) before the positions enter the positional embedding, then slides the
+    bundle boundary over each axis and averages the resulting attention OUTPUTS.
+    This restores spatial distinguishability at ultra-high resolution without
+    retraining the model. While the grid is inside the model's trained extent
+    (e.g. <= 1024px) SPA is an automatic no-op. HAP (attention pruning) is a
+    separate, future speed-up.
+    """
+
+    @classmethod
+    def define_schema(cls) -> io.Schema:
+        return io.Schema(
+            node_id="SPA",
+            display_name="SPA (HRDiT)",
+            category="model_patches/position_encoding",
+            description="Spatial Position Alignment (HRDiT). Prevents high-resolution spatial disorder by bundling + averaging RoPE positions. Static, no timestep dependence.",
+            inputs=[
+                io.Model.Input(
+                    "model",
+                    tooltip="The model to patch with SPA.",
+                ),
+                io.Int.Input(
+                    "width",
+                    default=1024, min=16, max=8192, step=8,
+                    tooltip="Target image width. Must match the width of your empty latent.",
+                ),
+                io.Int.Input(
+                    "height",
+                    default=1024, min=16, max=8192, step=8,
+                    tooltip="Target image height. Must match the height of your empty latent.",
+                ),
+                io.Combo.Input(
+                    "model_type",
+                    options=["auto", "flux", "nunchaku", "qwen", "zimage", "anima"],
+                    default="auto",
+                    tooltip="Specify the model architecture. 'auto' usually works.",
+                ),
+                io.Combo.Input(
+                    "method",
+                    options=["ntk", "vision_yarn", "yarn", "pi", "base"],
+                    default="ntk",
+                    tooltip="Base RoPE method used for the bundled positions. SPA always applies ntk_factor=1.0 (no extrapolation) on the bundled coords.",
+                ),
+                io.Boolean.Input(
+                    "enable_spa",
+                    default=True,
+                    label_on="Enabled",
+                    label_off="Disabled",
+                    tooltip="Enable or disable SPA. When disabled, the base RoPE is emitted unchanged.",
+                ),
+                io.Int.Input(
+                    "bundle_size",
+                    default=0, min=0, max=256, step=1,
+                    optional=True,
+                    tooltip="SPA bundle size N (HRDiT paper): tokens per bundle. 0 = auto (minimal compression that keeps every bundled position in-distribution). 1 = off (plain passthrough). 2..8 = explicit (paper recommends 3 at 2K, 5 at 4K). While the grid is inside the model's trained extent (e.g. <= 1024px) SPA is automatically a no-op. Explicit N is floored by the in-distribution minimum so bundled positions never go out of distribution; the averaged-pass count is capped at 15. A single shared bundle size is used for BOTH axes so non-square images keep their aspect ratio (no horizontal squish). Legacy values >= 32 (old group_num semantics) are treated as auto with a warning.",
+                ),
+                io.Float.Input(
+                    "spa_start_sigma",
+                    default=1.0, min=0.0, max=1.0, step=0.05,
+                    optional=True,
+                    tooltip="Optional sigma-threshold gate (AND-combined with spa_steps): SPA runs only while the current sigma is ABOVE this threshold. 1.0 = no sigma gating (default). Lower values make later steps run at baseline speed.",
+                ),
+                io.Int.Input(
+                    "spa_steps",
+                    default=3, min=0, max=100, step=1,
+                    optional=True,
+                    tooltip="Step gating (HRDiT applies SPA only on leading denoising steps): number of LEADING steps on which SPA is active. 3 = HRDiT default (recommended speed/quality tradeoff). 0 = active on every step (backward compatible, slower). A new generation (sigma jump-up) resets the counter. Later steps run plain attention at baseline speed.",
+                ),
+            ],
+            outputs=[
+                io.Model.Output(
+                    display_name="Patched Model",
+                    tooltip="The model patched with SPA.",
+                ),
+            ],
+        )
+
+    @classmethod
+    def execute(cls, model, width: int, height: int, model_type: str, method: str, enable_spa: bool, bundle_size: int = 0, spa_start_sigma: float = 1.0, spa_steps: int = 3) -> io.NodeOutput:
+        bs = None if (bundle_size is None or bundle_size <= 0) else int(bundle_size)
+        patched_model = apply_spa_to_model(
+            model, model_type, width, height, method=method,
+            enable_spa=enable_spa, bundle_size=bs,
+            spa_start_sigma=float(spa_start_sigma),
+            spa_steps=int(spa_steps),
+        )
+        return io.NodeOutput(patched_model)
+
+
 class DyPEExtension(ComfyExtension):
     async def on_load(self) -> None:
         """Install Qwen2D VAE patch on extension load."""
         install_qwen2d_patch()
 
     async def get_node_list(self) -> list[type[io.ComfyNode]]:
-        return [DyPE_FLUX, SEGA, PixelRushNode, FreeScaleNode]
+        return [DyPE_FLUX, SEGA, SPA, PixelRushNode, FreeScaleNode]
 
 async def comfy_entrypoint() -> DyPEExtension:
     return DyPEExtension()

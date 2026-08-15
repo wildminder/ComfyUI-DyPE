@@ -43,6 +43,18 @@ class PosEmbedNunchaku(DyPEBasePosEmbed):
 
         return rope.float()
 
+    def format_components(self, components, ids: torch.Tensor) -> torch.Tensor:
+        emb_parts = []
+        for cos, sin in components:
+            rope_i = self._axis_rope_from_cos_sin(cos, sin)
+            emb_parts.append(rope_i)
+
+        # shape: (B, M, D_total//2, 1, 2)
+        emb = torch.cat(emb_parts, dim=-3)
+
+        out = emb.unsqueeze(1).to(ids.device)
+        return out
+
     def forward(self, ids: torch.Tensor) -> torch.Tensor:
         added_batch = False
         if ids.ndim == 1:
@@ -51,16 +63,6 @@ class PosEmbedNunchaku(DyPEBasePosEmbed):
 
         pos = ids.float()
         freqs_dtype = torch.float32
-        
+
         components = self.get_components(pos, freqs_dtype)
-        
-        emb_parts = []
-        for cos, sin in components:
-            rope_i = self._axis_rope_from_cos_sin(cos, sin)
-            emb_parts.append(rope_i)
-
-        # shape: (B, M, D_total//2, 1, 2)
-        emb = torch.cat(emb_parts, dim=-3)  
-
-        out = emb.unsqueeze(1).to(ids.device)
-        return out
+        return self.format_components(components, ids)

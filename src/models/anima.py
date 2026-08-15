@@ -14,6 +14,21 @@ class PosEmbedAnima(DyPEBasePosEmbed):
     Output Format: (T*H*W, D/2, 2, 2) rotation matrices matching Cosmos RoPE format.
     """
 
+    def format_components(self, components, ids: torch.Tensor) -> torch.Tensor:
+        emb_parts = []
+        for cos, sin in components:
+            cos_half = cos[..., ::2]
+            sin_half = sin[..., ::2]
+
+            col0 = torch.stack([cos_half, sin_half], dim=-1)
+            col1 = torch.stack([-sin_half, cos_half], dim=-1)
+            matrix = torch.stack([col0, col1], dim=-1)
+
+            emb_parts.append(matrix)
+
+        emb = torch.cat(emb_parts, dim=-3)
+        return emb
+
     def forward(self, x_B_T_H_W_C, fps=None, device=None, dtype=None):
         B, T, H, W, C = x_B_T_H_W_C.shape
 
@@ -32,17 +47,4 @@ class PosEmbedAnima(DyPEBasePosEmbed):
         pos = torch.stack([t_grid.flatten(), h_grid.flatten(), w_grid.flatten()], dim=-1)
 
         components = self.get_components(pos, freqs_dtype)
-
-        emb_parts = []
-        for cos, sin in components:
-            cos_half = cos[..., ::2]
-            sin_half = sin[..., ::2]
-
-            col0 = torch.stack([cos_half, sin_half], dim=-1)
-            col1 = torch.stack([-sin_half, cos_half], dim=-1)
-            matrix = torch.stack([col0, col1], dim=-1)
-
-            emb_parts.append(matrix)
-
-        emb = torch.cat(emb_parts, dim=-3)
-        return emb.to(device=device)
+        return self.format_components(components, pos).to(device=device)

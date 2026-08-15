@@ -5,7 +5,7 @@
 
   
   <p align="center">
-    A ComfyUI custom node that implements <strong>DyPE (Dynamic Position Extrapolation)</strong> and <strong>SEGA (Spectral-Energy Guided Attention)</strong>, enabling Diffusion Transformers (like <strong>FLUX</strong>, <strong>Qwen Image</strong>, <strong>Z-Image</strong>, <strong>Anima/Cosmos</strong>, and <strong>Krea-2</strong>) to generate ultra-high-resolution images (4K and beyond) with exceptional coherence and detail.
+    A ComfyUI custom node that implements <strong>DyPE (Dynamic Position Extrapolation)</strong>, <strong>SEGA (Spectral-Energy Guided Attention)</strong>, and <strong>SPA (Spatial Position Alignment, HRDiT)</strong>, enabling Diffusion Transformers (like <strong>FLUX</strong>, <strong>Qwen Image</strong>, <strong>Z-Image</strong>, <strong>Anima/Cosmos</strong>, and <strong>Krea-2</strong>) to generate ultra-high-resolution images (4K and beyond) with exceptional coherence and detail.
     <br />
     <br />
     <a href="https://github.com/wildminder/ComfyUI-DyPE/issues/new?labels=bug&template=bug-report---.md">Report Bug</a>
@@ -43,6 +43,7 @@ This node provides a seamless, "plug-and-play" integration of DyPE into your wor
 
 **✨ Key Features:**
 *   **Multi-Architecture Support:** Supports **FLUX** (Standard), **Nunchaku** (Quantized Flux), **Qwen Image**, **Z-Image** (Lumina 2), **Anima/Cosmos**, and **Krea-2**.
+*   **SPA (HRDiT):** Spatial Position Alignment — a static, training-free RoPE patch that fixes high-resolution *spatial disorder* by bundling + sliding positions and averaging the `2s − 1` **attention outputs**. Resolution-aware (automatic no-op ≤ 1024px) and step-gated (`spa_steps = 3` default → ~1.3–1.8× overhead at 2K/4K), no timestep coupling. **Mutually exclusive** with DyPE/SEGA (apply only one).
 *   **High-Resolution Generation:** Push models to 4096x4096 and beyond.
 *   **Single-Node Integration:** Simply place the `DyPE for FLUX` node after your model loader to patch the model. No complex workflow changes required.
 *   **Full Compatibility:** Works seamlessly with your existing ComfyUI workflows, samplers, schedulers, and other optimization nodes.
@@ -87,6 +88,50 @@ This node provides a seamless, "plug-and-play" integration of DyPE into your wor
 | `base_mscale_coefficient` | 0.08 | κ (paper default) |
 
 > **Note:** SEGA uses NTK as its base extrapolation. It refines NTK with per-dimension spectral mscale. If NTK doesn't work for your model (e.g. Anima), SEGA won't either — use DyPE `vision_yarn` instead.
+
+<p align="right">(<a href="#readme-top">back to top</a>)</p>
+
+## SPA Node (HRDiT)
+
+**SPA** (Spatial Position Alignment, from **HRDiT** — arXiv 2608.07003) is a static, training-free positional-encoding patch for ultra-high-resolution generation. It is **mutually exclusive** with DyPE/SEGA — apply only one.
+
+*   **Why:** Pushing a DiT beyond its native resolution makes the RoPE token indices grow out of the model's training distribution, causing *spatial disorder* — repeated structures and positional collisions.
+*   **How:** SPA compresses out-of-distribution token indices into bundles of `N` tokens *before* they enter the positional embedding, then slides the bundle boundary independently along each axis. This yields `2s − 1` variants (1 base + `(s−1)` row slides + `(s−1)` column slides, where `s` is the derived per-axis bundle size). For each variant it builds that variant's (no-extrapolation) RoPE and runs a **full attention pass**; SPA runs the `2s − 1` passes and **averages the attention outputs** — exactly HRDiT `_spa_attention`. Averaging attention *outputs* (not the RoPE rotation matrices) is essential: softmax is nonlinear, so `meanₙ softmax(Rₙ)·V ≠ softmax(meanₙ Rₙ)·V`, and averaging the rotations yields a non-orthogonal matrix — the root cause of the old *rippled-mosaic* bug. The paper proves each original position keeps a unique signature across slides (`Σₙ φ⁽ⁿ⁾(i) = i`), so spatial distinguishability is restored without retraining.
+*   **Static:** SPA has **no timestep dependence** — it does not patch the noise schedule. When active (`enable_spa` and `bundle_size != 1`) it replaces the model's RoPE embedder (which returns the base RoPE and registers the `2s − 1` variant RoPEs) and installs an attention hook that runs the averaged attention passes. `bundle_size == 1` (off) or `enable_spa = False` installs nothing and is a transparent base-RoPE pass. `bundle_size == 0` (auto) stays active but is an automatic **no-op** while the grid is inside the model's trained extent.
+*   **Resolution-aware (trained-extent gate):** While the token grid is inside the model's trained distribution (`max_pos ≤ 64`, i.e. ≤ 1024px for 1024px-trained DiTs) there is no position extrapolation to fix, so SPA is an **identity no-op** for any `N` — zero overhead and no artifacts. Above that, the shared per-axis bundle size `s` is derived from the grid and the knob (see `bundle_size` below), and every bundled position is kept in-distribution (`≤ 79`, HRDiT's `group_num = 80` ceiling).
+
+### Usage
+
+1. Add the **SPA (HRDiT)** node after your model loader (under `model_patches/position_encoding`).
+2. Set `width`/`height` to match your latent.
+3. Leave `model_type: auto` (or force it). SPA auto-detects the architecture and reads `theta` / `axes_dim` from the model.
+4. Set `bundle_size` to the paper's `N` (tokens per bundle): `0` = auto, `1` = off, `2..8` explicit. **Recommended: `3` at 2K, `5` at 4K** (paper §4.1). `0` (auto) derives the minimal compression that keeps every bundled position in-distribution (HRDiT `group_num = 80` ceiling). SPA is automatically a **no-op** while the grid is inside the model's trained extent (≤ 1024px). The averaged-pass count is `2s − 1`, capped at 15.
+5. Leave `spa_steps` at `3` (HRDiT default): SPA runs only on the first 3 denoising steps of each generation — later steps run at baseline speed. Set `0` to run SPA on every step. Optionally combine with `spa_start_sigma < 1.0` for an additional sigma-threshold gate.
+6. Connect the patched `MODEL` to your KSampler.
+
+### Parameters
+
+| Parameter | Default | Description |
+|-----------|---------|-------------|
+| `model_type` | auto | Same detection as DyPE (`flux` / `nunchaku` / `qwen` / `zimage` / `anima`). Reads `theta` & `axes_dim` from the model. |
+| `method` | ntk | Base RoPE method on the bundled coords. SPA always uses `ntk_factor = 1.0` (no extrapolation) on the bundled positions; this only selects which base RoPE the bundle is built from. |
+| `enable_spa` | True | Disable to emit the model's base RoPE unchanged. |
+| `bundle_size` | 0 (auto) | The paper's `N` = **tokens per bundle** (paper §4.1). `0` = auto (minimal compression keeping every bundled position ≤ 79, i.e. HRDiT `group_num = 80`). `1` = off (passthrough). `2..8` = explicit; **recommended `3` at 2K, `5` at 4K**. While the grid is inside the trained extent (`max_pos ≤ 64`, e.g. ≤ 1024px) SPA is automatically a no-op for any `N`. Explicit `N` is floored by the in-distribution minimum (never out-of-distribution). Legacy values `≥ 32` (old `group_num` semantics) are migrated to auto with a one-time warning. The averaged-pass count is `2s − 1`, capped at 15. |
+| `spa_steps` | 3 | Step-count gating (HRDiT `--spa_steps`): SPA runs only on the first `spa_steps` denoising steps of each generation; later steps run at baseline speed. `0` = all steps (backward compatible). A new generation (sigma jump-up) resets the counter. |
+| `spa_start_sigma` | 1.0 | Optional sigma-threshold gate (AND-combined with `spa_steps`): SPA runs only while the current sigma is **above** this threshold. `1.0` = no sigma gating (default). |
+
+> **Performance:** With the defaults (`spa_steps = 3`, `N = 3` at 2K / `N = 5` at 4K) expect **zero overhead at ≤ 1024px** (trained-extent no-op) and roughly **1.3–1.8×** total inference time at 2K/4K (SPA's `2s − 1` averaged passes run only on the first 3 steps; the variant RoPEs and delta rotations are cached per grid). Setting `spa_steps = 0` runs SPA on every step and raises the cost to ~`2s − 1`× while active.
+
+> **Note:** SPA supports **FLUX, Qwen/Krea-2, Z-Image, and Anima/Cosmos**. **Nunchaku is not supported** in v1: its fused/quantized attention kernels bypass the SPA hook, so applying SPA to a Nunchaku model logs a warning and returns the model unchanged. For Anima, the temporal RoPE axis is left untouched and per-axis NTK factors are preserved; only the spatial (h, w) axes are bundled.
+
+> [!WARNING]
+> **SPA and DyPE/SEGA are mutually exclusive** in v1. Apply only one — stacking them raises `ValueError("SPA and DyPE/SEGA are mutually exclusive in v1. Apply only one.")`. Use SPA for static spatial-disorder correction, or DyPE/SEGA for dynamic spectral/scale extrapolation.
+
+### When to use SPA vs DyPE/SEGA
+
+*   **SPA alone:** fix high-res *spatial disorder* with a small, bounded sampling overhead (~1.3–1.8× with the `spa_steps = 3` default) and no timestep coupling.
+*   **DyPE/SEGA:** full dynamic extrapolation (spectral/scale progression) for resolutions far beyond native.
+*   **Not both:** SPA and DyPE/SEGA cannot be combined — they are mutually exclusive in v1.
 
 <p align="right">(<a href="#readme-top">back to top</a>)</p>
 
@@ -215,6 +260,19 @@ fallback; the VAE-space path is the recommended default).
 > performs its own CFG and prediction-type conversion (EPS, CONST/flow, V_PREDICTION, X0).
 
 ## Changelog
+
+#### v2.6.1 — SPA bundle-size semantics & speed fix (2026-08-15)
+*   **`bundle_size` is now the paper's `N` (tokens per bundle):** `0` = auto, `1` = off, `2..8` explicit (recommended `3` @ 2K, `5` @ 4K). The knob was previously implemented as HRDiT's `group_num` (target bundles per axis), which over-compressed the grid into big patches — the source of the *pixelated / mosaic* output at `bundle_size > 2`. Legacy values `≥ 32` are migrated to auto with a one-time warning.
+*   **Trained-extent gate:** SPA is an automatic **identity no-op** while the grid is inside the model's trained extent (`max_pos ≤ 64`, i.e. ≤ 1024px) — no big-patch artifacts, zero overhead.
+*   **`spa_steps` (new, default `3`):** HRDiT-faithful leading-step gating — SPA runs only on the first 3 denoising steps of each generation (a sigma jump-up resets the counter). This cuts the `bundle_size > 2` slowdown from ~10× to ~1.3–1.8×. `0` = all steps.
+*   **Delta-rotation cache:** the `inv(base) @ variant` rotations are composed once per grid (not per attention call), removing the per-call overhead.
+*   **HAP (Head-adaptive Attention Pruning)** — the paper's per-head sparse-attention speed-up — is tracked as future work (not in this release).
+
+#### v2.6.0 — SPA (HRDiT) Node
+*   **SPA Node:** Added **SPA** (Spatial Position Alignment, HRDiT arXiv 2608.07003) — a static, training-free RoPE patch that fixes high-resolution *spatial disorder* by bundling token indices into a few bundles, sliding the bundle boundaries `N` times, and **averaging the `N` attention outputs** (faithful to HRDiT `_spa_attention`). Supports FLUX, Qwen/Krea-2, Z-Image, and Anima/Cosmos; **Nunchaku is unsupported** (fused kernels bypass the hook — logs a warning, returns the model unchanged). Anima's temporal axis and per-axis NTK factors are preserved.
+*   **Auto bundle size:** `N = 5` at ≥4K, `N = 3` at ≥2K, `1` otherwise (no-op). Configurable via `bundle_size`.
+*   **Composable:** SPA is **mutually exclusive** with DyPE/SEGA in v1 (apply only one).
+*   **Example workflow:** added `example_workflows/SPA_basic.json` (2048×2048 FLUX + SPA).
 
 #### PixelRush — SDXL noise-dominance fix
 *   **VAE-space operation:** PixelRush now runs entirely in VAE latent space (std ≈ 1) and converts to model space only inside the `predict_eps` adapter. This fixes the SDXL "totally noisy" output caused by `process_latent_in` scaling the latent down to std ≈ 0.13 (noise injection std ≈ 0.95 then dominated ~6×).

@@ -33,6 +33,19 @@ def _snap_to_multiple(value: int, multiple: int = 16) -> int:
     return snapped
 
 
+def _dype_sega_reject_spa(orig_embedder) -> None:
+    """Mirror of the SPA exclusivity guard (remediation decision 6).
+
+    Rejects applying DyPE/SEGA when an SPA embedder is already present.  Uses a
+    name-based check to avoid a circular import with ``src.spa``.
+    """
+    name = type(orig_embedder).__name__
+    if name.startswith("PosEmbedSPA") or "SPA" in name:
+        raise ValueError(
+            "SPA and DyPE/SEGA are mutually exclusive in v1. Apply only one."
+        )
+
+
 def apply_dype_to_model(model: ModelPatcher, model_type: str, width: int, height: int, method: str, yarn_alt_scaling: bool, enable_dype: bool, dype_scale: float, dype_exponent: float, base_shift: float, max_shift: float, base_resolution: int = 1024, dype_start_sigma: float = 1.0) -> ModelPatcher:
     # Snap resolution to nearest multiple of 16 for latent space compatibility
     width = _snap_to_multiple(width, 16)
@@ -160,6 +173,8 @@ def apply_dype_to_model(model: ModelPatcher, model_type: str, width: int, height
         else:
             orig_embedder = m.model.diffusion_model.pe_embedder
             target_patch_path = "diffusion_model.pe_embedder"
+
+        _dype_sega_reject_spa(orig_embedder)
 
         if is_anima:
             theta_base = 10000.0
@@ -394,6 +409,8 @@ def apply_sega_to_model(
         else:
             orig_embedder = m.model.diffusion_model.pe_embedder
             target_patch_path = "diffusion_model.pe_embedder"
+
+        _dype_sega_reject_spa(orig_embedder)
 
         if is_anima:
             theta_base = 10000.0
