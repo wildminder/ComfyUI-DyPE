@@ -43,6 +43,10 @@ class SPAContext:
     pending: List = field(default_factory=list)
     uses_pending: bool = False
     embedder: object = None
+    # HAP integration (plan P3/T3.4): number of leading TEXT tokens derived from
+    # the position ids at registration time (tokens with row==col==0).  ``None``
+    # = unknown (HAP falls back to ``HapContext.text_len``).
+    text_len: Optional[int] = None
 
 
 # Module-global, process-safe activation slot. Default ``None`` == no SPA hook.
@@ -54,6 +58,35 @@ _SPA_ACTIVE: "contextvars.ContextVar" = contextvars.ContextVar("spa_active", def
 # closed gate exactly like an inactive context -> plain attention, zero overhead.
 # Default ``True`` == gate open (SPA allowed), preserving pre-gating behaviour.
 _SPA_STEP_GATE: "contextvars.ContextVar" = contextvars.ContextVar("spa_step_gate", default=True)
+
+# HAP (HRDiT speed half) activation slot (plan P2/T2.1): holds the active
+# ``src.hap.HapContext`` (or ``None`` == HAP off).  Process-scoped exactly like
+# ``_SPA_ACTIVE`` so concurrent/cross-model forwards never leak a scope plan.
+_HAP_ACTIVE: "contextvars.ContextVar" = contextvars.ContextVar("hap_active", default=None)
+
+# HRDiT per-forward attention-call counter (plan P2/T2.1): our hook patches a
+# MODULE-LEVEL ``optimized_attention`` symbol (no per-block processor identity),
+# so the layer index is a deterministic counter — reset to 0 by the unet wrapper
+# before every forward and incremented by EVERY wrapper call (including gated-off
+# early returns, so alignment with the model's block order is preserved).
+_HRDIT_LAYER_IDX: "contextvars.ContextVar" = contextvars.ContextVar("hrdit_layer_idx", default=0)
+
+# Proportional attention scaling flag (plan P7/T7.2, G4): the unet wrapper sets
+# this from ``m._hrdit_proportional_attention`` for the duration of a forward.
+# When True the unified attention wrapper pre-scales ``q`` by
+# ``proportional_scale_ratio(seq_len)`` (reference ``attention.py:89-93``) so the
+# softmax temperature grows with sequence length at high resolution.  Default
+# ``False`` == feature off (bit-identical to the pre-feature baseline).
+_HRDIT_PROPORTIONAL: "contextvars.ContextVar" = contextvars.ContextVar("hrdit_proportional", default=False)
+
+# Per-layer SPA filter (plan P8/T8.2, G5): the unet wrapper sets this from
+# ``m._spa_layer_filter`` for the duration of a forward.  ``None`` (default) ==
+# SPA allowed on EVERY layer (backward compatible); a frozenset of flat layer
+# indices (the per-forward attention-call counter) restricts the averaged-pass
+# SPA to those layers only.  Filtered-out layers run plain attention — but the
+# layer counter still advances (alignment is sacred) and HAP dispatch is NOT
+# gated by this filter (reference semantics: the filter affects SPA alone).
+_SPA_LAYER_FILTER: "contextvars.ContextVar" = contextvars.ContextVar("spa_layer_filter", default=None)
 
 
 def get_spa_context() -> Optional[SPAContext]:
@@ -74,3 +107,62 @@ def get_spa_step_gate() -> bool:
 def set_spa_step_gate(open_: bool) -> None:
     """Open (``True``) or close (``False``) the SPA step gate for this forward."""
     _SPA_STEP_GATE.set(bool(open_))
+
+
+# --- HAP activation (plan P2/T2.1) -----------------------------------------
+
+def get_hap_context():
+    """Return the active ``src.hap.HapContext`` (or ``None`` == HAP off)."""
+    return _HAP_ACTIVE.get()
+
+
+def set_hap_context(ctx) -> None:
+    """Set (or clear with ``None``) the active HAP context."""
+    _HAP_ACTIVE.set(ctx)
+
+
+# --- HRDiT layer-index counter (plan P2/T2.1) -------------------------------
+
+def get_hrdit_layer_idx() -> int:
+    """Return the current per-forward attention-call index (0-based)."""
+    return _HRDIT_LAYER_IDX.get()
+
+
+def set_hrdit_layer_idx(idx: int) -> None:
+    """Set the per-forward attention-call index (the unet wrapper resets to 0)."""
+    _HRDIT_LAYER_IDX.set(int(idx))
+
+
+def next_hrdit_layer_idx() -> int:
+    """Read the current layer index and advance the counter.
+
+    EVERY unified-wrapper call must use this (including gated-off early
+    returns) so the counter stays aligned with the model's block order.
+    """
+    idx = _HRDIT_LAYER_IDX.get()
+    _HRDIT_LAYER_IDX.set(idx + 1)
+    return idx
+
+
+# --- Proportional attention scaling flag (plan P7/T7.2) ---------------------
+
+def get_hrdit_proportional() -> bool:
+    """Return whether proportional attention scaling is active this forward."""
+    return _HRDIT_PROPORTIONAL.get()
+
+
+def set_hrdit_proportional(on: bool) -> None:
+    """Enable/disable proportional attention scaling for the current forward."""
+    _HRDIT_PROPORTIONAL.set(bool(on))
+
+
+# --- Per-layer SPA filter (plan P8/T8.2) ------------------------------------
+
+def get_spa_layer_filter():
+    """Return the active per-layer SPA filter (frozenset of layer indices or None)."""
+    return _SPA_LAYER_FILTER.get()
+
+
+def set_spa_layer_filter(f) -> None:
+    """Set (or clear with ``None``) the per-layer SPA filter for this forward."""
+    _SPA_LAYER_FILTER.set(f)

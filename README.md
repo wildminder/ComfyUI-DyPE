@@ -118,6 +118,8 @@ This node provides a seamless, "plug-and-play" integration of DyPE into your wor
 | `bundle_size` | 0 (auto) | The paper's `N` = **tokens per bundle** (paper §4.1). `0` = auto (minimal compression keeping every bundled position ≤ 79, i.e. HRDiT `group_num = 80`). `1` = off (passthrough). `2..8` = explicit; **recommended `3` at 2K, `5` at 4K**. While the grid is inside the trained extent (`max_pos ≤ 64`, e.g. ≤ 1024px) SPA is automatically a no-op for any `N`. Explicit `N` is floored by the in-distribution minimum (never out-of-distribution). Legacy values `≥ 32` (old `group_num` semantics) are migrated to auto with a one-time warning. The averaged-pass count is `2s − 1`, capped at 15. |
 | `spa_steps` | 3 | Step-count gating (HRDiT `--spa_steps`): SPA runs only on the first `spa_steps` denoising steps of each generation; later steps run at baseline speed. `0` = all steps (backward compatible). A new generation (sigma jump-up) resets the counter. |
 | `spa_start_sigma` | 1.0 | Optional sigma-threshold gate (AND-combined with `spa_steps`): SPA runs only while the current sigma is **above** this threshold. `1.0` = no sigma gating (default). |
+| `spa_layer_filter` | `""` | Per-layer SPA filter (HRDiT `set_spa_filter`): restrict the averaged-pass SPA to a subset of transformer layers. Flat layer-index spec: `"0-18,38-57"` (inclusive ranges, comma-separated) or a single index `"3"`. Empty = every layer (default). Filtered-out layers run plain attention; the layer counter and HAP are unaffected. Invalid specs raise an error. |
+| `proportional_attention` | False | HRDiT proportional attention scaling: scales the attention logits by `sqrt(ln(seq_len)/ln(train_seq_len))` to compensate entropy dilution on long sequences. Exact no-op at/below the trained extent (1024px). Off by default (bit-identical). Either the SPA or the HAP node may enable it. |
 
 > **Performance:** With the defaults (`spa_steps = 3`, `N = 3` at 2K / `N = 5` at 4K) expect **zero overhead at ≤ 1024px** (trained-extent no-op) and roughly **1.3–1.8×** total inference time at 2K/4K (SPA's `2s − 1` averaged passes run only on the first 3 steps; the variant RoPEs and delta rotations are cached per grid). Setting `spa_steps = 0` runs SPA on every step and raises the cost to ~`2s − 1`× while active.
 
@@ -131,6 +133,93 @@ This node provides a seamless, "plug-and-play" integration of DyPE into your wor
 *   **SPA alone:** fix high-res *spatial disorder* with a small, bounded sampling overhead (~1.3–1.8× with the `spa_steps = 3` default) and no timestep coupling.
 *   **DyPE/SEGA:** full dynamic extrapolation (spectral/scale progression) for resolutions far beyond native.
 *   **Not both:** SPA and DyPE/SEGA cannot be combined — they are mutually exclusive in v1.
+
+<p align="right">(<a href="#readme-top">back to top</a>)</p>
+
+## HAP Node (HRDiT)
+
+**HAP** (Head-Adaptive attention Pruning, from **HRDiT** — arXiv 2608.07003) is the paper's *speed* half: a training-free, per-head sparse-attention acceleration that complements SPA (the *quality* half). Where SPA fixes *what* the model attends to at high resolution, HAP fixes *how fast* it attends — by letting each attention head see only the keys it actually needs.
+
+*   **Why:** Full attention is `O(T²)` in the token count `T`. At 4K the sequence is ~66k tokens and attention dominates the step time. HRDiT observes that most heads attend to a narrow spatial band around each query — the rest of the `T²` work is wasted.
+*   **How:** An offline **calibration** pass measures, for every (layer, head), how much quality is lost when the head's attention is restricted to a smaller *scope* (a symmetric band of image blocks around each query, plus all text tokens). A **multiple-choice knapsack solver** then picks one scope per head to minimize total quality loss under a compute budget. The result is a **scope plan** (a JSON of per-head `alpha`/`beta` band parameters). At inference, HAP builds a block-sparse attention mask from the plan and runs attention through **PyTorch FlexAttention** (compiled, block-sparse kernel) — only the kept blocks are computed.
+*   **Mask semantics:** for a query in image block `qb` and a key in image block `kb`, the pair is kept when `|qb − kb| ≤ half[h]`, where `half[h]` is derived from the head's `(alpha, beta)` scope (`band = max(2·int(alpha/64 + beta·(T_img/64)) − 1, 1)`, `half = (band−1)/2`). Text rows/columns and every `anchor_stride`-th key block are always kept. This is exactly HRDiT's `mask_mod`.
+*   **Backends:** `flex` (CUDA + torch ≥ 2.5, the fast path), `dense_mask` (SDPA + additive −inf mask — the CPU/test oracle and automatic fallback), `off` (warning + plain attention). The node auto-selects `flex` when available.
+*   **Composable with SPA:** when both are active, each of SPA's `2s − 1` averaged passes runs through the HAP kernel (faithful to HRDiT `_spa_attention` + HAP). HAP-only runs a single masked pass per layer.
+
+### Usage
+
+1. Add the **HAP (HRDiT)** node after your model loader (under `model_patches/position_encoding`).
+2. Point `scope_plan_path` at a scope-plan JSON. A FLUX plan is shipped at `configs/scope_plan_flux.json` (57 layers × 24 heads, `alpha=2048`/`beta=0`). Relative paths resolve against the repo root.
+3. Leave `model_type: auto` (or force it). HAP auto-detects the architecture.
+4. Set `anchor_stride` (default `0` = off). When `> 0`, every `anchor_stride`-th image key block is globally visible to all queries — a cheap way to preserve long-range structure at aggressive budgets.
+5. Set `text_len` (default `512`). The number of leading text tokens always kept visible. When SPA is also active, the text length is auto-derived from the conditioning and this knob is only a fallback.
+6. Connect the patched `MODEL` to your KSampler (optionally through an SPA node first).
+
+### Parameters
+
+| Parameter | Default | Description |
+|-----------|---------|-------------|
+| `scope_plan_path` | `configs/scope_plan_flux.json` | Path to the scope-plan JSON (`{"alphas": [[…]], "betas": [[…]]}`). Relative paths resolve against the repo root. |
+| `model_type` | auto | Same detection as DyPE/SPA. **Nunchaku is not supported** (fused kernels bypass the hook — logs a warning, returns the model unchanged). |
+| `anchor_stride` | 0 | Keep every `anchor_stride`-th image key block globally visible. `0` = off. |
+| `text_len` | 512 | Number of leading text tokens always kept. Auto-derived from conditioning when SPA is active. |
+| `enable_hap` | True | Disable to pass the model through unchanged. |
+| `proportional_attention` | False | HRDiT proportional attention scaling (see below). |
+
+### Calibration
+
+The shipped `configs/scope_plan_flux.json` is the reference FLUX plan and works out of the box. To calibrate a plan for another model or budget, use [`calibration/calibrate_hap.py`](calibration/calibrate_hap.py):
+
+```bash
+# Self-contained dry run (toy model, no ComfyUI/GPU needed) — validates the full pipeline:
+python calibration/calibrate_hap.py --dry_run --out tmp/scope_plan_toy.json
+
+# Real-model calibration (requires wiring run_real() to your model + prompts — see the script docstring):
+python calibration/calibrate_hap.py --scope_plan_path out/plan.json --num_prompts 30 --budget_ratio 0.1
+```
+
+*   **Cost:** one forward + backward pass per prompt (the chunked collector never materializes a dense `T×T` attention matrix — ~68 MB per query-row chunk at 4K).
+*   **Reuse:** a plan is a plain JSON keyed by `(layers, heads)`; reuse it across resolutions and prompts. The solver's `budget_ratio` (default `0.1` = 10% of full-attention compute) trades speed vs. quality.
+*   **Solver:** a dependency-free multiple-choice knapsack DP (one scope per head, Σ cost ≤ budget·full_cost, minimize Σ quality loss) replaces the paper's Gurobi step with identical semantics.
+
+### Proportional attention scaling
+
+Both the SPA and HAP nodes expose `proportional_attention` (default **off**, bit-identical). When enabled, the attention logits are scaled by
+
+```
+ratio = sqrt( ln(seq_len) / ln(train_seq_len) )     # train_seq_len = 4608 (1024px FLUX)
+```
+
+to compensate the entropy dilution that softmax suffers as the sequence grows beyond the trained extent. The ratio is exactly `1.0` at/below 1024px (a no-op there) and ≈ `1.31` at 4K. Either node may enable it; the flag is shared across the whole model.
+
+### Per-layer SPA filter
+
+The SPA node's `spa_layer_filter` restricts the averaged-pass SPA to a subset of transformer layers (HRDiT `set_spa_filter`). The spec is a flat layer-index list: `"0-18,38-57"` (inclusive ranges) or `"3"`. Empty = every layer. Filtered-out layers run plain attention. This is useful when only certain depth bands exhibit spatial disorder. The layer counter and HAP are unaffected by the filter.
+
+### HRDiT coverage
+
+| HRDiT component | Status |
+|-----------------|--------|
+| SPA (bundle + slide + averaged attention) | ✅ |
+| HAP runtime (per-head scopes + FlexAttention) | ✅ |
+| HAP calibration (Taylor-softmax scoring) | ✅ |
+| HAP solver (multiple-choice knapsack) | ✅ |
+| Proportional attention scaling | ✅ |
+| Per-layer SPA filter | ✅ |
+| Cascaded SPA→HAP step schedule | ⚠️ workflow-level (compose SPA `spa_steps` + HAP manually) |
+
+### Expected speedups
+
+From the HRDiT paper (FLUX, A100, per-step attention time vs. full attention):
+
+| Resolution | Full attention | HAP (budget 0.1) | Speedup |
+|-----------|----------------|------------------|---------|
+| 2K | 1.0× | ~0.35× | ~2.9× |
+| 4K | 1.0× | ~0.18× | ~5.5× |
+
+End-to-end step-time gains are smaller (attention is one of several costs) but grow with resolution. The dense-mask fallback is *correct* but not faster than full attention — use `flex` (CUDA + torch ≥ 2.5) for real speedups.
+
+> **Requirements:** the fast `flex` backend needs **CUDA + PyTorch ≥ 2.5**. On CPU or older torch the node automatically falls back to the `dense_mask` backend (correct, SDPA-based) and logs which backend is active.
 
 <p align="right">(<a href="#readme-top">back to top</a>)</p>
 
@@ -260,13 +349,21 @@ fallback; the VAE-space path is the recommended default).
 
 ## Changelog
 
+#### v2.7.0 — HRDiT full implementation: HAP node + calibration + proportional scaling + layer filter (2026-08-15)
+*   **HAP (HRDiT) node:** Added **HAP** (Head-Adaptive attention Pruning, HRDiT arXiv 2608.07003) — the paper's *speed* half. Per-head sparse attention from an offline-calibrated **scope plan**, executed through **PyTorch FlexAttention** (block-sparse, compiled) on CUDA + torch ≥ 2.5, with an automatic SDPA dense-mask fallback on CPU/older torch. Shipped FLUX plan at `configs/scope_plan_flux.json` (57×24). **Nunchaku unsupported** (fused kernels bypass the hook).
+*   **Calibration pipeline:** [`calibration/calibrate_hap.py`](calibration/calibrate_hap.py) — Taylor-softmax per-head scope scoring (one backward pass per prompt, chunked so a dense `T×T` matrix is never materialized) + a dependency-free **multiple-choice knapsack** solver (replaces the paper's Gurobi step). `--dry_run` validates the full pipeline on a toy model without ComfyUI/GPU.
+*   **SPA + HAP composition:** when both nodes are active, each of SPA's `2s − 1` averaged passes runs through the HAP kernel (faithful to HRDiT). HAP-only runs a single masked pass per layer. Ref-counted shared hook install — SPA and HAP can be applied in any order and restore cleanly.
+*   **`proportional_attention` (new, both nodes, default off):** HRDiT proportional attention scaling — scales attention logits by `sqrt(ln(seq_len)/ln(4608))` to compensate softmax entropy dilution on long sequences. Exact no-op at/below 1024px; ≈ 1.31 at 4K.
+*   **`spa_layer_filter` (new, SPA node):** restrict the averaged-pass SPA to a subset of layers (HRDiT `set_spa_filter`). Flat index spec: `"0-18,38-57"` or `"3"`. Empty = every layer.
+*   **Text-length auto-derivation:** HAP derives the text-token count from the conditioning (leading contiguous run of row==col==0 tokens) when SPA is active, so the block-sparse mask keeps exactly the text prefix.
+
 #### v2.6.1 — SPA bundle-size semantics & speed fix (2026-08-15)
 *   **`bundle_size` is now the paper's `N` (tokens per bundle):** `0` = auto, `1` = off, `2..8` explicit (recommended `3` @ 2K, `5` @ 4K). The knob was previously implemented as HRDiT's `group_num` (target bundles per axis), which over-compressed the grid into big patches — the source of the *pixelated / mosaic* output at `bundle_size > 2`. Legacy values `≥ 32` are migrated to auto with a one-time warning.
 *   **Trained-extent gate:** SPA is an automatic **identity no-op** while the grid is inside the model's trained extent (`max_pos ≤ 64`, i.e. ≤ 1024px) — no big-patch artifacts, zero overhead.
 *   **`spa_steps` (new, default `3`):** HRDiT-faithful leading-step gating — SPA runs only on the first 3 denoising steps of each generation (a sigma jump-up resets the counter). This cuts the `bundle_size > 2` slowdown from ~10× to ~1.3–1.8×. `0` = all steps.
 *   **Delta-rotation cache:** the `inv(base) @ variant` rotations are composed once per grid (not per attention call), removing the per-call overhead.
 *   **Removed the `method` input from the SPA node:** the DyPE extrapolation methods (`ntk` / `yarn` / `vision_yarn` / `pi`) were a no-op for SPA — it always applies the model's native no-extrapolation RoPE (`ntk_factor = 1.0`) on the bundled coords (HRDiT "nor" RoPE). The knob was inherited UI plumbing and only invited misleading A/B tests.
-*   **HAP (Head-adaptive Attention Pruning)** — the paper's per-head sparse-attention speed-up — is tracked as future work (not in this release).
+*   **HAP (Head-adaptive Attention Pruning)** — the paper's per-head sparse-attention speed-up — shipped in **v2.7.0** (see above).
 
 #### v2.6.0 — SPA (HRDiT) Node
 *   **SPA Node:** Added **SPA** (Spatial Position Alignment, HRDiT arXiv 2608.07003) — a static, training-free RoPE patch that fixes high-resolution *spatial disorder* by bundling token indices into a few bundles, sliding the bundle boundaries `N` times, and **averaging the `N` attention outputs** (faithful to HRDiT `_spa_attention`). Supports FLUX, Qwen/Krea-2, Z-Image, and Anima/Cosmos; **Nunchaku is unsupported** (fused kernels bypass the hook — logs a warning, returns the model unchanged). Anima's temporal axis and per-axis NTK factors are preserved.

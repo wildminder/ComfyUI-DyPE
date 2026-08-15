@@ -1,10 +1,17 @@
+import os
+
 import torch
 from comfy_api.latest import ComfyExtension, io
+from .src.hap import ScopePlan, apply_hap_to_model
 from .src.patch_utils import apply_dype_to_model, apply_sega_to_model
 from .src.spa import apply_spa_to_model
 from .src.pixelrush_node import PixelRushNode
 from .src.freescale_node import FreeScaleNode
 from .src.qwen2d_vae_patch import install_qwen2d_patch
+
+# Repo root (this file lives at the root) — used to resolve the default
+# scope-plan path shipped with the node pack.
+_DYPE_ROOT = os.path.dirname(os.path.abspath(__file__))
 
 class DyPE_FLUX(io.ComfyNode):
     """
@@ -237,8 +244,9 @@ class SPA(io.ComfyNode):
     bundle boundary over each axis and averages the resulting attention OUTPUTS.
     This restores spatial distinguishability at ultra-high resolution without
     retraining the model. While the grid is inside the model's trained extent
-    (e.g. <= 1024px) SPA is an automatic no-op. HAP (attention pruning) is a
-    separate, future speed-up.
+    (e.g. <= 1024px) SPA is an automatic no-op. Combine with the HAP node
+    (attention pruning) for the full HRDiT pipeline — when both are active,
+    each of SPA's averaged passes runs through the HAP kernel.
     """
 
     @classmethod
@@ -294,6 +302,20 @@ class SPA(io.ComfyNode):
                     optional=True,
                     tooltip="Step gating (HRDiT applies SPA only on leading denoising steps): number of LEADING steps on which SPA is active. 3 = HRDiT default (recommended speed/quality tradeoff). 0 = active on every step (backward compatible, slower). A new generation (sigma jump-up) resets the counter. Later steps run plain attention at baseline speed.",
                 ),
+                io.String.Input(
+                    "spa_layer_filter",
+                    default="",
+                    optional=True,
+                    tooltip="Per-layer SPA filter (HRDiT set_spa_filter): restrict the averaged-pass SPA to a subset of transformer layers. Flat layer-index spec: '0-18,38-57' (inclusive ranges, comma-separated) or a single index '3'. Empty = every layer (default). Filtered-out layers run plain attention; the layer counter and HAP are unaffected. Invalid specs raise an error.",
+                ),
+                io.Boolean.Input(
+                    "proportional_attention",
+                    default=False,
+                    label_on="Enabled",
+                    label_off="Disabled",
+                    optional=True,
+                    tooltip="HRDiT proportional attention scaling: scales the attention logits by sqrt(ln(seq_len)/ln(train_seq_len)) to compensate entropy dilution on long sequences. Exact no-op at/below the trained extent (1024px). Off by default (bit-identical to previous behaviour). Either the SPA or the HAP node may enable it.",
+                ),
             ],
             outputs=[
                 io.Model.Output(
@@ -304,17 +326,123 @@ class SPA(io.ComfyNode):
         )
 
     @classmethod
-    def execute(cls, model, width: int, height: int, model_type: str, enable_spa: bool, bundle_size: int = 0, spa_start_sigma: float = 1.0, spa_steps: int = 3) -> io.NodeOutput:
+    def execute(cls, model, width: int, height: int, model_type: str, enable_spa: bool, bundle_size: int = 0, spa_start_sigma: float = 1.0, spa_steps: int = 3, spa_layer_filter: str = "", proportional_attention: bool = False) -> io.NodeOutput:
         # NOTE: no ``method`` input — SPA always applies the model's native
         # no-extrapolation RoPE (ntk_factor=1.0) on the bundled coords (HRDiT
         # "nor" RoPE).  The DyPE extrapolation methods are a no-op for SPA, so
         # the knob was removed to avoid misleading A/B testing.
         bs = None if (bundle_size is None or bundle_size <= 0) else int(bundle_size)
-        patched_model = apply_spa_to_model(
-            model, model_type, width, height,
-            enable_spa=enable_spa, bundle_size=bs,
-            spa_start_sigma=float(spa_start_sigma),
-            spa_steps=int(spa_steps),
+        try:
+            patched_model = apply_spa_to_model(
+                model, model_type, width, height,
+                enable_spa=enable_spa, bundle_size=bs,
+                spa_start_sigma=float(spa_start_sigma),
+                spa_steps=int(spa_steps),
+                spa_layer_filter=spa_layer_filter,
+                proportional_attention=bool(proportional_attention),
+            )
+        except ValueError as exc:
+            raise ValueError(f"SPA: invalid spa_layer_filter {spa_layer_filter!r}: {exc}") from exc
+        return io.NodeOutput(patched_model)
+
+
+class HAP(io.ComfyNode):
+    """
+    Applies HAP (Head-Adaptive attention Pruning, HRDiT 2608.07003) to a model.
+
+    HAP is the SPEED half of HRDiT: each attention head attends only within its
+    calibrated scope (a local band around each query plus text tokens and
+    periodic global anchor blocks), pruning the rest of the attention.  The
+    per-layer/per-head scopes come from an offline-calibrated scope plan (JSON).
+    Combine with the SPA node for the full HRDiT pipeline (SPA fixes quality at
+    high resolution; HAP restores speed).
+    """
+
+    @classmethod
+    def define_schema(cls) -> io.Schema:
+        return io.Schema(
+            node_id="HAP",
+            display_name="HAP (HRDiT)",
+            category="model_patches/position_encoding",
+            description="Head-Adaptive attention Pruning (HRDiT). Block-sparse attention from a calibrated scope plan — restores speed at high resolution. Combine with SPA for full HRDiT.",
+            inputs=[
+                io.Model.Input(
+                    "model",
+                    tooltip="The model to patch with HAP.",
+                ),
+                io.String.Input(
+                    "scope_plan_path",
+                    default="configs/scope_plan_flux.json",
+                    tooltip="Path to the scope-plan JSON (per-layer, per-head alpha/beta). Relative paths resolve against the ComfyUI-DyPE folder. Default ships the reference FLUX plan (57 layers x 24 heads). Generate a plan for your model/resolution with calibration/calibrate_hap.py.",
+                ),
+                io.Combo.Input(
+                    "model_type",
+                    options=["auto", "flux", "nunchaku", "qwen", "zimage", "anima"],
+                    default="auto",
+                    tooltip="Specify the model architecture. 'auto' usually works.",
+                ),
+                io.Int.Input(
+                    "anchor_stride",
+                    default=32, min=0, max=1024, step=1,
+                    optional=True,
+                    tooltip="Global anchor blocks: every N-th image block is visible to all queries (keeps global coherence under pruning). 32 = HRDiT default. 0 = off.",
+                ),
+                io.Int.Input(
+                    "text_len",
+                    default=512, min=0, max=4096, step=1,
+                    optional=True,
+                    tooltip="Number of leading text tokens (always fully attended). 512 = FLUX convention. When SPA is also active, the boundary is derived from the position ids and this is only a fallback.",
+                ),
+                io.Boolean.Input(
+                    "enable_hap",
+                    default=True,
+                    label_on="Enabled",
+                    label_off="Disabled",
+                    tooltip="Enable or disable HAP. When disabled, the model is returned unchanged.",
+                ),
+                io.Boolean.Input(
+                    "proportional_attention",
+                    default=False,
+                    label_on="Enabled",
+                    label_off="Disabled",
+                    optional=True,
+                    tooltip="HRDiT proportional attention scaling: scales the attention logits by sqrt(ln(seq_len)/ln(train_seq_len)) to compensate entropy dilution on long sequences. Exact no-op at/below the trained extent (1024px). Off by default (bit-identical to previous behaviour). Either the SPA or the HAP node may enable it.",
+                ),
+            ],
+            outputs=[
+                io.Model.Output(
+                    display_name="Patched Model",
+                    tooltip="The model patched with HAP.",
+                ),
+            ],
+        )
+
+    @classmethod
+    def execute(cls, model, scope_plan_path: str, model_type: str,
+                anchor_stride: int = 32, text_len: int = 512,
+                enable_hap: bool = True,
+                proportional_attention: bool = False) -> io.NodeOutput:
+        path = scope_plan_path
+        if not os.path.isabs(path):
+            candidate = os.path.join(_DYPE_ROOT, path)
+            if os.path.exists(candidate):
+                path = candidate
+        if not os.path.exists(path):
+            raise FileNotFoundError(
+                f"HAP: scope plan not found: {scope_plan_path!r} (resolved to "
+                f"{path!r}). Provide a path to a scope-plan JSON, or use the "
+                f"shipped default 'configs/scope_plan_flux.json'."
+            )
+        try:
+            plan = ScopePlan.load(path)
+        except ValueError as exc:
+            raise ValueError(f"HAP: invalid scope plan {scope_plan_path!r}: {exc}") from exc
+        patched_model = apply_hap_to_model(
+            model, model_type, plan,
+            anchor_stride=int(anchor_stride),
+            enable_hap=bool(enable_hap),
+            text_len=int(text_len),
+            proportional_attention=bool(proportional_attention),
         )
         return io.NodeOutput(patched_model)
 
@@ -325,7 +453,7 @@ class DyPEExtension(ComfyExtension):
         install_qwen2d_patch()
 
     async def get_node_list(self) -> list[type[io.ComfyNode]]:
-        return [DyPE_FLUX, SEGA, SPA, PixelRushNode, FreeScaleNode]
+        return [DyPE_FLUX, SEGA, SPA, HAP, PixelRushNode, FreeScaleNode]
 
 async def comfy_entrypoint() -> DyPEExtension:
     return DyPEExtension()

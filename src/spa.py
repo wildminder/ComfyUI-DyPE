@@ -42,9 +42,18 @@ from .patch_utils import _snap_to_multiple
 from .rope import get_1d_ntk_pos_embed
 from .spa_context import (
     SPAContext,
+    get_hap_context,
+    get_hrdit_layer_idx,
+    get_hrdit_proportional,
     get_spa_context,
+    get_spa_layer_filter,
     get_spa_step_gate,
+    next_hrdit_layer_idx,
+    set_hap_context,
+    set_hrdit_layer_idx,
+    set_hrdit_proportional,
     set_spa_context,
+    set_spa_layer_filter,
     set_spa_step_gate,
 )
 from .spa_attn import (
@@ -416,6 +425,11 @@ class SPABasePosEmbed(DyPEBasePosEmbed):
         # attention hook consumes them directly instead of recomposing per call.
         variant_deltas = self._cached_variant_deltas(ids)
 
+        # HAP integration (plan P3/T3.4): derive the text/image boundary from the
+        # position ids so the HAP band mask does not rely solely on the node's
+        # ``text_len`` default.
+        derived_text_len = _spa_derive_text_len(ids)
+
         ctx = get_spa_context()
         if ctx is None or not ctx.active:
             ctx = SPAContext(
@@ -427,6 +441,7 @@ class SPABasePosEmbed(DyPEBasePosEmbed):
                 fmt=self._rope_fmt,
                 model_key=id(self),
                 variant_deltas=variant_deltas,
+                text_len=derived_text_len,
             )
         else:
             # Reuse the live context (Z-Image multi-group accumulation).
@@ -436,6 +451,8 @@ class SPABasePosEmbed(DyPEBasePosEmbed):
             ctx.fmt = self._rope_fmt
             ctx.model_key = id(self)
             ctx.variant_deltas = variant_deltas
+            if derived_text_len is not None:
+                ctx.text_len = derived_text_len
 
         if getattr(self, "_spa_is_zimage", False):
             is_text = (
@@ -613,7 +630,9 @@ def _spa_run_averaged(q, k, v, ctx, attn_fn):
         n_variants = len(rotations)
         # s (bundle size in tokens) is recoverable from the variant count: 2*s-1 == n.
         s_est = (n_variants + 1) // 2
-        logger.info(
+        # DEBUG (not INFO): diagnostic detail for developers; common users do not
+        # need this line in their console.
+        logger.debug(
             "SPA averaged-attention ACTIVE: backend=%s fmt=%s bundle_size=%s -> "
             "%d variant passes (s~=%d tokens/bundle). If this line is missing, SPA is a "
             "no-op for this model; a mosaic/ripple means the variant math, not the model.",
@@ -673,6 +692,103 @@ def _spa_assemble_zimage_posids(pending):
     return torch.cat(parts, dim=1)
 
 
+def parse_layer_filter(spec: str):
+    """Parse a per-layer SPA filter spec into a frozenset of layer indices.
+
+    Plan P8/T8.1 (G5).  The reference HRDiT ``set_spa_filter(double_ids,
+    single_ids)`` selects WHICH transformer blocks run SPA; our hook is
+    module-level (no per-block identity), so the filter is expressed over the
+    FLAT per-forward attention-call counter (the same index HAP uses):
+
+    * ``""`` / ``None``      -> ``None`` (SPA allowed on EVERY layer),
+    * ``"3"``                -> ``frozenset({3})``,
+    * ``"0-18,38-57"``       -> union of both inclusive ranges,
+    * whitespace around tokens is tolerated (``"0-18, 38-57"``).
+
+    Invalid specs (reversed range, non-integer token, negative index, empty
+    range part) raise :class:`ValueError` naming the offending token.  The
+    result is deduplicated and sorted (frozenset).
+    """
+    if spec is None:
+        return None
+    spec = str(spec).strip()
+    if not spec:
+        return None
+    layers = set()
+    for raw_token in spec.split(","):
+        token = raw_token.strip()
+        if not token:
+            raise ValueError(
+                f"spa_layer_filter: empty token in {spec!r} (dangling comma?)"
+            )
+        if "-" in token:
+            parts = token.split("-")
+            if len(parts) != 2:
+                raise ValueError(
+                    f"spa_layer_filter: invalid range {token!r} in {spec!r}"
+                )
+            lo_s, hi_s = parts[0].strip(), parts[1].strip()
+            try:
+                lo, hi = int(lo_s), int(hi_s)
+            except ValueError:
+                raise ValueError(
+                    f"spa_layer_filter: non-integer range {token!r} in {spec!r}"
+                ) from None
+            if lo < 0 or hi < 0:
+                raise ValueError(
+                    f"spa_layer_filter: negative index in range {token!r}"
+                )
+            if lo > hi:
+                raise ValueError(
+                    f"spa_layer_filter: reversed range {token!r} (lo > hi)"
+                )
+            layers.update(range(lo, hi + 1))
+        else:
+            try:
+                idx = int(token)
+            except ValueError:
+                raise ValueError(
+                    f"spa_layer_filter: non-integer token {token!r} in {spec!r}"
+                ) from None
+            if idx < 0:
+                raise ValueError(
+                    f"spa_layer_filter: negative index {token!r}"
+                )
+            layers.add(idx)
+    return frozenset(layers)
+
+
+def _spa_derive_text_len(ids: torch.Tensor):
+    """Derive the number of leading TEXT tokens from position ids (plan P3/T3.4).
+
+    FLUX/Qwen/Krea-2 convention: text tokens have ``row == col == 0`` (axes 1 and
+    2 of the ``(B, L, 3)`` ids) and come FIRST in the sequence.  We count the
+    leading CONTIGUOUS run of such tokens (not the total) so the image pixel at
+    grid position (0, 0) — which also has row == col == 0 — is not miscounted as
+    text.  Returns the count from the first batch element (uniform across the
+    batch), or ``None`` when the ids cannot carry the info (too few axes /
+    empty).  Used by HAP to place the text/image boundary of the band mask
+    without relying solely on the node-provided default.
+    """
+    if ids is None:
+        return None
+    try:
+        if ids.dim() < 2 or ids.shape[-1] < 3:
+            return None
+        flat = ids.reshape(-1, ids.shape[-2], ids.shape[-1]) if ids.dim() > 2 else ids.unsqueeze(0)
+        first = flat[0]  # (L, 3)
+        is_text = (first[..., 1] == 0) & (first[..., 2] == 0)
+        # Length of the leading contiguous run of True.
+        run = 0
+        for flag in is_text.tolist():
+            if not flag:
+                break
+            run += 1
+        return run
+    except Exception:
+        return None
+
+
 def _spa_dispatch_attention(q, k, v, ctx, _attn, fmt):
     """Run the averaged-attention hook, selecting the Z-Image vs single-group path.
 
@@ -728,8 +844,86 @@ def _spa_dispatch_attention(q, k, v, ctx, _attn, fmt):
     return _spa_run_averaged(q, k, v, ctx, _attn)
 
 
-def _make_spa_wrapper(orig, is_masked: bool):
-    """Build the ``optimized_attention`` / ``optimized_attention_masked`` wrapper.
+def _hrdit_resolve_text_len(hap_ctx, seq_len):
+    """Resolve the effective text/image boundary for the HAP mask (plan P3/T3.4).
+
+    Priority: the live SPA context's derived ``text_len`` (from the position
+    ids) when available, else the node-provided ``HapContext.text_len``.  The
+    result is clamped to ``[0, seq_len]`` so a degenerate/oversized default can
+    never index past the sequence.
+    """
+    spa_ctx = get_spa_context()
+    text_len = None
+    if spa_ctx is not None and getattr(spa_ctx, "text_len", None) is not None:
+        text_len = int(spa_ctx.text_len)
+    if text_len is None:
+        text_len = int(getattr(hap_ctx, "text_len", 0) or 0)
+    return max(0, min(text_len, seq_len))
+
+
+def _hrdit_hap_dispatch(q, k, v, layer_idx, mask):
+    """Route one attention pass through the HAP kernel when HAP is live.
+
+    Returns the masked-attention output, or ``None`` to fall back to the
+    original attention.  Plan §2.1 decision matrix (HAP column).  v1 composes
+    HAP only when there is NO external attention mask to combine with (the masked
+    backend convention passes a ``mask`` argument; HAP's own block-sparse mask
+    cannot be composed with it yet, so those calls keep the plain path).
+    """
+    hap_ctx = get_hap_context()
+    if hap_ctx is None or not hap_ctx.active:
+        return None
+    if mask is not None:
+        return None
+    from .hap import HapRuntime
+
+    text_len = _hrdit_resolve_text_len(hap_ctx, q.shape[-2])
+    return HapRuntime.get().attn(q, k, v, layer_idx, ctx=hap_ctx, text_len=text_len)
+
+
+def _hrdit_proportional_ratio(q) -> float:
+    """Proportional attention scaling ratio for this call (plan P7/T7.2).
+
+    Computed from ``q.shape[-2]`` — the true sequence length INCLUDING text
+    tokens.  The reference uses ``key.size(2)`` which is the full concatenated
+    seq; identical here because q and k share the sequence dimension.  A scalar
+    factor on ``q`` commutes with RoPE and any attention mask, so pre-scaling
+    ``q`` once applies uniformly to every downstream pass (SPA variants
+    included) without touching backend internals.
+    """
+    from .hap import proportional_scale_ratio
+
+    return proportional_scale_ratio(int(q.shape[-2]))
+
+
+def _spa_layer_allowed(layer_idx: int) -> bool:
+    """Per-layer SPA filter gate (plan P8/T8.2, G5).
+
+    ``None`` filter (default) == SPA allowed on EVERY layer.  A frozenset of
+    flat layer indices restricts the averaged-pass SPA to those layers only;
+    filtered-out layers run plain attention.  The filter gates SPA ALONE — the
+    layer counter still advances (alignment is sacred) and HAP dispatch is NOT
+    affected (reference semantics: ``spa_allowed`` affects SPA only).
+    """
+    f = get_spa_layer_filter()
+    return f is None or layer_idx in f
+
+
+def _make_hrdit_wrapper(orig, is_masked: bool):
+    """Build the unified ``optimized_attention`` / ``optimized_attention_masked`` wrapper.
+
+    Plan P3/T3.1+T3.2.  Behaviour-preserving refactor of the old
+    ``_make_spa_wrapper`` that additionally:
+
+    - advances the per-forward HRDiT layer counter (:func:`next_hrdit_layer_idx`)
+      on EVERY call — including all early-return paths — so the counter stays
+      aligned with the model's block order (alignment is sacred), and
+    - dispatches each attention pass through the HAP kernel when a HAP context
+      is live (plan §2.1).  With SPA active, EVERY variant pass runs through the
+      kernel (reference composition); with SPA off, a single kernel pass runs.
+    - consults the per-layer SPA filter (plan P8/T8.2): when a filter is set and
+      the current layer index is NOT in it, SPA is skipped for that layer (plain
+      attention) while the counter and HAP dispatch are unaffected.
 
     ``is_masked`` reflects the backend call convention: the masked variant takes
     ``mask`` as the 5th positional argument, the unmasked variant takes it as a
@@ -738,41 +932,68 @@ def _make_spa_wrapper(orig, is_masked: bool):
     if is_masked:
         def _wrapper(q, k, v, heads, mask, skip_reshape=False,
                      transformer_options=None, **kw):
+            layer_idx = next_hrdit_layer_idx()
+            # Proportional attention scaling (plan P7/T7.2): pre-scale q so the
+            # logits gain the factor log(seq_len, train_seq_len).  A scalar on q
+            # commutes with RoPE and any mask, so every downstream pass (SPA
+            # variants included) sees the scaled q without backend changes.
+            if get_hrdit_proportional():
+                q = q * _hrdit_proportional_ratio(q)
             ctx = get_spa_context()
-            # Step gate (D2a): closed on late denoising steps -> plain attention.
-            if not get_spa_step_gate():
-                return orig(q, k, v, heads, mask, skip_reshape,
-                            transformer_options or {}, **kw)
-            if ctx is None or not ctx.active or len(ctx.variant_pes) <= 1:
-                return orig(q, k, v, heads, mask, skip_reshape,
-                            transformer_options or {}, **kw)
+            spa_active = (
+                get_spa_step_gate()
+                and ctx is not None
+                and ctx.active
+                and len(ctx.variant_pes) > 1
+                and _spa_layer_allowed(layer_idx)
+            )
 
             def _attn(qq, kk, vv):
+                out = _hrdit_hap_dispatch(qq, kk, vv, layer_idx, mask)
+                if out is not None:
+                    return out
                 return orig(qq, kk, vv, heads, mask, skip_reshape,
                             transformer_options or {}, **kw)
 
+            if not spa_active:
+                # SPA off / gated: single pass (still HAP-routed when live).
+                return _attn(q, k, v)
             return _spa_dispatch_attention(q, k, v, ctx, _attn, ctx.fmt)
 
         return _wrapper
 
     def _wrapper(q, k, v, heads, skip_reshape=False, mask=None,
                  transformer_options=None, **kw):
+        layer_idx = next_hrdit_layer_idx()
+        # Proportional attention scaling (plan P7/T7.2) — see the masked variant.
+        if get_hrdit_proportional():
+            q = q * _hrdit_proportional_ratio(q)
         ctx = get_spa_context()
-        # Step gate (D2a): closed on late denoising steps -> plain attention.
-        if not get_spa_step_gate():
-            return orig(q, k, v, heads, skip_reshape, mask,
-                        transformer_options or {}, **kw)
-        if ctx is None or not ctx.active or len(ctx.variant_pes) <= 1:
-            return orig(q, k, v, heads, skip_reshape, mask,
-                        transformer_options or {}, **kw)
+        spa_active = (
+            get_spa_step_gate()
+            and ctx is not None
+            and ctx.active
+            and len(ctx.variant_pes) > 1
+            and _spa_layer_allowed(layer_idx)
+        )
 
         def _attn(qq, kk, vv):
+            out = _hrdit_hap_dispatch(qq, kk, vv, layer_idx, mask)
+            if out is not None:
+                return out
             return orig(qq, kk, vv, heads, skip_reshape, mask,
                         transformer_options or {}, **kw)
 
+        if not spa_active:
+            # SPA off / gated: single pass (still HAP-routed when live).
+            return _attn(q, k, v)
         return _spa_dispatch_attention(q, k, v, ctx, _attn, ctx.fmt)
 
     return _wrapper
+
+
+# Backward-compatible alias (the pre-P3 name).
+_make_spa_wrapper = _make_hrdit_wrapper
 
 
 def _spa_restore_installed(m) -> None:
@@ -784,25 +1005,73 @@ def _spa_restore_installed(m) -> None:
         if getattr(mod, attr, None) is not orig:
             setattr(mod, attr, orig)
     m._spa_installed = None
+    m._hrdit_consumers = None
+
+
+def _hrdit_uninstall_hook(m, consumer: str) -> None:
+    """Remove one consumer from the shared hook; restore only when the last leaves.
+
+    Plan P3/T3.3.  SPA and HAP share ONE wrapper; uninstalling one while the
+    other is still active must keep the wrapper in place.  Only when the
+    consumer set empties do we restore the original attention symbols and drop
+    the unet wrapper.
+    """
+    consumers = getattr(m, "_hrdit_consumers", None)
+    if consumers is None:
+        # No shared-hook bookkeeping (legacy single-consumer install) -> restore.
+        _spa_restore_installed(m)
+        if hasattr(m, "set_model_unet_function_wrapper"):
+            m.set_model_unet_function_wrapper(None)
+        return
+    consumers.discard(consumer)
+    if consumers:
+        return  # another consumer still needs the wrapper
+    _spa_restore_installed(m)
+    if hasattr(m, "set_model_unet_function_wrapper"):
+        m.set_model_unet_function_wrapper(None)
 
 
 def _spa_install_hook(m, model_type: str) -> None:
-    """Install the averaged-attention hook for the active backend (decision 3).
+    """Install the averaged-attention hook for SPA (backward-compatible entry).
 
-    Only called when SPA is active (``enable_spa`` and ``bundle_size > 1``).  The hook
-    patches the backend's *bound* ``optimized_attention`` symbol (see
-    :func:`_spa_patch_targets`) — NOT only the module attribute — so it actually fires
-    for FLUX/Qwen/Z-Image/Anima.  It also patches ``comfy.ldm.modules.attention`` for
-    classic CrossAttention blocks.  The unet wrapper clears the :class:`SPAContext`
-    before/after a forward so it never leaks across models.  Idempotent: a prior
-    install on ``m`` is undone first.
+    Delegates to :func:`_hrdit_install_hook` with ``consumer="spa"`` (plan
+    P3/T3.3 install-policy generalization).
+    """
+    _hrdit_install_hook(m, model_type, consumer="spa")
+
+
+def _hrdit_install_hook(m, model_type: str, consumer: str = "spa") -> None:
+    """Install the unified HRDiT attention hook for the active backend.
+
+    Plan P3/T3.3 (ref-counted shared hook): the hook is installed when SPA is
+    active (``enable_spa`` and ``bundle_size > 1``) OR HAP is enabled.  Both
+    consumers share ONE wrapper: applying SPA then HAP (any order) installs once
+    and merely records the second consumer in ``m._hrdit_consumers``; the
+    wrapper is restored only when the LAST consumer uninstalls
+    (:func:`_hrdit_uninstall_hook`).
+
+    The hook patches the backend's *bound* ``optimized_attention`` symbol (see
+    :func:`_spa_patch_targets`) — NOT only the module attribute — so it actually
+    fires for FLUX/Qwen/Z-Image/Anima/Krea-2.  It also patches
+    ``comfy.ldm.modules.attention`` for classic CrossAttention blocks.  The unet
+    wrapper clears the :class:`SPAContext` / HAP context before/after a forward so
+    they never leak across models, and resets the HRDiT layer counter.
     """
     import importlib
 
     import comfy.ldm.modules.attention as attn_mod
 
-    # Idempotency: undo any previous install on this model first.
-    _spa_restore_installed(m)
+    # Shared-hook fast path: already installed -> just record the consumer.
+    # The unet wrapper reads ``m._hap_ctx`` at CALL time, so HAP state applied
+    # after a SPA install is still honoured by the same wrapper.
+    if getattr(m, "_spa_installed", None):
+        consumers = getattr(m, "_hrdit_consumers", None)
+        if consumers is None:
+            # Legacy install (pre-T3.3) was always SPA-only.
+            consumers = {"spa"}
+            m._hrdit_consumers = consumers
+        consumers.add(consumer)
+        return
 
     targets = list(_spa_patch_targets(model_type))
     # Always also patch the module-global for classic CrossAttention blocks
@@ -835,9 +1104,29 @@ def _spa_install_hook(m, model_type: str) -> None:
 
     m._spa_installed = installed
     m._spa_orig_optimized_attention = mod_global_orig  # legacy, for T-P3-5
+    m._hrdit_consumers = {consumer}  # ref-counted shared-hook consumers (T3.3)
 
     def _spa_unet_wrapper(model_function, args_dict):
         set_spa_context(None)  # clear before forward -> no cross-model leak
+        # Reset the per-forward HRDiT layer counter (plan P3/T3.1).  The unified
+        # wrapper advances it on EVERY attention call; resetting here keeps the
+        # counter aligned with the model's block order on every forward.
+        set_hrdit_layer_idx(0)
+        # Proportional attention scaling (plan P7/T7.2): activate for this forward
+        # from the model attr (OR-semantics: either node may enable it).  Read at
+        # call time so a later apply_* still takes effect on the shared wrapper.
+        set_hrdit_proportional(bool(getattr(m, "_hrdit_proportional_attention", False)))
+        # Per-layer SPA filter (plan P8/T8.2): activate for this forward from the
+        # model attr (frozenset of flat layer indices, or None == all layers).
+        # Read at call time so a later apply_* still takes effect on the shared
+        # wrapper.  The filter gates SPA ALONE (counter + HAP unaffected).
+        set_spa_layer_filter(getattr(m, "_spa_layer_filter", None))
+        # HAP (plan P4/T4.1): activate this model's HapContext for the forward.
+        # Read at call time (not install time) so SPA-then-HAP installs share the
+        # SAME unet wrapper and HAP state applied later is still honoured.
+        hap_ctx = getattr(m, "_hap_ctx", None)
+        if hap_ctx is not None:
+            set_hap_context(hap_ctx)
 
         # Read the current sigma ONCE (shared by the step-count gate and the
         # sigma-threshold gate).  NOTE: take the FIRST element, not a reduction --
@@ -890,14 +1179,28 @@ def _spa_install_hook(m, model_type: str) -> None:
                                   **args_dict.get("c", {}))
         finally:
             set_spa_context(None)  # clear after forward
+            set_hap_context(None)  # clear HAP too -> no cross-model leak
+            set_hrdit_proportional(False)  # clear proportional flag -> no leak
+            set_spa_layer_filter(None)  # clear layer filter -> no cross-model leak
             set_spa_step_gate(True)  # reopen so a non-SPA forward is unaffected
 
     m.set_model_unet_function_wrapper(_spa_unet_wrapper)
 
 
 def restore_spa_attention_hook(m, attn_module=None) -> None:
-    """Restore the original ``optimized_attention`` after a SPA un-patch (T-P3-5)."""
-    _spa_restore_installed(m)
+    """Restore the original ``optimized_attention`` after a SPA un-patch (T-P3-5).
+
+    Consumer-aware (plan P3/T3.3): the hook is SHARED between SPA and HAP.  If
+    another consumer (HAP) is still registered, uninstalling SPA merely removes
+    the ``"spa"`` consumer and keeps the wrapper; only the LAST consumer triggers
+    the full restore.
+    """
+    consumers = getattr(m, "_hrdit_consumers", None)
+    if consumers and "spa" in consumers and len(consumers) > 1:
+        consumers.discard("spa")
+        return  # HAP (or another consumer) still needs the shared wrapper
+
+    _hrdit_uninstall_hook(m, "spa")
     if attn_module is None:
         try:
             import comfy.ldm.modules.attention as attn_module
@@ -907,8 +1210,6 @@ def restore_spa_attention_hook(m, attn_module=None) -> None:
         orig = getattr(m, "_spa_orig_optimized_attention", None)
         if orig is not None and getattr(attn_module, "optimized_attention", None) is not orig:
             attn_module.optimized_attention = orig
-    if hasattr(m, "set_model_unet_function_wrapper"):
-        m.set_model_unet_function_wrapper(None)
     m._spa_orig_optimized_attention = None
 
 
@@ -927,6 +1228,8 @@ def apply_spa_to_model(
     dype_start_sigma: float = 1.0,
     spa_start_sigma: float = 1.0,
     spa_steps: int = 3,
+    proportional_attention: bool = False,
+    spa_layer_filter: Optional[str] = None,
 ):
     """Patch a ComfyUI model with Spatial Position Alignment.
 
@@ -944,6 +1247,24 @@ def apply_spa_to_model(
     compat).  Default ``3`` (HRDiT ``--spa_steps [3, 0]``).  A new generation
     (sigma jump-up) resets the leading-step counter.  It is AND-combined with
     the optional ``spa_start_sigma`` threshold gate.
+
+    ``proportional_attention`` (plan P7/T7.3) enables HRDiT's proportional
+    attention scaling: the attention logits gain a factor
+    ``sqrt(ln(seq_len) / ln(train_seq_len))`` (pre-scaling ``q``) to
+    compensate the entropy dilution of long sequences.  It is an exact no-op
+    (ratio ``1.0``) at/below the trained extent (seq 4608 = 1024px FLUX) and
+    when disabled (default — bit-identical regression).  OR-semantics: either
+    the SPA or the HAP node may enable it; the flag is stored on the patcher
+    (``m._hrdit_proportional_attention``) and read by the shared unet wrapper
+    at call time.
+
+    ``spa_layer_filter`` (plan P8/T8.3) restricts the averaged-pass SPA to a
+    subset of transformer layers, given as a flat layer-index spec string
+    (``"0-18,38-57"``; ``""``/``None`` = every layer).  The indices are the
+    per-forward attention-call counter values (the same flat index HAP uses).
+    Filtered-out layers run plain attention; the counter and HAP dispatch are
+    unaffected.  Invalid specs raise :class:`ValueError` (see
+    :func:`parse_layer_filter`).
 
     ``method`` / ``yarn_alt_scaling`` are NO-OPS for SPA: they exist only to
     satisfy the ``DyPEBasePosEmbed`` constructor chain (the SPA embedders
@@ -975,7 +1296,17 @@ def apply_spa_to_model(
     width = _snap_to_multiple(width, 16)
     height = _snap_to_multiple(height, 16)
 
+    # PROPORTIONAL ATTENTION SCALING (plan P7/T7.3): OR-semantics — either the
+    # SPA or the HAP node may enable it.  The real ``ModelPatcher.clone()``
+    # copies only its KNOWN fields (custom attrs do NOT survive), so the
+    # existing flag must be read from the SOURCE patcher BEFORE the clone and
+    # re-applied to the clone.  Set right after the clone (before any early
+    # return) so the flag survives even when SPA itself is disabled but a hook
+    # is (or gets) installed by HAP.  The shared unet wrapper reads it at call
+    # time and activates the q pre-scaling for the whole forward.
+    prev_proportional = bool(getattr(model, "_hrdit_proportional_attention", False))
     m = model.clone()
+    m._hrdit_proportional_attention = prev_proportional or bool(proportional_attention)
 
     dm = m.model.diffusion_model
     detected_type = _spa_resolve_type(model_type, dm)
@@ -1120,6 +1451,12 @@ def apply_spa_to_model(
     m._spa_steps = max(0, int(spa_steps))
     m._spa_step_counter = 0
     m._spa_last_sigma = None
+    # PER-LAYER SPA FILTER (plan P8/T8.3): parse the flat layer-index spec and
+    # store the frozenset (or None == every layer) on the patcher; the unet
+    # wrapper activates it around each forward and the attention wrapper skips
+    # SPA on filtered-out layers (counter + HAP unaffected).  Invalid specs
+    # raise ValueError here (clear node error, plan T8.3).
+    m._spa_layer_filter = parse_layer_filter(spa_layer_filter)
     if enable_spa and bundle_size != 1:
         _spa_install_hook(m, detected_type)
 
