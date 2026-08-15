@@ -945,6 +945,13 @@ def apply_spa_to_model(
     (sigma jump-up) resets the leading-step counter.  It is AND-combined with
     the optional ``spa_start_sigma`` threshold gate.
 
+    ``method`` / ``yarn_alt_scaling`` are NO-OPS for SPA: they exist only to
+    satisfy the ``DyPEBasePosEmbed`` constructor chain (the SPA embedders
+    inherit ``format_components`` from it).  SPA always applies the model's
+    native no-extrapolation RoPE (``ntk_factor=1.0``) on the bundled coords
+    (HRDiT "nor" RoPE), so the DyPE extrapolation methods never influence the
+    output.  The SPA node therefore does not expose a ``method`` input.
+
     Install policy (decision 3): the averaged-attention hook (the backend-bound
     ``optimized_attention`` symbol + the unet wrapper) is installed ONLY when SPA is
     active (``enable_spa`` and ``bundle_size != 1``).  For ``bundle_size == 1`` (off)

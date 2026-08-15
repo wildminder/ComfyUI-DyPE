@@ -114,7 +114,6 @@ This node provides a seamless, "plug-and-play" integration of DyPE into your wor
 | Parameter | Default | Description |
 |-----------|---------|-------------|
 | `model_type` | auto | Same detection as DyPE (`flux` / `nunchaku` / `qwen` / `zimage` / `anima`). Reads `theta` & `axes_dim` from the model. |
-| `method` | ntk | Base RoPE method on the bundled coords. SPA always uses `ntk_factor = 1.0` (no extrapolation) on the bundled positions; this only selects which base RoPE the bundle is built from. |
 | `enable_spa` | True | Disable to emit the model's base RoPE unchanged. |
 | `bundle_size` | 0 (auto) | The paper's `N` = **tokens per bundle** (paper §4.1). `0` = auto (minimal compression keeping every bundled position ≤ 79, i.e. HRDiT `group_num = 80`). `1` = off (passthrough). `2..8` = explicit; **recommended `3` at 2K, `5` at 4K**. While the grid is inside the trained extent (`max_pos ≤ 64`, e.g. ≤ 1024px) SPA is automatically a no-op for any `N`. Explicit `N` is floored by the in-distribution minimum (never out-of-distribution). Legacy values `≥ 32` (old `group_num` semantics) are migrated to auto with a one-time warning. The averaged-pass count is `2s − 1`, capped at 15. |
 | `spa_steps` | 3 | Step-count gating (HRDiT `--spa_steps`): SPA runs only on the first `spa_steps` denoising steps of each generation; later steps run at baseline speed. `0` = all steps (backward compatible). A new generation (sigma jump-up) resets the counter. |
@@ -266,6 +265,7 @@ fallback; the VAE-space path is the recommended default).
 *   **Trained-extent gate:** SPA is an automatic **identity no-op** while the grid is inside the model's trained extent (`max_pos ≤ 64`, i.e. ≤ 1024px) — no big-patch artifacts, zero overhead.
 *   **`spa_steps` (new, default `3`):** HRDiT-faithful leading-step gating — SPA runs only on the first 3 denoising steps of each generation (a sigma jump-up resets the counter). This cuts the `bundle_size > 2` slowdown from ~10× to ~1.3–1.8×. `0` = all steps.
 *   **Delta-rotation cache:** the `inv(base) @ variant` rotations are composed once per grid (not per attention call), removing the per-call overhead.
+*   **Removed the `method` input from the SPA node:** the DyPE extrapolation methods (`ntk` / `yarn` / `vision_yarn` / `pi`) were a no-op for SPA — it always applies the model's native no-extrapolation RoPE (`ntk_factor = 1.0`) on the bundled coords (HRDiT "nor" RoPE). The knob was inherited UI plumbing and only invited misleading A/B tests.
 *   **HAP (Head-adaptive Attention Pruning)** — the paper's per-head sparse-attention speed-up — is tracked as future work (not in this release).
 
 #### v2.6.0 — SPA (HRDiT) Node

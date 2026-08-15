@@ -269,12 +269,6 @@ class SPA(io.ComfyNode):
                     default="auto",
                     tooltip="Specify the model architecture. 'auto' usually works.",
                 ),
-                io.Combo.Input(
-                    "method",
-                    options=["ntk", "vision_yarn", "yarn", "pi", "base"],
-                    default="ntk",
-                    tooltip="Base RoPE method used for the bundled positions. SPA always applies ntk_factor=1.0 (no extrapolation) on the bundled coords.",
-                ),
                 io.Boolean.Input(
                     "enable_spa",
                     default=True,
@@ -310,10 +304,14 @@ class SPA(io.ComfyNode):
         )
 
     @classmethod
-    def execute(cls, model, width: int, height: int, model_type: str, method: str, enable_spa: bool, bundle_size: int = 0, spa_start_sigma: float = 1.0, spa_steps: int = 3) -> io.NodeOutput:
+    def execute(cls, model, width: int, height: int, model_type: str, enable_spa: bool, bundle_size: int = 0, spa_start_sigma: float = 1.0, spa_steps: int = 3) -> io.NodeOutput:
+        # NOTE: no ``method`` input — SPA always applies the model's native
+        # no-extrapolation RoPE (ntk_factor=1.0) on the bundled coords (HRDiT
+        # "nor" RoPE).  The DyPE extrapolation methods are a no-op for SPA, so
+        # the knob was removed to avoid misleading A/B testing.
         bs = None if (bundle_size is None or bundle_size <= 0) else int(bundle_size)
         patched_model = apply_spa_to_model(
-            model, model_type, width, height, method=method,
+            model, model_type, width, height,
             enable_spa=enable_spa, bundle_size=bs,
             spa_start_sigma=float(spa_start_sigma),
             spa_steps=int(spa_steps),

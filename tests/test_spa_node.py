@@ -133,6 +133,27 @@ class TestSpaNodeSchema:
         assert '"spa_start_sigma"' in content
         assert "io.Float.Input" in content
 
+    def test_no_method_input_on_spa_node(self):
+        """Guard: the SPA node must NOT expose a ``method`` combo.
+
+        SPA always applies the model's native no-extrapolation RoPE
+        (``ntk_factor=1.0``) on the bundled coords, so the DyPE extrapolation
+        methods (ntk/yarn/vision_yarn/pi) are a no-op for SPA.  The knob was
+        removed to stop users A/B-testing a dead input.  Scoped to the SPA
+        class section only (the DyPE node legitimately keeps its own
+        ``method`` input).
+        """
+        content = _INIT.read_text(encoding="utf-8")
+        start = content.index("class SPA(io.ComfyNode):")
+        end = content.index("class DyPEExtension")
+        spa_section = content[start:end]
+        assert '"method"' not in spa_section, (
+            "SPA node still exposes a 'method' input — it is a no-op for SPA "
+            "and must stay removed")
+        # execute() must not accept a method parameter either.
+        assert "def execute(cls, model, width: int, height: int, model_type: str, enable_spa: bool" in spa_section
+        assert "method: str" not in spa_section
+
 
 @pytest.mark.unit
 class TestSpaNodePatching:
@@ -140,8 +161,12 @@ class TestSpaNodePatching:
 
     These mirror exactly what ``SPA.execute`` does (the node body is thin glue:
     ``bs = None if bundle_size<=0 else int(bundle_size)`` then
-    ``apply_spa_to_model(model, model_type, width, height, method=method,
-    enable_spa=enable_spa, bundle_size=bs)``).
+    ``apply_spa_to_model(model, model_type, width, height,
+    enable_spa=enable_spa, bundle_size=bs)``).  The node no longer exposes a
+    ``method`` input (SPA always uses the model's native no-extrapolation
+    RoPE); the tests below pass ``"ntk"`` positionally only because
+    ``apply_spa_to_model`` keeps the parameter for the DyPE-base constructor
+    chain — it is a no-op for the SPA math.
     """
 
     def test_patches_flux_with_auto_bundle_size(self):
