@@ -520,3 +520,55 @@ class TestSpaDocs:
         # Nunchaku is explicitly unsupported for SPA.
         assert "Nunchaku is not supported" in content
 
+
+# ---------------------------------------------------------------------------
+# P4 (2026-08-16 fix) — SPA-side carry-over of HRDiT state across clone()
+# ---------------------------------------------------------------------------
+#
+# The real ModelPatcher.clone() drops custom attributes.  apply_spa_to_model
+# clones the incoming patcher, so any HRDiT state the source already carries
+# (e.g. an HAP runtime installed by an upstream HAP node) must be carried onto
+# the clone — otherwise HAP silently dies the moment an SPA node is chained
+# after it.  The HAP-side mirror of this test lives in test_hap_node.py
+# (TestChainOrderIndependence); this class covers the SPA apply function's
+# perspective.
+
+@pytest.mark.unit
+class TestSpaCarriesHrditState:
+    def test_spa_after_hap_carries_hap_ctx(self):
+        """apply_spa_to_model carries an existing _hap_ctx across its clone()."""
+        from src.spa import apply_spa_to_model
+
+        m = _make_flux_mock()
+        sentinel = object()
+        m._hap_ctx = sentinel
+
+        out = apply_spa_to_model(m, "flux", 4096, 4096, "ntk", enable_spa=True)
+        assert out is not m
+        assert getattr(out, "_hap_ctx", None) is sentinel
+
+    def test_spa_carries_hrdit_consumers_and_state_ref(self):
+        """apply_spa_to_model carries _hrdit_consumers and re-points _hrdit_state_ref."""
+        from src.spa import apply_spa_to_model
+
+        m = _make_flux_mock()
+        m._hrdit_consumers = {"spa"}
+        m._hrdit_state_ref = [m]
+
+        out = apply_spa_to_model(m, "flux", 4096, 4096, "ntk", enable_spa=True)
+        assert getattr(out, "_hrdit_consumers", None) == {"spa"}
+        # The shared state ref must now point at the newest clone so the
+        # already-installed unet wrapper reads the authoritative state.
+        assert getattr(out, "_hrdit_state_ref", [None])[0] is out
+
+    def test_spa_carry_noop_on_bare_model(self):
+        """Carry-over must not raise when the source has no HRDiT attributes."""
+        from src.spa import apply_spa_to_model
+
+        out = apply_spa_to_model(
+            _make_flux_mock(), "flux", 4096, 4096, "ntk", enable_spa=True
+        )
+        # No HRDiT attrs were present on the source -> none invented on the clone
+        # (the install hook may legitimately add its own attrs afterwards).
+        assert not hasattr(out, "_hap_ctx")
+

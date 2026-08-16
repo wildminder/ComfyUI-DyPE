@@ -146,6 +146,10 @@ This node provides a seamless, "plug-and-play" integration of DyPE into your wor
 *   **Backends:** `flex` (CUDA + torch ≥ 2.5, the fast path), `dense_mask` (SDPA + additive −inf mask — the CPU/test oracle and automatic fallback), `off` (warning + plain attention). The node auto-selects `flex` when available.
 *   **Composable with SPA:** when both are active, each of SPA's `2s − 1` averaged passes runs through the HAP kernel (faithful to HRDiT `_spa_attention` + HAP). HAP-only runs a single masked pass per layer.
 
+> **Scope plans are model-specific.** A plan is keyed by `(layers, heads)` — the shipped `configs/scope_plan_flux.json` is the **FLUX** plan (57 layers × 24 heads). On a different architecture (e.g. Anima, 16 heads) HAP detects the head-count mismatch, logs a **one-time warning**, and gracefully falls back to plain attention — never a crash, never wrong math. Calibrate a model-specific plan ([`calibration/calibrate_hap.py`](calibration/calibrate_hap.py)) to enable HAP there.
+>
+> **v1 limitations:** HAP skips attention calls it cannot serve with its square, plan-shaped mask and runs them as plain attention instead — (a) **cross-attention** calls (`kv_len ≠ q_len`, e.g. every Anima block's cross-attn) and (b) calls carrying an **external attention mask** (the masked backend convention; HAP's block-sparse mask is not composed with it yet). SPA likewise declines **cross-attention** calls (`q_len ≠ k_len`) — its averaged passes apply the spatial RoPE rotations to both `q` and `k`, which is only valid for square self-attention. **Node order is irrelevant:** SPA and HAP state carries across `ModelPatcher.clone()`, so chaining SPA→HAP or HAP→SPA behaves identically.
+
 ### Usage
 
 1. Add the **HAP (HRDiT)** node after your model loader (under `model_patches/position_encoding`).
@@ -348,6 +352,13 @@ fallback; the VAE-space path is the recommended default).
 > performs its own CFG and prediction-type conversion (EPS, CONST/flow, V_PREDICTION, X0).
 
 ## Changelog
+
+#### v2.7.1 — Anima crash fix + HAP decline-guards + node-order independence (2026-08-16)
+*   **Fixed the Anima `AttributeError: 'bool' object has no attribute 'ndim'` crash:** the HRDiT attention wrapper now mirrors the real ComfyUI `optimized_attention` signature bit-for-bit (`mask`, `attn_precision`, `skip_reshape`, `skip_output_reshape` in positional slots 5–8) and forwards `orig()` with the correct positional order — the pre-fix wrapper fed `skip_reshape` into the `mask` slot on the unmasked (Anima/cosmos) path.
+*   **HAP decline-guards:** HAP now declines to plain attention — never a crash, never silent wrong math — for (a) non-square attention (cross-attention, `kv_len ≠ q_len`; one-time DEBUG) and (b) head-count mismatch between the scope plan and the model (one-time WARNING naming both counts, e.g. FLUX 24-head plan on Anima's 16 heads).
+*   **Fixed the Anima SPA `einsum` length-mismatch crash:** SPA's averaged passes apply the spatial RoPE rotations to both `q` and `k`, which is only valid for square self-attention. Anima runs cross-attention (image queries vs text keys) through the same patched symbol, so the wrapper now declines SPA for non-square calls (`q_len ≠ k_len`) and runs plain attention — the exact SPA analogue of the HAP non-square guard. FLUX/Qwen/Krea-2/Z-Image are unaffected (their attention is always square).
+*   **Node-order independence:** SPA and HAP state now carries across `ModelPatcher.clone()` (`_hrdit_carry_state`), so chaining SPA→HAP or HAP→SPA behaves identically — previously the second node's `clone()` silently dropped the first node's state.
+*   **Test-fidelity fix:** the pytest attention mock now mirrors the real ComfyUI signature (it previously matched the wrapper's inverted convention, which is why the bug went undetected); a conformance tripwire (`tests/test_orig_call_convention.py`) locks the call convention for all six backends.
 
 #### v2.7.0 — HRDiT full implementation: HAP node + calibration + proportional scaling + layer filter (2026-08-15)
 *   **HAP (HRDiT) node:** Added **HAP** (Head-Adaptive attention Pruning, HRDiT arXiv 2608.07003) — the paper's *speed* half. Per-head sparse attention from an offline-calibrated **scope plan**, executed through **PyTorch FlexAttention** (block-sparse, compiled) on CUDA + torch ≥ 2.5, with an automatic SDPA dense-mask fallback on CPU/older torch. Shipped FLUX plan at `configs/scope_plan_flux.json` (57×24). **Nunchaku unsupported** (fused kernels bypass the hook).

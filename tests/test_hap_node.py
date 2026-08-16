@@ -200,3 +200,100 @@ class TestShippedPlan:
         assert plan.num_heads == 24
         assert all(a == 2048.0 for row in plan.alphas for a in row)
         assert all(b == 0.0 for row in plan.betas for b in row)
+
+
+# ---------------------------------------------------------------------------
+# T4.2 — clone-state carry-over: chain order independence (plan 2026-08-16 G4)
+# ---------------------------------------------------------------------------
+
+@pytest.mark.mock_integration
+class TestChainOrderIndependence:
+    """SPA<->HAP chaining must be behaviour-identical regardless of node order.
+
+    The mock ``_MockModel.clone()`` drops custom attrs exactly like the real
+    ``ModelPatcher.clone()``, so these tests prove :func:`_hrdit_carry_state`
+    re-applies the other node's state across the clone (plan G4).
+    """
+
+    def test_hap_then_spa_carries_both_states(self, mock_attn):
+        """HAP -> SPA: the final patcher keeps ``_hap_ctx`` AND SPA gating."""
+        from src.spa import apply_spa_to_model
+
+        base = _make_flux_mock()
+        m_hap = apply_hap_to_model(base, "flux", _tiny_plan(), text_len=512)
+        assert m_hap._hap_ctx is not None
+        # Chain SPA on top (clones m_hap, dropping custom attrs, then carries).
+        m_final = apply_spa_to_model(
+            m_hap, "flux", 2048, 2048, "ntk",
+            enable_spa=True, bundle_size=2, spa_steps=3,
+        )
+        # HAP state survived the clone (the exact scenario that crashed pre-fix).
+        assert m_final._hap_ctx is not None
+        assert m_final._hap_ctx is m_hap._hap_ctx
+        # SPA gating is configured on the final patcher.
+        assert m_final._spa_steps == 3
+        assert m_final._spa_layer_filter is None
+        # Shared hook: both consumers, single install.
+        assert m_final._hrdit_consumers == {"spa", "hap"}
+
+    def test_spa_then_hap_carries_both_states(self, mock_attn):
+        """SPA -> HAP: the final patcher keeps ``_spa_steps`` AND ``_hap_ctx``."""
+        from src.spa import apply_spa_to_model
+
+        base = _make_flux_mock()
+        m_spa = apply_spa_to_model(
+            base, "flux", 2048, 2048, "ntk",
+            enable_spa=True, bundle_size=2, spa_steps=5,
+        )
+        assert m_spa._spa_steps == 5
+        # Chain HAP on top (clones m_spa, dropping custom attrs, then carries).
+        m_final = apply_hap_to_model(m_spa, "flux", _tiny_plan(), text_len=512)
+        # SPA gating survived the clone.
+        assert m_final._spa_steps == 5
+        # HAP state is configured on the final patcher.
+        assert m_final._hap_ctx is not None
+        # Shared hook: both consumers, single install (fast path fired).
+        assert m_final._hrdit_consumers == {"spa", "hap"}
+
+    def test_spa_then_hap_no_double_wrapper(self, mock_attn):
+        """SPA -> HAP must NOT re-wrap the attention symbol (install fast path)."""
+        from src.spa import apply_spa_to_model
+
+        orig = mock_attn.optimized_attention
+        base = _make_flux_mock()
+        m_spa = apply_spa_to_model(
+            base, "flux", 2048, 2048, "ntk", enable_spa=True, bundle_size=2,
+        )
+        wrapper_after_spa = mock_attn.optimized_attention
+        assert wrapper_after_spa is not orig
+        # Chain HAP: the carried ``_spa_installed`` triggers the fast path.
+        apply_hap_to_model(m_spa, "flux", _tiny_plan())
+        assert mock_attn.optimized_attention is wrapper_after_spa  # not re-wrapped
+
+    def test_state_ref_points_at_final_patcher(self, mock_attn):
+        """After chaining, ``_hrdit_state_ref`` points at the newest clone so the
+        shared unet wrapper reads the combined (authoritative) state."""
+        from src.spa import apply_spa_to_model
+
+        base = _make_flux_mock()
+        m_hap = apply_hap_to_model(base, "flux", _tiny_plan())
+        m_final = apply_spa_to_model(
+            m_hap, "flux", 2048, 2048, "ntk", enable_spa=True, bundle_size=2,
+        )
+        ref = getattr(m_final, "_hrdit_state_ref", None)
+        assert ref is not None
+        assert ref[0] is m_final
+
+    def test_proportional_or_semantics_across_chain(self, mock_attn):
+        """Either node enabling proportional scaling survives the chain (OR)."""
+        from src.spa import apply_spa_to_model
+
+        base = _make_flux_mock()
+        # HAP enables proportional; SPA does not -> flag must stay True.
+        m_hap = apply_hap_to_model(base, "flux", _tiny_plan(), proportional_attention=True)
+        assert m_hap._hrdit_proportional_attention is True
+        m_final = apply_spa_to_model(
+            m_hap, "flux", 2048, 2048, "ntk",
+            enable_spa=True, bundle_size=2, proportional_attention=False,
+        )
+        assert m_final._hrdit_proportional_attention is True

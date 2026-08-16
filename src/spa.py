@@ -912,8 +912,27 @@ def _spa_layer_allowed(layer_idx: int) -> bool:
 def _make_hrdit_wrapper(orig, is_masked: bool):
     """Build the unified ``optimized_attention`` / ``optimized_attention_masked`` wrapper.
 
-    Plan P3/T3.1+T3.2.  Behaviour-preserving refactor of the old
-    ``_make_spa_wrapper`` that additionally:
+    Plan P3/T3.1+T3.2, signature fix 2026-08-16 (G1).  The wrapper is a
+    **signature-compatible shim** of the real ComfyUI attention function.  Every
+    real backend in this build shares ONE signature
+    (``comfy/ldm/modules/attention.py::attention_pytorch``)::
+
+        (q, k, v, heads, mask=None, attn_precision=None,
+         skip_reshape=False, skip_output_reshape=False, **kwargs)
+
+    and ``optimized_attention_masked = optimized_attention`` (same function).  So
+    BOTH the masked and unmasked symbols are wrapped with this single body whose
+    positional slots 5-8 are EXACTLY ``mask``, ``attn_precision``, ``skip_reshape``,
+    ``skip_output_reshape``.  ``transformer_options`` (and any other extra kwarg
+    such as ``enable_gqa`` / ``scale`` / ``low_precision_attention``) rides
+    ``**kw`` and is forwarded to ``orig`` untouched.
+
+    The pre-fix wrapper inverted these slots for the unmasked variant (feeding the
+    ``skip_reshape`` bool into the real ``mask`` parameter -> ``mask.ndim`` ->
+    ``AttributeError`` on Anima) and mis-forwarded them for the masked variant.
+    Mirroring the real signature bit-for-bit removes the whole class of bug.
+
+    Behaviour (unchanged from P3):
 
     - advances the per-forward HRDiT layer counter (:func:`next_hrdit_layer_idx`)
       on EVERY call — including all early-return paths — so the counter stays
@@ -925,47 +944,16 @@ def _make_hrdit_wrapper(orig, is_masked: bool):
       the current layer index is NOT in it, SPA is skipped for that layer (plain
       attention) while the counter and HAP dispatch are unaffected.
 
-    ``is_masked`` reflects the backend call convention: the masked variant takes
-    ``mask`` as the 5th positional argument, the unmasked variant takes it as a
-    keyword (after ``skip_reshape``).
+    ``is_masked`` is retained for patch-target bookkeeping and tests but no longer
+    changes the call convention (the two real symbols are the same function).
     """
-    if is_masked:
-        def _wrapper(q, k, v, heads, mask, skip_reshape=False,
-                     transformer_options=None, **kw):
-            layer_idx = next_hrdit_layer_idx()
-            # Proportional attention scaling (plan P7/T7.2): pre-scale q so the
-            # logits gain the factor log(seq_len, train_seq_len).  A scalar on q
-            # commutes with RoPE and any mask, so every downstream pass (SPA
-            # variants included) sees the scaled q without backend changes.
-            if get_hrdit_proportional():
-                q = q * _hrdit_proportional_ratio(q)
-            ctx = get_spa_context()
-            spa_active = (
-                get_spa_step_gate()
-                and ctx is not None
-                and ctx.active
-                and len(ctx.variant_pes) > 1
-                and _spa_layer_allowed(layer_idx)
-            )
-
-            def _attn(qq, kk, vv):
-                out = _hrdit_hap_dispatch(qq, kk, vv, layer_idx, mask)
-                if out is not None:
-                    return out
-                return orig(qq, kk, vv, heads, mask, skip_reshape,
-                            transformer_options or {}, **kw)
-
-            if not spa_active:
-                # SPA off / gated: single pass (still HAP-routed when live).
-                return _attn(q, k, v)
-            return _spa_dispatch_attention(q, k, v, ctx, _attn, ctx.fmt)
-
-        return _wrapper
-
-    def _wrapper(q, k, v, heads, skip_reshape=False, mask=None,
-                 transformer_options=None, **kw):
+    def _wrapper(q, k, v, heads, mask=None, attn_precision=None,
+                 skip_reshape=False, skip_output_reshape=False, **kw):
         layer_idx = next_hrdit_layer_idx()
-        # Proportional attention scaling (plan P7/T7.2) — see the masked variant.
+        # Proportional attention scaling (plan P7/T7.2): pre-scale q so the
+        # logits gain the factor log(seq_len, train_seq_len).  A scalar on q
+        # commutes with RoPE and any mask, so every downstream pass (SPA
+        # variants included) sees the scaled q without backend changes.
         if get_hrdit_proportional():
             q = q * _hrdit_proportional_ratio(q)
         ctx = get_spa_context()
@@ -977,12 +965,41 @@ def _make_hrdit_wrapper(orig, is_masked: bool):
             and _spa_layer_allowed(layer_idx)
         )
 
+        # NON-SQUARE GUARD (2026-08-16, Anima cross-attention crash): the
+        # averaged passes apply the registered spatial RoPE rotations to BOTH q
+        # and k (``spa_averaged_attention``), which is only valid when q and k
+        # span the SAME sequence (self-attention over the spatial grid).  Anima
+        # (cosmos.predict2) runs cross-attention — image queries (T*H*W tokens)
+        # against text/context keys — through the SAME patched
+        # ``optimized_attention`` symbol, so q_len != k_len there and the einsum
+        # broadcast crashed (``subscript l has size 512 for operand 1 ...
+        # previously seen size 6300``).  Decline SPA for non-square calls and
+        # run plain attention — the exact SPA analogue of the HAP non-square
+        # guard (``HapRuntime.attn``).  The layer counter already advanced above
+        # (alignment is sacred) and HAP dispatch keeps its own guard.  FLUX /
+        # Qwen / Krea-2 / Z-Image are unaffected: their attention is joint
+        # text+image (always square).
+        if spa_active and q.shape[-2] != k.shape[-2]:
+            if not getattr(ctx, "_spa_nonsquare_logged", False):
+                ctx._spa_nonsquare_logged = True
+                logger.debug(
+                    "SPA: non-square attention (q_len=%d k_len=%d, e.g. "
+                    "cross-attention) cannot use the spatial RoPE variants; "
+                    "using plain attention for these calls.",
+                    q.shape[-2], k.shape[-2],
+                )
+            spa_active = False
+
         def _attn(qq, kk, vv):
             out = _hrdit_hap_dispatch(qq, kk, vv, layer_idx, mask)
             if out is not None:
                 return out
-            return orig(qq, kk, vv, heads, skip_reshape, mask,
-                        transformer_options or {}, **kw)
+            # Forward to the ORIGINAL attention with the REAL positional
+            # convention: slots 5-8 == mask, attn_precision, skip_reshape,
+            # skip_output_reshape.  Everything else (transformer_options, ...)
+            # rides **kw exactly as the backend sent it.
+            return orig(qq, kk, vv, heads, mask, attn_precision, skip_reshape,
+                        skip_output_reshape, **kw)
 
         if not spa_active:
             # SPA off / gated: single pass (still HAP-routed when live).
@@ -994,6 +1011,69 @@ def _make_hrdit_wrapper(orig, is_masked: bool):
 
 # Backward-compatible alias (the pre-P3 name).
 _make_spa_wrapper = _make_hrdit_wrapper
+
+
+# ---------------------------------------------------------------------------
+# Clone-state carry-over (plan 2026-08-16 G4)
+# ---------------------------------------------------------------------------
+
+#: HRDiT-private patcher attributes that MUST survive ``ModelPatcher.clone()``.
+#: The real ``clone()`` copies only its KNOWN fields, so chaining SPA->HAP or
+#: HAP->SPA would silently drop the other node's state (making node order decide
+#: whether HAP/SPA is live).  :func:`_hrdit_carry_state` re-applies them to the
+#: clone right after ``clone()``.  NOTE: ``_hrdit_proportional_attention`` is NOT
+#: in this tuple — it has OR-semantics (either node may enable it) and is handled
+#: explicitly by the apply functions.
+_HRDIT_PATCHER_ATTRS = (
+    "_spa_installed",
+    "_hrdit_consumers",
+    "_spa_orig_optimized_attention",
+    "_hap_ctx",
+    "_hap_plan",
+    "_spa_steps",
+    "_spa_start_sigma",
+    "_spa_step_counter",
+    "_spa_last_sigma",
+    "_spa_layer_filter",
+    # State indirection (see :func:`_hrdit_carry_state`): a 1-element list
+    # pointing at the current AUTHORITATIVE patcher.  The shared unet wrapper's
+    # closure captures the install-time patcher, so it resolves live state via
+    # this ref; carry-over re-points it to the newest clone.
+    "_hrdit_state_ref",
+)
+
+
+def _hrdit_carry_state(src, dst) -> None:
+    """Copy every HRDiT-private patcher attr from ``src`` to ``dst`` (plan G4).
+
+    Called immediately after ``model.clone()`` in BOTH
+    :func:`apply_spa_to_model` and :func:`apply_hap_to_model` (before any early
+    return) so node order never decides whether SPA/HAP state is live:
+
+    * HAP -> SPA: ``_hap_ctx`` / ``_hap_plan`` survive -> HAP stays live under
+      the SPA wrapper (the exact scenario that crashed pre-fix).
+    * SPA -> HAP: ``_spa_steps`` / ``_spa_layer_filter`` / gates survive -> SPA
+      keeps its configured gating; ``_spa_installed`` survives -> the shared
+      install fast path fires (consumer added, no re-install attempt).
+
+    Only attrs actually present on ``src`` are copied; bare objects (no HRDiT
+    state) are a no-op and never raise.
+
+    STATE REF RE-POINTING: ``_hrdit_state_ref`` is a 1-element list shared by
+    reference between ``src`` and ``dst``.  After copying, we re-point its single
+    slot to ``dst`` so the shared unet wrapper (whose closure captured the
+    install-time patcher) reads/writes state on the NEWEST authoritative clone.
+    Without this, a SPA->HAP chain would leave the wrapper reading the old SPA
+    patcher's ``_hap_ctx`` (``None``) and HAP would be silently inactive — node
+    order would still decide behaviour.  Re-pointing makes the chain fully
+    order-independent for linear workflows (the common case).
+    """
+    for attr in _HRDIT_PATCHER_ATTRS:
+        if hasattr(src, attr):
+            setattr(dst, attr, getattr(src, attr))
+    ref = getattr(dst, "_hrdit_state_ref", None)
+    if ref is not None:
+        ref[0] = dst
 
 
 def _spa_restore_installed(m) -> None:
@@ -1105,6 +1185,17 @@ def _hrdit_install_hook(m, model_type: str, consumer: str = "spa") -> None:
     m._spa_installed = installed
     m._spa_orig_optimized_attention = mod_global_orig  # legacy, for T-P3-5
     m._hrdit_consumers = {consumer}  # ref-counted shared-hook consumers (T3.3)
+    # STATE REF (plan 2026-08-16 G4): a 1-element list pointing at the current
+    # AUTHORITATIVE patcher.  The unet wrapper's closure captures ``m`` (the
+    # install-time patcher), but HRDiT state may be carried onto a LATER clone
+    # (SPA->HAP / HAP->SPA chaining); :func:`_hrdit_carry_state` re-points this
+    # ref so the wrapper always reads/writes the newest clone's state.  A fresh
+    # install creates the ref; if one was somehow already carried, re-point it.
+    _existing_ref = getattr(m, "_hrdit_state_ref", None)
+    if _existing_ref is None:
+        m._hrdit_state_ref = [m]
+    else:
+        _existing_ref[0] = m
 
     def _spa_unet_wrapper(model_function, args_dict):
         set_spa_context(None)  # clear before forward -> no cross-model leak
@@ -1112,19 +1203,26 @@ def _hrdit_install_hook(m, model_type: str, consumer: str = "spa") -> None:
         # wrapper advances it on EVERY attention call; resetting here keeps the
         # counter aligned with the model's block order on every forward.
         set_hrdit_layer_idx(0)
+        # Resolve the AUTHORITATIVE patcher (plan G4): the state ref is
+        # re-pointed by _hrdit_carry_state to the newest clone, so a chained
+        # SPA->HAP / HAP->SPA workflow reads the combined state, not the stale
+        # install-time patcher's.  Fall back to the closure patcher when the ref
+        # is absent (legacy installs).
+        _ref = getattr(m, "_hrdit_state_ref", None)
+        state = _ref[0] if _ref else m
         # Proportional attention scaling (plan P7/T7.2): activate for this forward
         # from the model attr (OR-semantics: either node may enable it).  Read at
         # call time so a later apply_* still takes effect on the shared wrapper.
-        set_hrdit_proportional(bool(getattr(m, "_hrdit_proportional_attention", False)))
+        set_hrdit_proportional(bool(getattr(state, "_hrdit_proportional_attention", False)))
         # Per-layer SPA filter (plan P8/T8.2): activate for this forward from the
         # model attr (frozenset of flat layer indices, or None == all layers).
         # Read at call time so a later apply_* still takes effect on the shared
         # wrapper.  The filter gates SPA ALONE (counter + HAP unaffected).
-        set_spa_layer_filter(getattr(m, "_spa_layer_filter", None))
+        set_spa_layer_filter(getattr(state, "_spa_layer_filter", None))
         # HAP (plan P4/T4.1): activate this model's HapContext for the forward.
         # Read at call time (not install time) so SPA-then-HAP installs share the
         # SAME unet wrapper and HAP state applied later is still honoured.
-        hap_ctx = getattr(m, "_hap_ctx", None)
+        hap_ctx = getattr(state, "_hap_ctx", None)
         if hap_ctx is not None:
             set_hap_context(hap_ctx)
 
@@ -1141,30 +1239,32 @@ def _hrdit_install_hook(m, model_type: str, consumer: str = "spa") -> None:
 
         # STEP-COUNT GATE (P2, HRDiT-faithful fix for D4): SPA is only useful on
         # the LEADING denoising steps (it fixes global position extrapolation
-        # established early).  ``m._spa_steps`` is the number of leading steps on
-        # which SPA is active; ``0`` = all steps (backward-compatible).  A NEW
+        # established early).  ``state._spa_steps`` is the number of leading steps
+        # on which SPA is active; ``0`` = all steps (backward-compatible).  A NEW
         # GENERATION is detected when the incoming sigma jumps UP (or on the first
         # call), which resets the leading-step counter.  This is scheduler-agnostic
         # and deterministic (sigma decreases monotonically within a generation).
         # An unreadable timestep keeps SPA active (safe fallback, no counting).
-        spa_steps = int(getattr(m, "_spa_steps", 0) or 0)
+        # Read/write through ``state`` (the authoritative patcher, plan G4) so a
+        # chained SPA->HAP clone keeps its configured gating and step counter.
+        spa_steps = int(getattr(state, "_spa_steps", 0) or 0)
         gate_by_steps = True
         if spa_steps > 0 and sigma is not None:
-            last_sigma = getattr(m, "_spa_last_sigma", None)
+            last_sigma = getattr(state, "_spa_last_sigma", None)
             counter = (
                 0
                 if (last_sigma is None or sigma > last_sigma)
-                else int(getattr(m, "_spa_step_counter", 0))
+                else int(getattr(state, "_spa_step_counter", 0))
             )
             gate_by_steps = counter < spa_steps
-            m._spa_step_counter = counter + 1
-            m._spa_last_sigma = sigma
+            state._spa_step_counter = counter + 1
+            state._spa_last_sigma = sigma
 
         # SIGMA-THRESHOLD GATE (D2a, pre-existing): an additional OPTIONAL gate,
         # AND-combined with the step-count gate.  ``spa_start_sigma >= 1.0`` keeps
         # SPA active on every step (backward-compatible default); otherwise SPA
         # runs only while the current sigma is above the threshold.
-        start_sigma = float(getattr(m, "_spa_start_sigma", 1.0) or 1.0)
+        start_sigma = float(getattr(state, "_spa_start_sigma", 1.0) or 1.0)
         if start_sigma >= 1.0:
             gate_by_sigma = True
         elif sigma is None:
@@ -1306,6 +1406,12 @@ def apply_spa_to_model(
     # time and activates the q pre-scaling for the whole forward.
     prev_proportional = bool(getattr(model, "_hrdit_proportional_attention", False))
     m = model.clone()
+    # CLONE-STATE CARRY-OVER (plan 2026-08-16 G4): the real ``ModelPatcher.clone()``
+    # drops custom attrs, so a HAP-patched source patcher would lose ``_hap_ctx``
+    # here (HAP silently inactive under the SPA wrapper).  Re-apply every
+    # HRDiT-private attr from the SOURCE patcher right after the clone, before any
+    # early return, so node order (HAP->SPA vs SPA->HAP) never changes behaviour.
+    _hrdit_carry_state(model, m)
     m._hrdit_proportional_attention = prev_proportional or bool(proportional_attention)
 
     dm = m.model.diffusion_model

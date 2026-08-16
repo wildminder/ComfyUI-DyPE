@@ -8,6 +8,14 @@
 - T9.2 ``test_e2e_hap_standalone`` — SPA off (``bundle_size=1``), HAP on:
   every step is a single kernel pass whose output equals the dense-mask
   reference, and differs from the no-HAP baseline.
+- T5.1 ``TestE2EAnimaRegression`` — Anima-style cosmos-convention calls
+  (``skip_reshape=True`` + ``transformer_options`` kwargs) through the REAL
+  shared unet wrapper: matching plan engages the kernel (output == dense-mask
+  reference, orig never called); mismatched plan falls back gracefully with a
+  one-time warning (the exact scenario that crashed pre-fix).
+- T5.2 ``test_e2e_cross_attention_mix`` — a forward mixing square self-attn
+  and non-square cross-attn calls: self-attn HAP-masked, cross-attn plain,
+  layer counter advances for BOTH (alignment preserved).
 
 These drive the REAL shared unet wrapper (``_hrdit_install_hook``) with a
 decreasing-sigma schedule so the step-count gate behaves exactly as in a real
@@ -17,6 +25,8 @@ Markers: @pytest.mark.mock_integration
 Accept (user-run):
     pytest tests/test_hap_integration.py -k e2e_spa
     pytest tests/test_hap_integration.py -k e2e_hap_standalone
+    pytest tests/test_hap_integration.py -k anima
+    pytest tests/test_hap_integration.py -k cross_attention
 """
 
 import types
@@ -293,3 +303,220 @@ class TestE2EHapStandalone:
         assert not torch.allclose(out, baseline, atol=1e-6)
         # The wrapper's orig fallback never fired while HAP was live.
         assert orig_calls == []
+
+
+# ---------------------------------------------------------------------------
+# T5.1 / T5.2 — Anima regression e2e (plan 2026-08-16 P5)
+# ---------------------------------------------------------------------------
+
+@pytest.mark.mock_integration
+class TestE2EAnimaRegression:
+    """Anima-style cosmos-convention calls through the REAL shared unet wrapper.
+
+    Anima (``comfy.ldm.cosmos.predict2``) calls ``optimized_attention`` UNMASKED
+    with ``skip_reshape=True`` and ``transformer_options`` as keyword args.  The
+    pre-fix wrapper fed ``skip_reshape`` into the real ``mask`` slot ->
+    ``mask.ndim`` -> ``AttributeError``.  These tests prove the fixed wrapper
+    serves the cosmos convention end-to-end:
+
+    - T5.1 matching plan (heads == q heads): the HAP kernel engages, the output
+      equals the dense-mask reference, and the original attention never fires.
+    - T5.1 mismatched plan (FLUX 24-head plan on a 2-head model): graceful
+      plain-attention fallback, no exception, one-time warning naming both counts.
+    - T5.2 mixed self/cross-attention: self-attn is HAP-masked, cross-attn is
+      plain, and the layer counter advances for BOTH (alignment is sacred).
+    """
+
+    def test_e2e_anima_matching_plan(self, mock_attn):
+        """T5.1 matching: cosmos convention + SPA active + HAP active (heads match)
+        -> kernel engages, output == dense-mask reference, orig never called."""
+        orig_calls = _install_spy_orig(mock_attn)
+        m = _MockModel()
+        m._spa_steps = 1
+        m._spa_start_sigma = 1.0
+        m._hap_ctx = _hap_ctx()  # HEADS=2 == q heads -> kernel engages
+        _hrdit_install_hook(m, "flux", consumer="spa")
+        _hrdit_install_hook(m, "flux", consumer="hap")
+        assert m._hrdit_consumers == {"spa", "hap"}
+
+        q, k, v = _rand_qkv(seed=11)
+        captured = {}
+
+        def model_fn(x, t, **c):
+            set_spa_context(_identity_spa_ctx(num_variants=5))
+            # Cosmos convention: skip_reshape + transformer_options kwargs, NO mask.
+            out = mock_attn.optimized_attention(
+                q, k, v, HEADS, skip_reshape=True, transformer_options={}
+            )
+            captured["out"] = out
+            return x
+
+        m._unet_wrapper(model_fn, {
+            "input": torch.zeros(1),
+            "timestep": torch.tensor(1.0),
+            "c": {},
+        })
+
+        # Identity SPA rotations -> every variant pass is the same HAP-masked
+        # attention, so the averaged output equals the dense-mask reference.
+        out = captured["out"]
+        mask = hap.build_band_mask(SEQ_LEN, 0, [0] * HEADS, 0)
+        ref = hap.hap_attn_dense(q, k, v, mask)
+        assert torch.allclose(out, ref, atol=1e-6)
+        # The original dense attention never fires while HAP is live.
+        assert orig_calls == []
+
+    def test_e2e_anima_mismatched_plan_fallback(self, mock_attn, caplog):
+        """T5.1 mismatched: FLUX plan (24 heads) on a 2-head model -> graceful
+        plain-attention fallback, no exception, one-time warning naming both counts."""
+        import logging
+
+        orig_calls = _install_spy_orig(mock_attn)
+        m = _MockModel()
+        m._spa_steps = 1
+        # FLUX-shaped plan (24 heads) vs q with HEADS=2 -> head-count mismatch.
+        mismatched_plan = hap.ScopePlan(
+            alphas=[[64.0] * 24 for _ in range(NUM_LAYERS)],
+            betas=[[0.0] * 24 for _ in range(NUM_LAYERS)],
+        )
+        m._hap_ctx = hap.HapContext(
+            active=True, plan=mismatched_plan, text_len=0, backend="dense"
+        )
+        _hrdit_install_hook(m, "flux", consumer="hap")
+
+        q, k, v = _rand_qkv(seed=12)
+        captured = {}
+
+        def model_fn(x, t, **c):
+            out = mock_attn.optimized_attention(
+                q, k, v, HEADS, skip_reshape=True, transformer_options={}
+            )
+            captured["out"] = out
+            return x
+
+        with caplog.at_level(logging.WARNING, logger="src.hap"):
+            m._unet_wrapper(model_fn, {
+                "input": torch.zeros(1),
+                "timestep": torch.tensor(1.0),
+                "c": {},
+            })
+
+        # No exception (the pre-fix crash) and a graceful plain-attention fallback.
+        out = captured["out"]
+        baseline = F.scaled_dot_product_attention(q, k, v, scale=1.0)
+        assert torch.allclose(out, baseline, atol=1e-6)
+        # The wrapper fell back to the original attention exactly once.
+        assert len(orig_calls) == 1
+        # One-time warning naming both the plan's and the model's head counts.
+        mismatch = [r for r in caplog.records if "heads" in r.message]
+        assert len(mismatch) == 1
+        assert "24" in mismatch[0].message
+        assert "2" in mismatch[0].message
+
+    def test_e2e_cross_attention_mix(self, mock_attn):
+        """T5.2: a forward mixing square self-attn and non-square cross-attn calls.
+        Self-attn is HAP-masked, cross-attn is plain, and the layer counter advances
+        for BOTH (alignment is sacred)."""
+        orig_calls = _install_spy_orig(mock_attn)
+        m = _MockModel()
+        m._hap_ctx = _hap_ctx()  # HEADS=2 == q heads
+        _hrdit_install_hook(m, "flux", consumer="hap")
+
+        q_self, k_self, v_self = _rand_qkv(seed=21)  # square (SEQ_LEN x SEQ_LEN)
+        g = torch.Generator().manual_seed(22)
+        q_cross = torch.randn(1, HEADS, SEQ_LEN, DIM, generator=g)
+        k_cross = torch.randn(1, HEADS, SEQ_LEN // 2, DIM, generator=g)  # shorter kv
+        v_cross = torch.randn(1, HEADS, SEQ_LEN // 2, DIM, generator=g)
+
+        kernel_calls = []
+        captured = {}
+        real_attn = hap.HapRuntime.attn
+
+        def spy(self, qq, kk, vv, layer, **kw):
+            kernel_calls.append((layer, int(qq.shape[-2]), int(kk.shape[-2])))
+            return real_attn(self, qq, kk, vv, layer, **kw)
+
+        def model_fn(x, t, **c):
+            # Block 0: self-attn (square) then cross-attn (non-square).
+            captured["self0"] = mock_attn.optimized_attention(
+                q_self, k_self, v_self, HEADS, skip_reshape=True
+            )
+            captured["cross0"] = mock_attn.optimized_attention(
+                q_cross, k_cross, v_cross, HEADS, skip_reshape=True
+            )
+            # Block 1: self-attn then cross-attn.
+            mock_attn.optimized_attention(q_self, k_self, v_self, HEADS, skip_reshape=True)
+            mock_attn.optimized_attention(q_cross, k_cross, v_cross, HEADS, skip_reshape=True)
+            return x
+
+        hap.HapRuntime.attn = spy
+        try:
+            m._unet_wrapper(model_fn, {
+                "input": torch.zeros(1),
+                "timestep": torch.tensor(1.0),
+                "c": {},
+            })
+        finally:
+            hap.HapRuntime.attn = real_attn
+
+        # The layer counter advances for BOTH self-attn and cross-attn (0,1,2,3).
+        assert kernel_calls == [
+            (0, SEQ_LEN, SEQ_LEN),          # block 0 self-attn (square)
+            (1, SEQ_LEN, SEQ_LEN // 2),     # block 0 cross-attn (non-square)
+            (2, SEQ_LEN, SEQ_LEN),          # block 1 self-attn (square)
+            (3, SEQ_LEN, SEQ_LEN // 2),     # block 1 cross-attn (non-square)
+        ]
+        # Cross-attn (non-square) declined to plain attention: 2 orig fallbacks.
+        assert len(orig_calls) == 2
+        # Self-attn output is HAP-masked (equals the dense-mask reference).
+        mask = hap.build_band_mask(SEQ_LEN, 0, [0] * HEADS, 0)
+        ref_self = hap.hap_attn_dense(q_self, k_self, v_self, mask)
+        assert torch.allclose(captured["self0"], ref_self, atol=1e-6)
+        # Cross-attn output is plain attention (the pristine SDPA).
+        ref_cross = F.scaled_dot_product_attention(q_cross, k_cross, v_cross, scale=1.0)
+        assert torch.allclose(captured["cross0"], ref_cross, atol=1e-6)
+
+    def test_e2e_anima_spa_cross_attention_no_crash(self, mock_attn):
+        """REGRESSION (2026-08-16): the exact Anima production crash path.
+
+        SPA active (identity variants) + a NON-SQUARE cosmos-convention call
+        (image queries vs text keys) through the REAL shared unet wrapper.
+        Pre-fix this raised ``RuntimeError: einsum(): subscript l has size 512
+        for operand 1 ... previously seen size 6300`` because the averaged
+        passes applied the image-sized RoPE rotations to the text ``k``.  The
+        non-square guard must decline SPA and run plain attention.
+        """
+        m = _MockModel()
+        m._spa_steps = 1
+        m._spa_start_sigma = 1.0
+        _hrdit_install_hook(m, "flux", consumer="spa")
+
+        # Identity SPA variants over the IMAGE query length (SEQ_LEN) — exactly
+        # what PosEmbedSPAAnima registers for the T*H*W grid.
+        q_img = torch.randn(1, HEADS, SEQ_LEN, DIM,
+                            generator=torch.Generator().manual_seed(31))
+        k_text = torch.randn(1, HEADS, SEQ_LEN // 2, DIM,
+                             generator=torch.Generator().manual_seed(32))
+        v_text = torch.randn(1, HEADS, SEQ_LEN // 2, DIM,
+                             generator=torch.Generator().manual_seed(33))
+        captured = {}
+
+        def model_fn(x, t, **c):
+            set_spa_context(_identity_spa_ctx(num_variants=5))
+            # Cosmos convention: skip_reshape kw, NO mask, q_len != k_len.
+            captured["out"] = mock_attn.optimized_attention(
+                q_img, k_text, v_text, HEADS,
+                skip_reshape=True, transformer_options={},
+            )
+            return x
+
+        # Pre-fix: RuntimeError in einsum.  Post-fix: must complete.
+        m._unet_wrapper(model_fn, {
+            "input": torch.zeros(1),
+            "timestep": torch.tensor(1.0),
+            "c": {},
+        })
+
+        # The declined cross-attn call ran PLAIN attention (pristine SDPA).
+        ref = F.scaled_dot_product_attention(q_img, k_text, v_text, scale=1.0)
+        assert torch.allclose(captured["out"], ref, atol=1e-6)

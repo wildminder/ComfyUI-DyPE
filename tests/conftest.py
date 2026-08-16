@@ -104,10 +104,23 @@ def _install_mock_attention_module():
         "comfy.ldm.modules.attention", types.ModuleType("comfy.ldm.modules.attention")
     )
 
-    def _sdpa(q, k, v, heads, skip_reshape=False, mask=None, transformer_options=None, **kw):
+    # REAL ComfyUI signature (comfy/ldm/modules/attention.py::attention_pytorch):
+    #   (q, k, v, heads, mask=None, attn_precision=None,
+    #    skip_reshape=False, skip_output_reshape=False, **kwargs)
+    # The mock MUST mirror it bit-for-bit (positional slots 5-8) — the pre-fix
+    # mock inverted ``skip_reshape``/``mask`` and therefore never caught the
+    # wrapper's positional mis-forwarding (closed-loop mock-fidelity failure,
+    # plan 2026-08-16 G2).  A conformance tripwire lives in
+    # tests/test_orig_call_convention.py.
+    def _sdpa(q, k, v, heads, mask=None, attn_precision=None,
+              skip_reshape=False, skip_output_reshape=False, **kwargs):
         return F.scaled_dot_product_attention(q, k, v, scale=1.0, dropout_p=0.0, is_causal=False)
 
     attn_mod.optimized_attention = _sdpa
+    # Real ComfyUI aliases the masked symbol to the SAME function
+    # (attention.py: ``optimized_attention_masked = optimized_attention``).
+    # Mirror the alias so masked-backend bindings (Krea-2/Qwen/Z-Image) resolve.
+    attn_mod.optimized_attention_masked = _sdpa
     yield attn_mod
 
 

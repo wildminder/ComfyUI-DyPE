@@ -374,3 +374,206 @@ class TestTextLenDerivation:
         q2, k2, v2 = _rand_qkv(S=192, seed=8)
         mock_attn.optimized_attention(q2, k2, v2, 2)
         assert runtime.prepare_count == 2
+
+
+# ---------------------------------------------------------------------------
+# T4.1 — clone-state carry-over helper (plan 2026-08-16 G4)
+# ---------------------------------------------------------------------------
+
+@pytest.mark.unit
+class TestCarryState:
+    """Unit tests for :func:`src.spa._hrdit_carry_state` (plan G4/T4.1)."""
+
+    def test_copies_every_listed_attr_when_present(self):
+        from src.spa import _HRDIT_PATCHER_ATTRS, _hrdit_carry_state
+
+        class _P:
+            pass
+
+        src, dst = _P(), _P()
+        sentinel = object()
+        for attr in _HRDIT_PATCHER_ATTRS:
+            if attr == "_hrdit_state_ref":
+                setattr(src, attr, [src])  # a real 1-element ref list
+            else:
+                setattr(src, attr, sentinel)
+        _hrdit_carry_state(src, dst)
+        for attr in _HRDIT_PATCHER_ATTRS:
+            assert hasattr(dst, attr), f"{attr} was not carried"
+            if attr == "_hrdit_state_ref":
+                # The ref is re-pointed to the NEW authoritative patcher (dst).
+                assert getattr(dst, attr)[0] is dst
+            else:
+                assert getattr(dst, attr) is sentinel
+
+    def test_copies_nothing_when_absent(self):
+        from src.spa import _HRDIT_PATCHER_ATTRS, _hrdit_carry_state
+
+        class _P:
+            pass
+
+        src, dst = _P(), _P()
+        _hrdit_carry_state(src, dst)
+        for attr in _HRDIT_PATCHER_ATTRS:
+            assert not hasattr(dst, attr), f"{attr} should not be created"
+
+    def test_no_raise_on_bare_objects(self):
+        from src.spa import _hrdit_carry_state
+
+        class _P:
+            pass
+
+        # Must not raise on objects with no HRDiT state at all.
+        _hrdit_carry_state(_P(), _P())
+
+    def test_state_ref_repointed_to_dst(self):
+        """Carrying a state ref re-points its single slot to the new patcher."""
+        from src.spa import _hrdit_carry_state
+
+        class _P:
+            pass
+
+        src, dst = _P(), _P()
+        ref = [src]
+        src._hrdit_state_ref = ref
+        _hrdit_carry_state(src, dst)
+        # dst shares the SAME list object, now pointing at dst.
+        assert dst._hrdit_state_ref is ref
+        assert ref[0] is dst
+
+
+# ---------------------------------------------------------------------------
+# Non-square guard (2026-08-16 Anima cross-attention crash fix)
+# ---------------------------------------------------------------------------
+
+@pytest.mark.mock_integration
+class TestSpaNonSquareGuard:
+    """SPA must decline non-square (cross-attention) calls and run plain attention.
+
+    Anima (cosmos.predict2) runs cross-attention — image queries (T*H*W tokens)
+    against text/context keys — through the SAME patched ``optimized_attention``
+    symbol.  The averaged passes apply the spatial RoPE rotations to BOTH q and
+    k, which is only valid for square self-attention; pre-fix the einsum
+    broadcast crashed (``subscript l has size 512 for operand 1 ... previously
+    seen size 6300``).  The guard declines SPA for q_len != k_len.
+    """
+
+    def _spa_ctx_len(self, L, N=5, D=16):
+        """An active SPA context whose variant rotations span ``L`` tokens."""
+        try:
+            from tests._spa_math_helpers import angles_to_blocks
+        except ImportError:
+            from _spa_math_helpers import angles_to_blocks
+
+        P = D // 2
+        g = torch.Generator().manual_seed(0)
+        base = torch.randn(L, P, generator=g) * 0.3
+        variants = [torch.randn(L, P, generator=g) * 0.3 for _ in range(N)]
+        base_R = angles_to_blocks(base)[None, None]
+        variant_Rs = [angles_to_blocks(a)[None, None] for a in variants]
+        return SPAContext(active=True, bundle_size=3, base_pe=base_R,
+                          variant_pes=variant_Rs, pre_roped=True, fmt="flux",
+                          model_key=0, text_len=0)
+
+    def test_nonsquare_call_declines_spa_no_crash(self, mock_attn):
+        """q_len=128 vs k_len=64 (cross-attn) -> plain attention, no einsum crash."""
+        import torch.nn.functional as F
+
+        m = _MockModel()
+        _hrdit_install_hook(m, "flux", consumer="spa")
+        set_spa_context(self._spa_ctx_len(L=128))
+
+        g = torch.Generator().manual_seed(1)
+        q = torch.randn(1, 2, 128, 16, generator=g)   # image queries
+        k = torch.randn(1, 2, 64, 16, generator=g)    # text/context keys
+        v = torch.randn(1, 2, 64, 16, generator=g)
+        # Pre-fix this raised RuntimeError in einsum; now it must return plain attention.
+        out = mock_attn.optimized_attention(q, k, v, 2)
+        ref = F.scaled_dot_product_attention(q, k, v, scale=1.0)
+        assert torch.allclose(out, ref, atol=1e-6)
+
+    def test_nonsquare_decline_is_one_time_debug(self, mock_attn, caplog):
+        """The non-square decline logs at most ONE debug line per SPA context."""
+        import logging
+
+        m = _MockModel()
+        _hrdit_install_hook(m, "flux", consumer="spa")
+        ctx = self._spa_ctx_len(L=128)
+        set_spa_context(ctx)
+
+        g = torch.Generator().manual_seed(2)
+        q = torch.randn(1, 2, 128, 16, generator=g)
+        k = torch.randn(1, 2, 64, 16, generator=g)
+        v = torch.randn(1, 2, 64, 16, generator=g)
+        with caplog.at_level(logging.DEBUG, logger="ComfyUI-DyPE"):
+            mock_attn.optimized_attention(q, k, v, 2)
+            mock_attn.optimized_attention(q, k, v, 2)  # second call must be silent
+        nonsquare = [r for r in caplog.records if "non-square" in r.message]
+        assert len(nonsquare) == 1
+
+    def test_nonsquare_counter_still_advances(self, mock_attn):
+        """The layer counter advances for declined cross-attn calls (alignment)."""
+        m = _MockModel()
+        _hrdit_install_hook(m, "flux", consumer="spa")
+        set_spa_context(self._spa_ctx_len(L=128))
+
+        g = torch.Generator().manual_seed(3)
+        q = torch.randn(1, 2, 128, 16, generator=g)
+        k = torch.randn(1, 2, 64, 16, generator=g)
+        v = torch.randn(1, 2, 64, 16, generator=g)
+        mock_attn.optimized_attention(q, k, v, 2)
+        mock_attn.optimized_attention(q, k, v, 2)
+        assert get_hrdit_layer_idx() == 2
+
+    def test_square_call_still_runs_spa(self, mock_attn):
+        """Square self-attention (q_len == k_len) is unaffected by the guard."""
+        from src.spa_attn import apply_rope_matrix
+
+        m = _MockModel()
+        _hrdit_install_hook(m, "flux", consumer="spa")
+        ctx = self._spa_ctx_len(L=128)
+        set_spa_context(ctx)
+
+        g = torch.Generator().manual_seed(4)
+        q = torch.randn(1, 2, 128, 16, generator=g)
+        k = torch.randn(1, 2, 128, 16, generator=g)
+        v = torch.randn(1, 2, 128, 16, generator=g)
+        q_base = apply_rope_matrix(q, ctx.base_pe, "flux")
+        k_base = apply_rope_matrix(k, ctx.base_pe, "flux")
+        out = mock_attn.optimized_attention(q_base, k_base, v, 2)
+        # SPA active -> averaged output differs from plain attention of the
+        # base-RoPE'd inputs (the variants perturb the rotations).
+        import torch.nn.functional as F
+
+        plain = F.scaled_dot_product_attention(q_base, k_base, v, scale=1.0)
+        assert not torch.allclose(out, plain, atol=1e-6)
+
+    def test_mixed_self_and_cross_forward(self, mock_attn):
+        """A forward mixing square self-attn and non-square cross-attn: self-attn
+        runs SPA, cross-attn runs plain, and the counter advances for BOTH."""
+        import torch.nn.functional as F
+
+        m = _MockModel()
+        _hrdit_install_hook(m, "flux", consumer="spa")
+        ctx = self._spa_ctx_len(L=128)
+        set_spa_context(ctx)
+
+        g = torch.Generator().manual_seed(5)
+        q_self = torch.randn(1, 2, 128, 16, generator=g)
+        k_self = torch.randn(1, 2, 128, 16, generator=g)
+        v_self = torch.randn(1, 2, 128, 16, generator=g)
+        q_cross = torch.randn(1, 2, 128, 16, generator=g)
+        k_cross = torch.randn(1, 2, 64, 16, generator=g)
+        v_cross = torch.randn(1, 2, 64, 16, generator=g)
+
+        # Block: self-attn (square) then cross-attn (non-square), twice.
+        out_cross = None
+        for _ in range(2):
+            mock_attn.optimized_attention(q_self, k_self, v_self, 2)
+            out_cross = mock_attn.optimized_attention(q_cross, k_cross, v_cross, 2)
+
+        # Counter advanced for BOTH call kinds (4 calls total).
+        assert get_hrdit_layer_idx() == 4
+        # Cross-attn output is plain attention (SPA declined).
+        ref_cross = F.scaled_dot_product_attention(q_cross, k_cross, v_cross, scale=1.0)
+        assert torch.allclose(out_cross, ref_cross, atol=1e-6)

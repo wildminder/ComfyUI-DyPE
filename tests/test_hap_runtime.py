@@ -551,3 +551,124 @@ class TestHapRuntime:
         # Full-attention plan (huge alpha) -> ratio ~ 1.
         full = hap.ScopePlan(alphas=[[10**9]], betas=[[0.0]])
         assert hap.flops_ratio(full, seq_len=2048, text_len=0) == pytest.approx(1.0)
+
+
+# ---------------------------------------------------------------------------
+# T3.1/T3.2 — Decline guards (plan 2026-08-16 G3)
+# ---------------------------------------------------------------------------
+
+@pytest.mark.unit
+class TestDeclineGuards:
+    """HAP must DECLINE (return None -> plain attention) — never crash, never
+    silent wrong math — for calls its square, plan-shaped mask cannot serve:
+
+    * non-square attention (cross-attention, ``kv_len != q_len``), and
+    * head-count mismatch (scope plan heads != model heads).
+
+    Both decline with a one-time log latch (reset by ``HapRuntime.reset()``).
+    """
+
+    def setup_method(self):
+        hap.HapRuntime.reset()
+
+    def teardown_method(self):
+        from src.spa_context import set_hap_context
+
+        set_hap_context(None)
+        hap.HapRuntime.reset()
+
+    def _ctx(self, num_layers=3, num_heads=2, backend="dense"):
+        plan = hap.ScopePlan(
+            alphas=[[64.0] * num_heads for _ in range(num_layers)],
+            betas=[[0.0] * num_heads for _ in range(num_layers)],
+        )
+        return hap.HapContext(active=True, plan=plan, text_len=0, backend=backend)
+
+    def test_nonsquare_cross_attention_returns_none(self):
+        """Cross-attention (kv_len != q_len) -> None (plain-attention fallback)."""
+        from src.spa_context import set_hap_context
+
+        ctx = self._ctx(num_heads=2)
+        set_hap_context(ctx)
+        runtime = hap.HapRuntime.get()
+        # q has 64 tokens, k/v have 32 (cross-attention).
+        g = torch.Generator().manual_seed(30)
+        q = torch.randn(1, 2, 64, 16, generator=g)
+        k = torch.randn(1, 2, 32, 16, generator=g)
+        v = torch.randn(1, 2, 32, 16, generator=g)
+        assert runtime.attn(q, k, v, 0) is None
+
+    def test_nonsquare_decline_is_one_time_debug(self, caplog):
+        """The non-square decline logs at most ONE debug line per runtime."""
+        import logging
+
+        from src.spa_context import set_hap_context
+
+        ctx = self._ctx(num_heads=2)
+        set_hap_context(ctx)
+        runtime = hap.HapRuntime.get()
+        g = torch.Generator().manual_seed(31)
+        q = torch.randn(1, 2, 64, 16, generator=g)
+        k = torch.randn(1, 2, 32, 16, generator=g)
+        v = torch.randn(1, 2, 32, 16, generator=g)
+        with caplog.at_level(logging.DEBUG, logger="src.hap"):
+            runtime.attn(q, k, v, 0)
+            runtime.attn(q, k, v, 1)  # second call must be silent
+        nonsquare = [r for r in caplog.records if "non-square" in r.message]
+        assert len(nonsquare) == 1
+
+    def test_head_mismatch_returns_none(self):
+        """Plan with 24 heads vs q with 16 heads -> None (wrong plan for model)."""
+        from src.spa_context import set_hap_context
+
+        ctx = self._ctx(num_heads=24)  # FLUX plan shape
+        set_hap_context(ctx)
+        runtime = hap.HapRuntime.get()
+        q, k, v = _rand_qkv(H=16, S=64, seed=32)  # Anima runs 16 heads
+        assert runtime.attn(q, k, v, 0) is None
+
+    def test_head_mismatch_decline_is_one_time_warning(self, caplog):
+        """The head-mismatch decline logs ONE warning naming both counts."""
+        import logging
+
+        from src.spa_context import set_hap_context
+
+        ctx = self._ctx(num_heads=24)
+        set_hap_context(ctx)
+        runtime = hap.HapRuntime.get()
+        q, k, v = _rand_qkv(H=16, S=64, seed=33)
+        with caplog.at_level(logging.WARNING, logger="src.hap"):
+            runtime.attn(q, k, v, 0)
+            runtime.attn(q, k, v, 1)  # second call must be silent
+        mismatch = [r for r in caplog.records if "heads" in r.message]
+        assert len(mismatch) == 1
+        # The warning names both the plan's and the model's head counts.
+        assert "24" in mismatch[0].message
+        assert "16" in mismatch[0].message
+
+    def test_matching_heads_unaffected(self):
+        """Matching head count still engages the kernel (existing behaviour)."""
+        from src.spa_context import set_hap_context
+
+        ctx = self._ctx(num_heads=2)
+        set_hap_context(ctx)
+        runtime = hap.HapRuntime.get()
+        q, k, v = _rand_qkv(H=2, S=64, seed=34)
+        out = runtime.attn(q, k, v, 0)
+        assert out is not None and out.shape == q.shape
+
+    def test_decline_latches_reset_by_runtime_reset(self):
+        """``HapRuntime.reset()`` drops the singleton -> fresh latches."""
+        from src.spa_context import set_hap_context
+
+        ctx = self._ctx(num_heads=24)
+        set_hap_context(ctx)
+        r1 = hap.HapRuntime.get()
+        q, k, v = _rand_qkv(H=16, S=64, seed=35)
+        r1.attn(q, k, v, 0)
+        assert r1._warned_head_mismatch is True
+        hap.HapRuntime.reset()
+        r2 = hap.HapRuntime.get()
+        assert r2 is not r1
+        assert r2._warned_head_mismatch is False
+        assert r2._warned_nonsquare is False

@@ -525,6 +525,11 @@ class HapRuntime:
         self.prepare_count = 0
         self._flex_kernel = None
         self._warned_off = False
+        # One-time decline latches (plan 2026-08-16 G3).  Reset implicitly by
+        # :meth:`reset` (the singleton is dropped, so a fresh instance starts
+        # with fresh latches — test hygiene).
+        self._warned_nonsquare = False
+        self._warned_head_mismatch = False
 
     @classmethod
     def get(cls) -> "HapRuntime":
@@ -622,6 +627,39 @@ class HapRuntime:
             )
             return None
 
+        # DECLINE GUARDS (plan 2026-08-16 G3): never crash, never silent wrong
+        # math — decline to plain attention when the call cannot be served by the
+        # square, plan-shaped HAP mask.
+        #
+        # 1. Non-square attention (cross-attention): every Anima block runs
+        #    self-attn AND cross-attn through the same patched symbol; cross-attn
+        #    has kv_len != q_len, which the square band mask cannot serve.
+        #    Structural and expected on Anima -> one-time DEBUG.
+        if k.shape[-2] != q.shape[-2]:
+            if not self._warned_nonsquare:
+                logger.debug(
+                    "HAP: non-square attention (q_len=%d kv_len=%d, e.g. "
+                    "cross-attention) cannot use the square scope mask; using "
+                    "plain attention for these calls.",
+                    q.shape[-2], k.shape[-2],
+                )
+                self._warned_nonsquare = True
+            return None
+        # 2. Head-count mismatch: the scope plan is model-specific (the shipped
+        #    plan is FLUX 57x24; Anima runs 16 heads).  Engaging the mask with a
+        #    different head count is undefined -> decline with a one-time
+        #    WARNING naming both counts (actionable: wrong plan for this model).
+        if q.shape[1] != ctx.plan.num_heads:
+            if not self._warned_head_mismatch:
+                logger.warning(
+                    "HAP: scope plan has %d heads but the model runs %d heads; "
+                    "the plan does not match this model — using plain attention. "
+                    "Calibrate a model-specific scope plan to enable HAP.",
+                    ctx.plan.num_heads, q.shape[1],
+                )
+                self._warned_head_mismatch = True
+            return None
+
         seq_len = q.shape[-2]
         eff_text_len = ctx.text_len if text_len is None else int(text_len)
         eff_text_len = max(0, min(eff_text_len, seq_len))
@@ -684,7 +722,7 @@ def apply_hap_to_model(
     path to a JSON file.  ``enable_hap=False`` returns the clone with no
     wrapper and no context (transparent passthrough).
     """
-    from .spa import _hrdit_install_hook, _spa_resolve_type
+    from .spa import _hrdit_carry_state, _hrdit_install_hook, _spa_resolve_type
 
     # PROPORTIONAL ATTENTION SCALING (plan P7/T7.3): OR-semantics — either the
     # SPA or the HAP node may enable it.  The real ``ModelPatcher.clone()``
@@ -696,6 +734,13 @@ def apply_hap_to_model(
     # time and activates the q pre-scaling for the whole forward.
     prev_proportional = bool(getattr(model, "_hrdit_proportional_attention", False))
     m = model.clone()
+    # CLONE-STATE CARRY-OVER (plan 2026-08-16 G4): the real ``ModelPatcher.clone()``
+    # drops custom attrs, so an SPA-patched source patcher would lose
+    # ``_spa_steps`` / ``_spa_layer_filter`` / ``_spa_installed`` here (SPA gating
+    # silently reset + the shared install fast path missed).  Re-apply every
+    # HRDiT-private attr from the SOURCE patcher right after the clone, before any
+    # early return, so node order (SPA->HAP vs HAP->SPA) never changes behaviour.
+    _hrdit_carry_state(model, m)
     m._hrdit_proportional_attention = prev_proportional or bool(proportional_attention)
     dm = m.model.diffusion_model
     detected_type = _spa_resolve_type(model_type, dm)

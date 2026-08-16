@@ -76,10 +76,15 @@ def _ensure_mock_attention_module():
         sys.modules.setdefault(name, types.ModuleType(name))
     attn_mod = types.ModuleType("comfy.ldm.modules.attention")
 
-    def _sdpa(q, k, v, heads, skip_reshape=False, mask=None, transformer_options=None, **kw):
+    # REAL ComfyUI signature (attention.py::attention_pytorch) — positional slots
+    # 5-8 == mask, attn_precision, skip_reshape, skip_output_reshape.  Must mirror
+    # the test conftest mock (plan 2026-08-16 G2 mock-fidelity fix).
+    def _sdpa(q, k, v, heads, mask=None, attn_precision=None,
+              skip_reshape=False, skip_output_reshape=False, **kwargs):
         return F.scaled_dot_product_attention(q, k, v, scale=1.0, dropout_p=0.0, is_causal=False)
 
     attn_mod.optimized_attention = _sdpa
+    attn_mod.optimized_attention_masked = _sdpa  # real alias (attention.py:883)
     sys.modules["comfy.ldm.modules.attention"] = attn_mod
     sys.modules["comfy.ldm.modules"].attention = attn_mod
     return attn_mod
