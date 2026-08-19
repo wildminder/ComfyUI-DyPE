@@ -491,3 +491,88 @@ class TestCalibrateScopePlan:
         bad_compute = [torch.zeros(1, 1, dtype=torch.float64), compute[1]]
         with pytest.raises(ValueError):
             calibrate_scope_plan(quality, bad_compute)
+
+    # ------------------------------------------------------------------
+    # NaN/inf sanitize safety net (bf16 overflow root cause)
+    # ------------------------------------------------------------------
+
+    def test_calibrate_sanitizes_all_nan_quality_table(self):
+        """SAFETY NET: an all-NaN quality table (the live Krea2 crash — layer 0
+        had 960 NaN of 960) must NOT raise 'No feasible HAP scope assignment'.
+        The sanitizer replaces NaN with a large finite penalty so the solver
+        degrades gracefully and returns a valid assignment.
+
+        budget_ratio=1.0 is used to guarantee cost feasibility for this small
+        geometry, isolating the sanitize behaviour from budget feasibility
+        (diag #3 proved NaN alone makes the solver raise even with ample
+        budget)."""
+        H, S = 4, 6
+        compute = [calibration_cost_table(H, 256, text_len=64, num_scopes=S)]
+        all_nan = torch.full((H, S), float("nan"), dtype=torch.float64)
+
+        # Before the fix this raised RuntimeError("No feasible ...").
+        plan_dict = calibrate_scope_plan([[all_nan]], compute, budget_ratio=1.0)
+
+        assert set(plan_dict.keys()) == {"alphas", "betas"}
+        plan = hap.ScopePlan.from_dict(plan_dict)  # validates eagerly
+        assert plan.num_layers == 1
+        assert plan.num_heads == H
+        # Every beta is a valid scope_to_beta value.
+        for b in plan_dict["betas"][0]:
+            assert 0.0 < b <= 1.0
+
+    def test_calibrate_sanitizes_partial_nan_quality_table(self):
+        """SAFETY NET: a partially-NaN quality table (some heads poisoned, some
+        finite) must NOT raise.  The sanitizer replaces NaN entries with a
+        penalty; finite entries are preserved so the solver can still pick
+        good scopes for the unpoisoned heads.
+
+        budget_ratio=0.7 is used because the minimum feasible budget for this
+        geometry (seq=256, text_len=64) is ~0.63 (validated by
+        tmp/diag_partial_nan.py); 0.7 is feasible and picks non-trivial
+        scopes, exercising that the solver still differentiates the
+        unpoisoned heads."""
+        H, S = 4, 6
+        compute = [calibration_cost_table(H, 256, text_len=64, num_scopes=S)]
+        quality, _ = _synthetic_stats(num_layers=1, H=H, S=S)
+        table = quality[0][0].clone()
+        # Poison head 0 entirely.
+        table[0, :] = float("nan")
+
+        plan_dict = calibrate_scope_plan([[table]], compute, budget_ratio=0.7)
+
+        assert set(plan_dict.keys()) == {"alphas", "betas"}
+        plan = hap.ScopePlan.from_dict(plan_dict)
+        assert plan.num_heads == H
+
+    def test_calibrate_sanitizes_inf_quality_table(self):
+        """SAFETY NET: an all-inf quality table must NOT raise.  The sanitizer
+        treats inf the same as NaN (replaces with a finite penalty).
+        budget_ratio=1.0 guarantees cost feasibility."""
+        H, S = 4, 6
+        compute = [calibration_cost_table(H, 256, text_len=64, num_scopes=S)]
+        all_inf = torch.full((H, S), float("inf"), dtype=torch.float64)
+
+        plan_dict = calibrate_scope_plan([[all_inf]], compute, budget_ratio=1.0)
+
+        assert set(plan_dict.keys()) == {"alphas", "betas"}
+        plan = hap.ScopePlan.from_dict(plan_dict)
+        assert plan.num_heads == H
+
+    def test_calibrate_sanitize_warning_fires(self, caplog):
+        """The NaN/inf sanitizer must log a WARNING naming the layer and the
+        NaN/inf counts, so a poisoned Taylor table is visible in the ComfyUI
+        console before the solver runs."""
+        import logging
+
+        H, S = 4, 6
+        compute = [calibration_cost_table(H, 256, text_len=64, num_scopes=S)]
+        all_nan = torch.full((H, S), float("nan"), dtype=torch.float64)
+
+        with caplog.at_level(logging.WARNING, logger="ComfyUI-DyPE"):
+            calibrate_scope_plan([[all_nan]], compute, budget_ratio=1.0)
+
+        assert any(
+            "quality table has" in rec.message and "NaN" in rec.message
+            for rec in caplog.records
+        ), "expected the NaN/inf sanitize WARNING to fire"

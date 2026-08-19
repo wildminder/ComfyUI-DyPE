@@ -947,6 +947,12 @@ def _make_hrdit_wrapper(orig, is_masked: bool):
     ``is_masked`` is retained for patch-target bookkeeping and tests but no longer
     changes the call convention (the two real symbols are the same function).
     """
+    # DIAGNOSTIC latch (2026-08-18, krea2 inference shape-mismatch): one-time
+    # log of the HAP output shape vs the caller's output-reshape convention.
+    # Hypothesis: HAP returns head format (B, H, T, D) but the caller (krea2)
+    # expects flattened (B, T, H*D) because it did not pass skip_output_reshape.
+    _shape_diag = [False]
+
     def _wrapper(q, k, v, heads, mask=None, attn_precision=None,
                  skip_reshape=False, skip_output_reshape=False, **kw):
         layer_idx = next_hrdit_layer_idx()
@@ -993,7 +999,35 @@ def _make_hrdit_wrapper(orig, is_masked: bool):
         def _attn(qq, kk, vv):
             out = _hrdit_hap_dispatch(qq, kk, vv, layer_idx, mask)
             if out is not None:
-                return out
+                # OUTPUT-RESHAPE CONVENTION FIX (2026-08-18, krea2 inference
+                # crash ``dim 3: 128 vs 6144``).  ``HapRuntime.attn`` returns
+                # head format ``(B, H, T, D)`` (SDPA / FlexAttention layout),
+                # but the caller's convention — set by ``skip_output_reshape``
+                # — may require FLATTENED ``(B, T, H*D)``.  Krea2 calls
+                # ``optimized_attention_masked(..., skip_reshape=True)`` WITHOUT
+                # ``skip_output_reshape`` (defaults False) and then does
+                # ``out * F.sigmoid(gate)`` where ``gate`` is ``(B, T, H*D)`` —
+                # so it NEEDS the flattened layout.  The pre-fix wrapper returned
+                # the head-format output as-is, crashing the elementwise multiply.
+                #
+                # Mirror the calibration path EXACTLY (hap_calib_node.py:919-923):
+                #   skip_output_reshape=True  -> head format (B, H, T, D) as-is
+                #   skip_output_reshape=False -> flatten to (B, T, H*D)
+                # This fixes both the direct HAP path and the SPA-averaged path
+                # (which averages ``_attn`` results, so each pass is reshaped
+                # before averaging — shape-invariant mean).
+                if not _shape_diag[0]:
+                    _shape_diag[0] = True
+                    logger.debug(
+                        "[HAP shape-diag] HAP returned shape=%s; caller convention: "
+                        "skip_output_reshape=%s (False => flatten to (B, T, H*D)), "
+                        "skip_reshape=%s, heads=%s.",
+                        tuple(out.shape), skip_output_reshape, skip_reshape, heads,
+                    )
+                if skip_output_reshape:
+                    return out  # (B, H, T, D) head format, as the caller wants
+                b, h, t, d = out.shape
+                return out.permute(0, 2, 1, 3).reshape(b, t, h * d)
             # Forward to the ORIGINAL attention with the REAL positional
             # convention: slots 5-8 == mask, attn_precision, skip_reshape,
             # skip_output_reshape.  Everything else (transformer_options, ...)

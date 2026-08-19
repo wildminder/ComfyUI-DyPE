@@ -271,8 +271,10 @@ class TestE2EHapStandalone:
 
         def model_fn(x, t, **c):
             # No SPA context registered -> spa_active is False on every layer.
+            # skip_output_reshape=True -> wrapper returns head format (B, H, T, D)
+            # to match the hap_attn_dense reference below (math comparison).
             for layer in range(NUM_LAYERS):
-                out = mock_attn.optimized_attention(q, k, v, HEADS)
+                out = mock_attn.optimized_attention(q, k, v, HEADS, skip_output_reshape=True)
                 if layer == 0:
                     captured["out"] = out  # capture while HAP ctx is live
             return x
@@ -345,8 +347,11 @@ class TestE2EAnimaRegression:
         def model_fn(x, t, **c):
             set_spa_context(_identity_spa_ctx(num_variants=5))
             # Cosmos convention: skip_reshape + transformer_options kwargs, NO mask.
+            # skip_output_reshape=True -> wrapper returns head format (B, H, T, D)
+            # to match the hap_attn_dense reference below (math comparison).
             out = mock_attn.optimized_attention(
-                q, k, v, HEADS, skip_reshape=True, transformer_options={}
+                q, k, v, HEADS, skip_reshape=True, skip_output_reshape=True,
+                transformer_options={}
             )
             captured["out"] = out
             return x
@@ -438,14 +443,18 @@ class TestE2EAnimaRegression:
 
         def model_fn(x, t, **c):
             # Block 0: self-attn (square) then cross-attn (non-square).
+            # Self-attn: skip_output_reshape=True -> head format (B, H, T, D) to
+            # match the hap_attn_dense reference below (math comparison).
+            # Cross-attn declines HAP (non-square) -> orig fallback (pristine SDPA,
+            # head format) — unaffected by the output-reshape fix.
             captured["self0"] = mock_attn.optimized_attention(
-                q_self, k_self, v_self, HEADS, skip_reshape=True
+                q_self, k_self, v_self, HEADS, skip_reshape=True, skip_output_reshape=True
             )
             captured["cross0"] = mock_attn.optimized_attention(
                 q_cross, k_cross, v_cross, HEADS, skip_reshape=True
             )
             # Block 1: self-attn then cross-attn.
-            mock_attn.optimized_attention(q_self, k_self, v_self, HEADS, skip_reshape=True)
+            mock_attn.optimized_attention(q_self, k_self, v_self, HEADS, skip_reshape=True, skip_output_reshape=True)
             mock_attn.optimized_attention(q_cross, k_cross, v_cross, HEADS, skip_reshape=True)
             return x
 

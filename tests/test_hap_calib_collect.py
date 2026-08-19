@@ -92,6 +92,152 @@ class TestChunkedAttention:
         with pytest.raises(ValueError):
             chunked_attention(q, q, q, chunk=0)
 
+    def test_chunked_bf16_keeps_native_dtype_and_clean_grads(self):
+        """OOM REVERT (2026-08-18): bf16 q/k/v must keep the NATIVE dtype for
+        the attention chunks and their gradients — NOT be up-cast to fp32.
+
+        An earlier revision up-cast to fp32 to "fix" the NaN quality table, but
+        that DOUBLED the retained attention memory (bf16 3.6 GiB -> fp32
+        7.19 GiB at seq=1198/H=48) plus a second fp32 ``.grad`` during
+        ``backward()``, causing an OOM on a 16 GiB card.  De-risking
+        (tmp/diag_oom_redesign.py, Q1) proved the attention-leaf backward
+        ``grad_out @ vᵀ`` is CLEAN in bf16 even at 1e30 scale (bf16 shares
+        fp32's exponent range), so the live NaN is UPSTREAM and up-casting
+        ``A`` cannot fix it.  This test pins the memory-safe behaviour:
+        native dtype preserved, grads clean.
+        """
+        torch.manual_seed(2)
+        B, H, T, D = 1, 2, 16, 4
+        q = torch.randn(B, H, T, D, dtype=torch.bfloat16)
+        k = torch.randn(B, H, T, D, dtype=torch.bfloat16)
+        v = torch.randn(B, H, T, D, dtype=torch.bfloat16)
+        weight = torch.randn(B, H, T, D, dtype=torch.bfloat16)
+
+        out, chunks = chunked_attention(q, k, v, scale=1.0, chunk=5)
+
+        # Output stays in the model's dtype (bf16).
+        assert out.dtype == torch.bfloat16
+        assert out.shape == (B, H, T, D)
+
+        # Chunks keep the native dtype (bf16) — NOT up-cast to fp32 (that
+        # would double the retained memory and OOM).
+        for c in chunks:
+            assert c.dtype == torch.bfloat16, (
+                f"chunk dtype {c.dtype} != bfloat16 — fp32 up-cast would "
+                "double retained attention memory and OOM"
+            )
+
+        # Gradients keep the native dtype and are clean (no NaN/inf) — the
+        # attention-leaf backward is robust in bf16 (same exponent range as
+        # fp32).
+        loss = (out * weight).sum()
+        loss.backward()
+        for c in chunks:
+            assert c.grad is not None
+            assert c.grad.dtype == torch.bfloat16, (
+                f"chunk.grad dtype {c.grad.dtype} != bfloat16"
+            )
+            assert not torch.isnan(c.grad).any(), "NaN in chunk.grad"
+            assert not torch.isinf(c.grad).any(), "inf in chunk.grad"
+
+
+# ---------------------------------------------------------------------------
+# P19 — fp16 logit-overflow fix (live Krea2 run #8 root cause)
+# ---------------------------------------------------------------------------
+#
+# The live run proved: the model runs fp16 with |q|,|k| ~ 600 and head_dim=128,
+# so the fp16 ``q @ kᵀ`` dot product reaches ~128 * 600^2 ~= 4.6e7 — ~700x OVER
+# fp16's max (65504) -> ``inf`` logits -> ``softmax(inf - inf) = NaN`` rows ->
+# the forward NaN cascade.  ComfyUI's own ``attention_basic`` computes
+# ``einsum(q.float(), k.float())`` — logits are ALWAYS fp32 there.  The fix
+# computes logits + softmax in fp32 (transient) and casts ``A`` back to the
+# model dtype for storage (no retained-VRAM increase).
+
+@pytest.mark.unit
+class TestChunkedFp16OverflowFix:
+    def test_fp16_large_magnitude_finite_attention(self):
+        """PRIMARY regression: fp16 q/k with live-scale magnitudes (|q|,|k|
+        in the hundreds, head_dim=128) used to overflow the fp16 ``q @ kᵀ``
+        matmul -> inf logits -> NaN attention.  With the fp32-logits fix the
+        attention chunks and output must be FINITE."""
+        torch.manual_seed(3)
+        B, H, T, D = 1, 2, 32, 128  # head_dim=128 like Krea2
+        # randn * 100 -> element magnitudes in the hundreds; dot products over
+        # 128 dims reach ~1e6, ~20x over fp16's 65504 limit.
+        q = torch.randn(B, H, T, D, dtype=torch.float16) * 100
+        k = torch.randn(B, H, T, D, dtype=torch.float16) * 100
+        v = torch.randn(B, H, T, D, dtype=torch.float16)
+
+        out, chunks = chunked_attention(q, k, v, scale=1.0, chunk=8)
+
+        for c in chunks:
+            assert torch.isfinite(c).all(), "NaN/inf in attention chunk (fp16 logit overflow)"
+        assert torch.isfinite(out).all(), "NaN/inf in attention output"
+
+    def test_fp16_matches_fp32_oracle(self):
+        """The fp16 chunked output matches the SAME inputs computed in fp32
+        (the fp32 path cannot overflow) — the fp32-logits fix makes fp16
+        numerically equivalent to fp32 attention, up to fp16 storage rounding."""
+        torch.manual_seed(4)
+        B, H, T, D = 1, 2, 32, 128
+        q32 = torch.randn(B, H, T, D) * 100
+        k32 = torch.randn(B, H, T, D) * 100
+        v32 = torch.randn(B, H, T, D)
+        q16, k16, v16 = q32.half(), k32.half(), v32.half()
+
+        out32, _ = chunked_attention(q32, k32, v32, scale=1.0, chunk=8)
+        out16, _ = chunked_attention(q16, k16, v16, scale=1.0, chunk=8)
+
+        # fp16 storage rounding of A and v bounds the difference; with the
+        # large logits the attention is near one-hot so out ~ a v row.
+        assert torch.allclose(out16.float(), out32, rtol=2e-2, atol=2.0)
+
+    def test_fp16_large_magnitude_grads_clean(self):
+        """Under live-scale fp16 magnitudes the chunk gradients stay FINITE
+        (the old fp16-matmul path produced NaN grads via the NaN attention)."""
+        torch.manual_seed(5)
+        B, H, T, D = 1, 2, 32, 128
+        q = torch.randn(B, H, T, D, dtype=torch.float16) * 100
+        k = torch.randn(B, H, T, D, dtype=torch.float16) * 100
+        v = torch.randn(B, H, T, D, dtype=torch.float16)
+
+        out, chunks = chunked_attention(q, k, v, scale=1.0, chunk=8)
+        out.sum().backward()
+        for c in chunks:
+            assert c.grad is not None
+            assert torch.isfinite(c.grad).all(), "NaN/inf in chunk.grad"
+
+    def test_fp16_chunks_keep_fp16_dtype(self):
+        """The stored attention chunks stay fp16 (only the TRANSIENT logits are
+        fp32) — the retained-VRAM footprint must NOT double (the reverted P10
+        upcast stored A in fp32 and OOM'd)."""
+        torch.manual_seed(6)
+        B, H, T, D = 1, 2, 16, 128
+        q = torch.randn(B, H, T, D, dtype=torch.float16) * 100
+        k = torch.randn(B, H, T, D, dtype=torch.float16) * 100
+        v = torch.randn(B, H, T, D, dtype=torch.float16)
+        out, chunks = chunked_attention(q, k, v, scale=1.0, chunk=8)
+        assert out.dtype == torch.float16
+        for c in chunks:
+            assert c.dtype == torch.float16, (
+                f"chunk dtype {c.dtype} != float16 — storing A in fp32 would "
+                "double retained attention memory and OOM"
+            )
+
+    def test_fp32_input_not_downcast(self):
+        """fp32 (and fp64) inputs are NEVER down-cast: compute stays in the
+        input dtype and the chunks keep it."""
+        torch.manual_seed(7)
+        B, H, T, D = 1, 2, 16, 8
+        for dt in (torch.float32, torch.float64):
+            q = torch.randn(B, H, T, D, dtype=dt)
+            k = torch.randn(B, H, T, D, dtype=dt)
+            v = torch.randn(B, H, T, D, dtype=dt)
+            out, chunks = chunked_attention(q, k, v, scale=1.0, chunk=4)
+            assert out.dtype == dt
+            for c in chunks:
+                assert c.dtype == dt
+
 
 # ---------------------------------------------------------------------------
 # T6.2 — stats collector over a toy forward
@@ -210,6 +356,81 @@ class TestCollector:
         error (nothing to calibrate)."""
         with pytest.raises(RuntimeError, match="no optimized_attention calls"):
             collect_scope_scores(lambda: torch.zeros(1), lambda o: o.sum(), 4)
+
+
+# ---------------------------------------------------------------------------
+# text_len clamp (Krea2 live crash: band_compute_cost text_len=512 exceeds
+# seq_len=430 — the FLUX-ism text_len knob overruns the observed sequence)
+# ---------------------------------------------------------------------------
+
+@pytest.mark.unit
+class TestCollectorTextLenClamp:
+    def _toy(self, seed=5):
+        from _hrdit_fixtures import make_toy_dit
+        # seq_len = text_len(8) + 4*4 = 24.
+        return make_toy_dit(num_layers=2, heads=3, dim=8, text_len=8,
+                            img_hw=4, seed=seed, dtype=torch.float64)
+
+    def test_clamp_no_crash_when_knob_exceeds_seq(self):
+        """A ``text_len`` knob larger than the observed sequence no longer raises
+        ``ValueError: band_compute_cost: text_len exceeds seq_len``; it returns a
+        valid rectangular table."""
+        num_scopes = 5
+        dit = self._toy()
+        quality, compute = collect_scope_scores(
+            dit.forward, _make_loss_fn(dit), num_scopes, text_len=512,
+            chunk=4096, scale=1.0,
+        )
+        assert quality.shape == (2, 3, num_scopes)
+        assert compute.shape == (2, 3, num_scopes)
+        assert torch.isfinite(quality).all()
+        assert torch.isfinite(compute).all()
+
+    def test_clamp_equals_explicit_boundary(self):
+        """``text_len=512`` (clamped to seq=24) == passing ``text_len=24``
+        explicitly — the clamp is exactly the boundary value."""
+        num_scopes = 5
+        q_clamped, c_clamped = collect_scope_scores(
+            self._toy().forward, _make_loss_fn(self._toy()),
+            num_scopes, text_len=512, chunk=4096, scale=1.0,
+        )
+        q_explicit, c_explicit = collect_scope_scores(
+            self._toy().forward, _make_loss_fn(self._toy()),
+            num_scopes, text_len=24, chunk=4096, scale=1.0,
+        )
+        assert torch.allclose(q_clamped, q_explicit, atol=1e-10)
+        assert torch.allclose(c_clamped, c_explicit, atol=1e-10)
+
+    def test_clamp_logs_warning(self, caplog):
+        """When the knob exceeds the observed sequence, a WARNING names the knob,
+        the observed length, and the clamped value."""
+        import logging
+        dit = self._toy()
+        with caplog.at_level(logging.WARNING, logger="ComfyUI-DyPE"):
+            collect_scope_scores(
+                dit.forward, _make_loss_fn(dit), 4, text_len=512,
+                chunk=4096, scale=1.0,
+            )
+        warns = [r.getMessage() for r in caplog.records
+                 if "exceeds the observed attention" in r.getMessage()]
+        assert len(warns) == 1
+        m = warns[0]
+        assert "512" in m
+        assert "(24)" in m
+        assert "clamped to 24" in m
+
+    def test_no_warning_when_knob_valid(self, caplog):
+        """A ``text_len`` within ``[0, seq]`` triggers NO clamp warning."""
+        import logging
+        dit = self._toy()
+        with caplog.at_level(logging.WARNING, logger="ComfyUI-DyPE"):
+            collect_scope_scores(
+                dit.forward, _make_loss_fn(dit), 4, text_len=8,
+                chunk=4096, scale=1.0,
+            )
+        warns = [r.getMessage() for r in caplog.records
+                 if "exceeds the observed attention" in r.getMessage()]
+        assert warns == []
 
 
 # ---------------------------------------------------------------------------

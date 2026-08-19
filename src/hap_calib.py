@@ -27,12 +27,15 @@ All functions are deterministic and side-effect free.
 
 from __future__ import annotations
 
+import logging
 import math
 from typing import Dict, List, Sequence, Tuple
 
 import torch
 
-from src.hap import HAP_BLOCK, band_blocks, band_compute_cost, half_blocks
+from .hap import HAP_BLOCK, band_blocks, band_compute_cost, half_blocks
+
+logger = logging.getLogger("ComfyUI-DyPE")
 
 __all__ = [
     "taylor_softmax_pruning_score",
@@ -533,6 +536,43 @@ def calibrate_scope_plan(
             [t.detach().to(torch.float64) for t in prompts], dim=0
         ).mean(dim=0)
 
+        # DIAGNOSTIC (false-infeasibility root cause): the knapsack DP treats a
+        # NaN/inf quality entry as "never an improvement" (``NaN < x`` is False),
+        # so a single all-NaN head leaves the DP all-inf and the solver raises
+        # "No feasible HAP scope assignment found" EVEN WHEN THE BUDGET IS AMPLE
+        # (validated: cost/budget feasibility is scale-invariant, and finite
+        # quality — even 1e30 — is always feasible).  Log NaN/inf counts so a
+        # poisoned Taylor table is visible before the solver runs.
+        n_nan = int(torch.isnan(quality_avg).sum().item())
+        n_inf = int(torch.isinf(quality_avg).sum().item())
+        if n_nan or n_inf:
+            logger.warning(
+                "[HAP calib] layer %d quality table has %d NaN and %d inf "
+                "entries (of %d).  NaN/inf Taylor scores poison the knapsack DP "
+                "and cause a false 'No feasible HAP scope assignment' even when "
+                "the budget is sufficient.  This usually comes from bf16 "
+                "attention/gradient overflow feeding the score computation.",
+                layer, n_nan, n_inf, quality_avg.numel(),
+            )
+
+            # SAFETY NET: replace NaN/inf with a large finite penalty so the
+            # solver degrades gracefully instead of crashing.  The penalty is
+            # the max finite score + 1 (or 1e30 if all entries are NaN/inf),
+            # which marks poisoned entries as worst-quality-but-valid.  The
+            # solver will avoid them when possible; if every entry is poisoned
+            # the solver still runs (all entries equal penalty) and returns a
+            # valid assignment.
+            finite_mask = torch.isfinite(quality_avg)
+            if bool(finite_mask.any()):
+                max_finite = float(quality_avg[finite_mask].max().item())
+                penalty = max_finite + 1.0
+            else:
+                penalty = 1e30
+            quality_avg = torch.where(
+                finite_mask, quality_avg,
+                torch.full_like(quality_avg, penalty),
+            )
+
         chosen = solve_multiple_choice_knapsack(
             quality_avg, cc, budget_ratio=budget_ratio, bins=bins
         )
@@ -589,14 +629,41 @@ def chunked_attention(
     if chunk < 1:
         raise ValueError(f"chunk must be >= 1, got {chunk}")
 
+    # NOTE (2026-08-18, P19 — fp32 logits): the live Krea2 run #8 PROVED the
+    # NaN origin: the model runs fp16 with |q|,|k| ~ 600 and head_dim=128, so
+    # the fp16 ``q @ kᵀ`` dot product reaches ~128 * 600^2 ~= 4.6e7 — ~700x
+    # OVER fp16's max (65504) -> ``inf`` logits -> ``softmax(inf - inf) = NaN``
+    # rows -> the forward NaN cascade.  ComfyUI's own ``attention_basic``
+    # avoids this by computing ``einsum(q.float(), k.float())`` — the logits
+    # are ALWAYS fp32 there (flash/SDPA likewise accumulate in fp32).
+    #
+    # Fix: compute the logits + softmax in fp32 (up-casting fp16/bf16 only;
+    # NEVER down-casting fp32/fp64), then cast ``A`` back to the model dtype
+    # for storage and ``A @ v`` (a convex combination of ``v`` — safe in the
+    # model dtype, exactly what flash attention does after its fp32 softmax).
+    #
+    # VRAM: the fp32 logits are TRANSIENT (one chunk at a time, freed each
+    # iteration) and the STORED ``A`` leaves stay in the model dtype, so the
+    # retained footprint is UNCHANGED (3.6 GiB at seq=1198/H=48).  This is the
+    # crucial difference from the reverted P10 upcast, which STORED ``A`` in
+    # fp32 (2x retained memory -> OOM).
     _, _, T, _ = q.shape
+    compute_dtype = (
+        torch.float32
+        if q.dtype in (torch.float16, torch.bfloat16)
+        else q.dtype
+    )
+    k_compute = k.to(compute_dtype)  # cast once, reuse across chunks
     outs: List[torch.Tensor] = []
     chunks: List[torch.Tensor] = []
     for start in range(0, T, chunk):
         end = min(start + chunk, T)
         q_c = q[:, :, start:end, :]                              # (B, H, C, D)
-        logits = torch.matmul(q_c, k.transpose(-1, -2)) * scale  # (B, H, C, T)
-        A = torch.softmax(logits, dim=-1).detach().requires_grad_(True)
+        logits = torch.matmul(
+            q_c.to(compute_dtype), k_compute.transpose(-1, -2)
+        ) * scale                                                # (B, H, C, T) fp32
+        A = torch.softmax(logits, dim=-1)
+        A = A.to(q.dtype).detach().requires_grad_(True)          # stored in model dtype
         out_c = torch.matmul(A, v)                               # (B, H, C, D)
         outs.append(out_c)
         chunks.append(A)
@@ -674,6 +741,29 @@ def collect_scope_scores(
             "calls — nothing to calibrate."
         )
 
+    # OBSERVED GEOMETRY + TEXT_LEN CLAMP (text_len>seq_len root cause).  The
+    # cost model requires ``text_len <= seq_len`` (seq = text + image).  The
+    # node's ``text_len`` knob is a FLUX-ism default (512) that can exceed the
+    # observed sequence when calibration runs at a reduced resolution (OOM
+    # workaround) or the model's real text length is below the knob.  Clamp to
+    # ``[0, seq0]`` — mirroring the HAP runtime's ``max(0, min(text_len,
+    # seq_len))`` (src/hap.py HapRuntime.attn) — so a knob mismatch degrades
+    # gracefully instead of crashing ``band_compute_cost``.  The clamped value
+    # is threaded through BOTH the quality-scoring loop (_chunk_row_scores) and
+    # the cost table so the two stay consistent.
+    heads0 = records[0][0].shape[1]
+    seq0 = records[0][0].shape[3]
+    eff_text_len = max(0, min(int(text_len), seq0))
+    if eff_text_len != int(text_len):
+        logger.warning(
+            "[HAP calib] text_len knob (%d) exceeds the observed attention "
+            "sequence length (%d) — clamped to %d.  This usually means the "
+            "calibration resolution is too small for the configured text_len, "
+            "or the model's real text length is below the knob.  Consider "
+            "raising width/height or lowering text_len.",
+            int(text_len), seq0, eff_text_len,
+        )
+
     quality_layers: List[torch.Tensor] = []
     for li, layer_chunks in enumerate(records):
         heads = layer_chunks[0].shape[1]
@@ -686,18 +776,21 @@ def collect_scope_scores(
                     "gradient — the loss does not depend on it."
                 )
             rows = A_chunk.shape[2]
-            A = A_chunk[0].to(torch.float64)        # (H, C, T)
-            G = A_chunk.grad[0].to(torch.float64)   # (H, C, T)
-            acc = acc + _chunk_row_scores(A, G, num_scopes, text_len, offset)
+            # DEVICE-CONSISTENT SCORING: leaves live on the model's device
+            # (cuda:0 in ComfyUI) but ``acc`` and the downstream pipeline are
+            # CPU-resident.  Move A/G to CPU so the accumulation never mixes
+            # devices (``.to(dtype)`` alone preserves device -> cuda:0 vs cpu
+            # crash) and the fp64 intermediates are scored off-GPU.
+            A = A_chunk[0].detach().to(dtype=torch.float64, device="cpu")        # (H, C, T)
+            G = A_chunk.grad[0].detach().to(dtype=torch.float64, device="cpu")   # (H, C, T)
+            acc = acc + _chunk_row_scores(A, G, num_scopes, eff_text_len, offset)
             offset += rows
         quality_layers.append(acc)
     quality_cost = torch.stack(quality_layers, dim=0)  # (L, H, S)
 
     # Prompt-independent compute cost (same for every layer).
-    heads0 = records[0][0].shape[1]
-    seq0 = records[0][0].shape[3]
     cost = calibration_cost_table(
-        heads0, seq0, text_len=text_len, num_scopes=num_scopes
+        heads0, seq0, text_len=eff_text_len, num_scopes=num_scopes
     )  # (H, S)
     compute_cost = cost.unsqueeze(0).expand(quality_cost.shape[0], -1, -1).clone()
 

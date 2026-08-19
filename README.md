@@ -172,15 +172,58 @@ This node provides a seamless, "plug-and-play" integration of DyPE into your wor
 
 ### Calibration
 
-The shipped `configs/scope_plan_flux.json` is the reference FLUX plan and works out of the box. To calibrate a plan for another model or budget, use [`calibration/calibrate_hap.py`](calibration/calibrate_hap.py):
+The shipped `configs/scope_plan_flux.json` is the reference FLUX plan and works out of the box. To calibrate a plan for another model or budget, use the **HAP Calibrate (HRDiT)** node in-graph, or the [`calibration/calibrate_hap.py`](calibration/calibrate_hap.py) CLI.
+
+#### HAP Calibrate node (in-graph)
+
+Add the **HAP Calibrate (HRDiT)** node (under `model_patches/position_encoding`) and wire it:
+
+```
+Model loader ──► HAP Calibrate ──► (scope_plan) ──► HAP node
+CLIP Text Encode (pos) ──► HAP Calibrate
+CLIP Text Encode (neg) ──► HAP Calibrate
+```
+
+The node runs the full pipeline in-graph — one denoising-step forward per calibration prompt, chunked differentiable attention to collect per-head Taylor scores, the knapsack solver, and writes the plan JSON to `<output>/dype_hap/`. Its `scope_plan` output links **directly** into the HAP node's `scope_plan` input (no file round-trip needed).
+
+| Input | Default | Description |
+|-------|---------|-------------|
+| `model` | — | The model to calibrate. Must be the **same model + resolution** you will run HAP on. Do **not** connect a HAP-patched model (calibrate unpruned). |
+| `positive` / `negative` | — | Conditioning from CLIP Text Encode nodes. Keep `positive` representative of your typical prompts. |
+| `width` / `height` | 1024 | Calibration resolution. Calibrate at ≤ 2K (memory); reuse the plan at higher resolutions. |
+| `prompts` | (built-in) | Calibration prompts, one per line. Empty = built-in default list (5 prompts). Paper uses 30. |
+| `prompts_file` | `""` | Optional text file with one prompt per line (overrides `prompts`). Relative paths resolve against the ComfyUI-DyPE folder. |
+| `num_prompts` | 5 | Number of calibration prompts to actually run (first N of the list). Paper: 30. |
+| `num_scopes` | 50 | Candidate scopes `N_scope`. Paper: 50. More scopes = finer granularity but slower solver. |
+| `budget_ratio` | 0.10 | Attention cost ratio `r_c` (fraction of full-attention compute retained). Paper: 0.1. Lower = faster but more pruning. |
+| `bins` | 4000 | Knapsack discretization resolution. |
+| `chunk` | 256 | Query rows per calibration chunk (memory knob; result-invariant). Lower = less VRAM but slower. |
+| `text_len` | 512 | Number of leading text tokens (never pruned). 512 = FLUX convention. |
+| `anchor_stride` | 32 | Global anchor blocks in the cost model. 32 = HRDiT default. 0 = off. |
+| `calib_sigma` | 1.0 | Denoising sigma for the single calibration step. 1.0 = first step (max noise). |
+| `seed` | 3407 | Noise seed base (prompt `i` uses `seed + i`). |
+| `loss_type` | `output_norm` | `output_norm` = MSE of the denoised prediction vs zero (no external data). `reference_mse` = MSE vs a reference latent (connect `reference_latent`). |
+| `reference_latent` | — | Target latent for `reference_mse` loss (e.g. an encoded real image). Only needed when `loss_type='reference_mse'`. |
+| `output_name` | `scope_plan_calibrated.json` | JSON file name inside `<output>/dype_hap/`. |
+| `run` | True | Master switch. False = return empty plan without running (for safe graph wiring). |
+
+**Outputs:** `scope_plan` (link into the HAP node), `plan_path` (absolute path of the written JSON), `summary` (human-readable report).
+
+> **Calibrate once per model + resolution, then reuse the plan.** The plan is a plain JSON keyed by `(layers, heads)`; it is valid across prompts and (approximately) across resolutions. Do not leave the calibrate node in your generation graph — run it once, then wire the saved plan (or the `scope_plan` output) into the HAP node and disable/remove the calibrate node.
+
+#### CLI alternative
 
 ```bash
 # Self-contained dry run (toy model, no ComfyUI/GPU needed) — validates the full pipeline:
 python calibration/calibrate_hap.py --dry_run --out tmp/scope_plan_toy.json
 
-# Real-model calibration (requires wiring run_real() to your model + prompts — see the script docstring):
-python calibration/calibrate_hap.py --scope_plan_path out/plan.json --num_prompts 30 --budget_ratio 0.1
+# Real-model calibration (requires the ComfyUI venv + a GPU):
+python calibration/calibrate_hap.py --model_path /path/to/flux.safetensors \
+    --model_type flux --width 4096 --height 4096 --num_prompts 30 \
+    --out configs/scope_plan_flux_4k.json
 ```
+
+The CLI's real-model path delegates to the **same** orchestrator the node uses (`run_hap_calibration`), so the two can never drift.
 
 *   **Cost:** one forward + backward pass per prompt (the chunked collector never materializes a dense `T×T` attention matrix — ~68 MB per query-row chunk at 4K).
 *   **Reuse:** a plan is a plain JSON keyed by `(layers, heads)`; reuse it across resolutions and prompts. The solver's `budget_ratio` (default `0.1` = 10% of full-attention compute) trades speed vs. quality.
@@ -208,6 +251,7 @@ The SPA node's `spa_layer_filter` restricts the averaged-pass SPA to a subset of
 | HAP runtime (per-head scopes + FlexAttention) | ✅ |
 | HAP calibration (Taylor-softmax scoring) | ✅ |
 | HAP solver (multiple-choice knapsack) | ✅ |
+| HAP Calibrate node (in-graph calibration) | ✅ |
 | Proportional attention scaling | ✅ |
 | Per-layer SPA filter | ✅ |
 | Cascaded SPA→HAP step schedule | ⚠️ workflow-level (compose SPA `spa_steps` + HAP manually) |
@@ -352,6 +396,14 @@ fallback; the VAE-space path is the recommended default).
 > performs its own CFG and prediction-type conversion (EPS, CONST/flow, V_PREDICTION, X0).
 
 ## Changelog
+
+#### v2.8.0 — HAP Calibrate node (in-graph scope-plan calibration) (2026-08-16)
+*   **New `HAP Calibrate (HRDiT)` node:** runs the full HAP scope-plan calibration pipeline in-graph — one denoising-step forward per calibration prompt, chunked differentiable attention to collect per-head Taylor scores, the multiple-choice knapsack solver, and writes the plan JSON to `<output>/dype_hap/`. Its `scope_plan` output links **directly** into the HAP node's new `scope_plan` input (no file round-trip needed).
+*   **HAP node gained an optional `scope_plan` input** (`SCOPE_PLAN` custom type): when connected, it overrides `scope_plan_path`. The node prefers the linked plan, falling back to the path.
+*   **Backend-aware calibration collector:** patches the same backend-specific bound attention symbols as SPA (`_spa_patch_targets`) plus the module-global, so calibration fires for real ComfyUI DiT backends that captured the symbol at import time. Non-square (cross-attention), masked, and GQA calls pass through unrecorded by design.
+*   **Gradient-safe forward:** calibration calls `comfy.samplers.sampling_function` (not `no_grad`-decorated) under `torch.enable_grad()` — all k_diffusion samplers are `@torch.no_grad()`, so `comfy.sample.sample` would block gradient flow to the attention leaves.
+*   **CLI `run_real` implemented:** `calibration/calibrate_hap.py` now loads a checkpoint via ComfyUI and delegates to the same orchestrator the node uses, so the CLI and node can never drift. The node module's pure-math helpers import without `comfy_api` (lazy import) so the CLI dry-run stays standalone.
+*   **103 new/updated calibration tests** across 6 modules (spec validation, loss functions, forward bridge + collector, orchestrator, persistence, node schema/execute).
 
 #### v2.7.1 — Anima crash fix + HAP decline-guards + node-order independence (2026-08-16)
 *   **Fixed the Anima `AttributeError: 'bool' object has no attribute 'ndim'` crash:** the HRDiT attention wrapper now mirrors the real ComfyUI `optimized_attention` signature bit-for-bit (`mask`, `attn_precision`, `skip_reshape`, `skip_output_reshape` in positional slots 5–8) and forwards `orig()` with the correct positional order — the pre-fix wrapper fed `skip_reshape` into the `mask` slot on the unmasked (Anima/cosmos) path.

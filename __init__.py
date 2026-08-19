@@ -3,6 +3,7 @@ import os
 import torch
 from comfy_api.latest import ComfyExtension, io
 from .src.hap import ScopePlan, apply_hap_to_model
+from .src.hap_calib_node import HAPCalibrate
 from .src.patch_utils import apply_dype_to_model, apply_sega_to_model
 from .src.spa import apply_spa_to_model
 from .src.pixelrush_node import PixelRushNode
@@ -370,10 +371,15 @@ class HAP(io.ComfyNode):
                     "model",
                     tooltip="The model to patch with HAP.",
                 ),
+                io.Custom("SCOPE_PLAN").Input(
+                    "scope_plan",
+                    optional=True,
+                    tooltip="Calibrated scope plan linked from the 'HAP Calibrate' node. When connected, it OVERRIDES scope_plan_path — no file needed.",
+                ),
                 io.String.Input(
                     "scope_plan_path",
                     default="configs/scope_plan_flux.json",
-                    tooltip="Path to the scope-plan JSON (per-layer, per-head alpha/beta). Relative paths resolve against the ComfyUI-DyPE folder. Default ships the reference FLUX plan (57 layers x 24 heads). Generate a plan for your model/resolution with calibration/calibrate_hap.py.",
+                    tooltip="Path to the scope-plan JSON (per-layer, per-head alpha/beta). Relative paths resolve against the ComfyUI-DyPE folder. Default ships the reference FLUX plan (57 layers x 24 heads). Generate a plan for your model/resolution with the 'HAP Calibrate' node or calibration/calibrate_hap.py. Ignored when a scope_plan is linked.",
                 ),
                 io.Combo.Input(
                     "model_type",
@@ -421,22 +427,34 @@ class HAP(io.ComfyNode):
     def execute(cls, model, scope_plan_path: str, model_type: str,
                 anchor_stride: int = 32, text_len: int = 512,
                 enable_hap: bool = True,
-                proportional_attention: bool = False) -> io.NodeOutput:
-        path = scope_plan_path
-        if not os.path.isabs(path):
-            candidate = os.path.join(_DYPE_ROOT, path)
-            if os.path.exists(candidate):
-                path = candidate
-        if not os.path.exists(path):
-            raise FileNotFoundError(
-                f"HAP: scope plan not found: {scope_plan_path!r} (resolved to "
-                f"{path!r}). Provide a path to a scope-plan JSON, or use the "
-                f"shipped default 'configs/scope_plan_flux.json'."
-            )
-        try:
-            plan = ScopePlan.load(path)
-        except ValueError as exc:
-            raise ValueError(f"HAP: invalid scope plan {scope_plan_path!r}: {exc}") from exc
+                proportional_attention: bool = False,
+                scope_plan=None) -> io.NodeOutput:
+        # A linked SCOPE_PLAN object (from the HAP Calibrate node) OVERRIDES
+        # the file path — no disk round-trip needed.
+        if scope_plan is not None:
+            try:
+                plan = ScopePlan.from_dict(scope_plan)
+            except (ValueError, TypeError) as exc:
+                raise ValueError(
+                    f"HAP: invalid linked scope_plan: {exc}"
+                ) from exc
+        else:
+            path = scope_plan_path
+            if not os.path.isabs(path):
+                candidate = os.path.join(_DYPE_ROOT, path)
+                if os.path.exists(candidate):
+                    path = candidate
+            if not os.path.exists(path):
+                raise FileNotFoundError(
+                    f"HAP: scope plan not found: {scope_plan_path!r} (resolved to "
+                    f"{path!r}). Provide a path to a scope-plan JSON, link a "
+                    f"scope_plan from the 'HAP Calibrate' node, or use the "
+                    f"shipped default 'configs/scope_plan_flux.json'."
+                )
+            try:
+                plan = ScopePlan.load(path)
+            except ValueError as exc:
+                raise ValueError(f"HAP: invalid scope plan {scope_plan_path!r}: {exc}") from exc
         patched_model = apply_hap_to_model(
             model, model_type, plan,
             anchor_stride=int(anchor_stride),
@@ -453,7 +471,7 @@ class DyPEExtension(ComfyExtension):
         install_qwen2d_patch()
 
     async def get_node_list(self) -> list[type[io.ComfyNode]]:
-        return [DyPE_FLUX, SEGA, SPA, HAP, PixelRushNode, FreeScaleNode]
+        return [DyPE_FLUX, SEGA, SPA, HAP, HAPCalibrate, PixelRushNode, FreeScaleNode]
 
 async def comfy_entrypoint() -> DyPEExtension:
     return DyPEExtension()

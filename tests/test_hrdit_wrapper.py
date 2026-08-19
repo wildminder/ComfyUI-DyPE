@@ -169,15 +169,46 @@ class TestHapDispatch:
         assert calls == [0, 1, 2]
 
     def test_hap_output_equals_dense_mask_reference(self, mock_attn):
-        """Wrapper HAP output == manual dense-mask attention (alpha=64 -> half 0)."""
+        """Wrapper HAP output == manual dense-mask attention (alpha=64 -> half 0).
+
+        Uses ``skip_output_reshape=True`` so the wrapper returns head format
+        ``(B, H, T, D)`` — the layout ``hap_attn_dense`` produces — for a direct
+        element-wise comparison.
+        """
         m = _MockModel()
         _hrdit_install_hook(m, "flux", consumer="hap")
         set_hap_context(_hap_ctx(num_layers=1, text_len=0))
         q, k, v = _rand_qkv(S=128, seed=3)
-        out = mock_attn.optimized_attention(q, k, v, 2)
+        out = mock_attn.optimized_attention(q, k, v, 2, skip_output_reshape=True)
         mask = hap.build_band_mask(128, 0, [0, 0], 0)
         ref = hap.hap_attn_dense(q, k, v, mask)
         assert torch.allclose(out, ref, atol=1e-6)
+
+    def test_hap_output_flattened_when_skip_output_reshape_false(self, mock_attn):
+        """REGRESSION (2026-08-18, krea2 inference crash ``dim 3: 128 vs 6144``).
+
+        Krea2 calls ``optimized_attention_masked(..., skip_reshape=True)`` WITHOUT
+        ``skip_output_reshape`` (defaults False) and then does
+        ``out * F.sigmoid(gate)`` where ``gate`` is ``(B, T, H*D)`` — so it NEEDS
+        the flattened ``(B, T, H*D)`` layout.  The pre-fix wrapper returned the
+        head-format ``(B, H, T, D)`` output as-is, crashing the elementwise
+        multiply.  With ``skip_output_reshape=False`` the wrapper must flatten the
+        HAP output to ``(B, T, H*D)``, matching the flattened dense-mask reference.
+        """
+        m = _MockModel()
+        _hrdit_install_hook(m, "flux", consumer="hap")
+        set_hap_context(_hap_ctx(num_layers=1, text_len=0))
+        B, H, S, D = 1, 2, 128, 16
+        q, k, v = _rand_qkv(B=B, H=H, S=S, D=D, seed=3)
+        # Default skip_output_reshape=False -> caller expects flattened (B, T, H*D).
+        out = mock_attn.optimized_attention(q, k, v, H)
+        assert out.shape == (B, S, H * D), (
+            f"skip_output_reshape=False must flatten to (B, T, H*D); got {tuple(out.shape)}"
+        )
+        mask = hap.build_band_mask(S, 0, [0, 0], 0)
+        ref_head = hap.hap_attn_dense(q, k, v, mask)          # (B, H, S, D)
+        ref_flat = ref_head.permute(0, 2, 1, 3).reshape(B, S, H * D)
+        assert torch.allclose(out, ref_flat, atol=1e-6)
 
     def test_kernel_none_falls_back_to_orig(self, mock_attn):
         """HAP runtime returning None -> wrapper falls back to orig attention."""

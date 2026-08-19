@@ -47,14 +47,9 @@ import torch
 
 from src.hap import ScopePlan, band_blocks, band_compute_cost, flops_ratio, half_blocks
 from src.hap_calib import calibrate_scope_plan, collect_scope_scores
-
-DEFAULT_PROMPTS = [
-    "a photograph of a mountain landscape at sunrise",
-    "a detailed portrait of an elderly sailor",
-    "a bustling city street at night in the rain",
-    "a macro shot of a dewdrop on a leaf",
-    "an oil painting of a sailing ship in a storm",
-]
+# Single source for default prompts (plan 2026-08-16 P6.1): the node module
+# owns the list; the CLI re-imports it so the two never drift.
+from src.hap_calib_node import DEFAULT_CALIBRATION_PROMPTS as DEFAULT_PROMPTS
 
 
 def _ensure_mock_attention_module():
@@ -176,17 +171,30 @@ def run_dry_run(args) -> dict:
 # Real-model calibration (user's ComfyUI venv; manual step, checklist A5)
 # ---------------------------------------------------------------------------
 
-def run_real(args) -> dict:
+def _encode_conditioning(clip, prompt: str):
+    """Build a ComfyUI CONDITIONING list for ``prompt`` using ``clip``.
+
+    Mirrors the CLIP Text Encode node: tokenize, encode, and wrap the pooled
+    output so ``comfy.samplers.sampling_function`` receives a valid cond.
+    """
+    tokens = clip.tokenize(prompt)
+    cond, pooled = clip.encode_from_tokens(tokens, return_pooled=True)
+    return [[cond, {"pooled_output": pooled}]]
+
+
+def run_real(args) -> dict:  # pragma: no cover - requires ComfyUI venv + GPU
     """Calibrate a real checkpoint.  Requires the ComfyUI runtime + a GPU.
 
     This is a documented manual step (plan §6, checklist A5) and is not run in
-    CI.  It loads the checkpoint, then for each calibration prompt runs ONE
-    representative denoising-step forward through the P6 collector and solves.
+    CI.  It loads the checkpoint via ComfyUI's standard loader, builds
+    conditioning from the calibration prompts, then delegates to the SAME
+    orchestrator the in-graph node uses (:func:`src.hap_calib_node.
+    run_hap_calibration`) so the CLI and the node can never drift.
     """
     try:
-        import comfy.sd  # noqa: F401
+        import comfy.sd
         import comfy.utils  # noqa: F401
-    except Exception as exc:  # pragma: no cover - environment dependent
+    except Exception as exc:
         raise RuntimeError(
             "Real-model calibration requires the ComfyUI runtime.  Run this "
             "script inside your ComfyUI venv (checklist A5), or use --dry_run "
@@ -194,13 +202,65 @@ def run_real(args) -> dict:
             f"{exc!r}"
         ) from exc
 
-    raise NotImplementedError(
-        "Real-model HAP calibration wires the ComfyUI sampling loop to the P6 "
-        "collector and is intentionally completed as a manual step in the "
-        "user's venv (plan §6 acceptance, checklist A5).  The collector, "
-        "solver, and JSON writer are fully validated by --dry_run; point this "
-        "path at a loaded ModelPatcher + one denoising-step forward to finish."
+    from src.hap_calib_node import (
+        CalibrationSpec,
+        resolve_prompts,
+        run_hap_calibration,
     )
+
+    if not args.model_path:
+        raise ValueError(
+            "run_real: --model_path is required for real-model calibration "
+            "(use --dry_run to validate the pipeline without a checkpoint)."
+        )
+
+    # Load the checkpoint (model + clip) through ComfyUI's canonical loader.
+    model, clip, _vae, *_rest = comfy.sd.load_checkpoint_guess_config(
+        args.model_path,
+        output_vae=False,
+        output_clip=True,
+        output_clipvision=False,
+        output_model=True,
+    )
+
+    # Resolve the calibration prompt list (file > defaults).
+    prompts = resolve_prompts(
+        prompts_text="",
+        prompts_file=args.prompts_file or "",
+        num_prompts=args.num_prompts,
+        pack_root=_PROJECT_ROOT,
+    )
+
+    # Condition on the FIRST prompt; each prompt index varies the noise seed
+    # inside the orchestrator (matches the node's behaviour).
+    positive = _encode_conditioning(clip, prompts[0])
+    negative = _encode_conditioning(clip, "")
+
+    spec = CalibrationSpec(
+        width=int(args.width),
+        height=int(args.height),
+        num_prompts=int(args.num_prompts),
+        num_scopes=int(args.num_scopes),
+        budget_ratio=float(args.budget_ratio),
+        bins=int(args.bins),
+        chunk=int(args.chunk),
+        text_len=512,
+        anchor_stride=int(args.anchor_stride),
+        calib_sigma=1.0,
+        seed=3407,
+        loss_type="output_norm",
+        prompts=prompts,
+    )
+    spec.validate()
+
+    plan_dict, _summary = run_hap_calibration(
+        model=model,
+        spec=spec,
+        model_type=args.model_type,
+        positive=positive,
+        negative=negative,
+    )
+    return plan_dict
 
 
 # ---------------------------------------------------------------------------

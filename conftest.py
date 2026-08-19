@@ -70,10 +70,16 @@ def _install_comfyui_mocks():
         def define_schema(cls):
             raise NotImplementedError
 
+    def _node_output(*args, **kwargs):
+        """Mock io.NodeOutput — a plain function so ``io.NodeOutput(...)``
+        (attribute access on the _IO INSTANCE) does not bind ``self`` as the
+        first positional arg (which would corrupt the output tuple)."""
+        return args
+
     class _IO:
         Schema = _Schema
         ComfyNode = _ComfyNode
-        NodeOutput = lambda *args, **kwargs: args
+        NodeOutput = staticmethod(_node_output)
 
         class Model:
             Input = _Input
@@ -88,6 +94,7 @@ def _install_comfyui_mocks():
             Input = _Input
         class String:
             Input = _Input
+            Output = _Output
         class Image:
             Input = _Input
             Output = _Output
@@ -96,9 +103,21 @@ def _install_comfyui_mocks():
         class Mask:
             Input = _Input
             Output = _Output
+        class Conditioning:
+            Input = _Input
+            Output = _Output
         class Hidden:
             unique_id = "unique_id"
             prompt = "prompt"
+
+        @staticmethod
+        def Custom(name):
+            """Mock for io.Custom("TYPE") -> object with .Input/.Output."""
+            class _CustomType:
+                Input = _Input
+                Output = _Output
+            _CustomType.type_name = name
+            return _CustomType
 
     class _UI:
         class PreviewImage:
