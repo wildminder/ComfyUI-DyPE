@@ -48,8 +48,10 @@ from .spa_context import (
     get_spa_context,
     get_spa_layer_filter,
     get_spa_step_gate,
+    next_hap_layer_idx,
     next_hrdit_layer_idx,
     set_hap_context,
+    set_hap_layer_idx,
     set_hrdit_layer_idx,
     set_hrdit_proportional,
     set_spa_context,
@@ -956,6 +958,37 @@ def _make_hrdit_wrapper(orig, is_masked: bool):
     def _wrapper(q, k, v, heads, mask=None, attn_precision=None,
                  skip_reshape=False, skip_output_reshape=False, **kw):
         layer_idx = next_hrdit_layer_idx()
+        # HAP PLAN-LAYER ORDINAL (2026-08-19, runtime layer-index mismatch fix).
+        # Calibration enumerates scope-plan layers by the DOMINANT-HEAD-ONLY
+        # ordinal: its heterogeneous-head-count filter drops auxiliary attention
+        # with other head counts (Krea2's 4 x 20-head projector calls) and numbers
+        # the remaining dominant-head calls 0..N-1.  The runtime must index the
+        # plan by the SAME ordinal — NOT the raw all-call counter.  The pre-fix
+        # wrapper fed the raw counter into the plan, so the 4 aux calls consumed
+        # indices 0-3, shifting every main block by 4 and pushing the last 4 main
+        # blocks past the plan ("layer 28 exceeds the scope plan").
+        #
+        # Advance the ordinal ONCE per wrapper call that the plan actually covers
+        # (square + unmasked + non-GQA + head-count match — exactly calibration's
+        # recorded-and-kept set).  Non-covered calls (cross-attention, aux heads,
+        # masked, GQA) do NOT consume a plan slot; they decline to plain attention
+        # via ``HapRuntime.attn``'s guards.  Computed HERE (not per ``_attn`` pass)
+        # so all SPA variant passes of one layer share ONE ordinal — mirroring
+        # calibration's grouping of variant passes by layer key.
+        _hap_ctx_peek = get_hap_context()
+        if (
+            _hap_ctx_peek is not None
+            and _hap_ctx_peek.active
+            and _hap_ctx_peek.plan is not None
+            and mask is None
+            and q.shape[-2] == k.shape[-2]      # square (self/joint attention)
+            and not kw.get("enable_gqa", False)  # calibration skips GQA calls
+            and k.shape == q.shape              # non-GQA (calibration skips GQA)
+            and q.shape[1] == _hap_ctx_peek.plan.num_heads  # dominant head count
+        ):
+            hap_plan_layer = next_hap_layer_idx()
+        else:
+            hap_plan_layer = layer_idx  # non-covered; declines via attn guards
         # Proportional attention scaling (plan P7/T7.2): pre-scale q so the
         # logits gain the factor log(seq_len, train_seq_len).  A scalar on q
         # commutes with RoPE and any mask, so every downstream pass (SPA
@@ -997,7 +1030,10 @@ def _make_hrdit_wrapper(orig, is_masked: bool):
             spa_active = False
 
         def _attn(qq, kk, vv):
-            out = _hrdit_hap_dispatch(qq, kk, vv, layer_idx, mask)
+            # Use the HAP PLAN-LAYER ORDINAL (dominant-head-only, mirroring
+            # calibration) — NOT the raw all-call counter — so auxiliary
+            # attention with other head counts never shifts the plan indexing.
+            out = _hrdit_hap_dispatch(qq, kk, vv, hap_plan_layer, mask)
             if out is not None:
                 # OUTPUT-RESHAPE CONVENTION FIX (2026-08-18, krea2 inference
                 # crash ``dim 3: 128 vs 6144``).  ``HapRuntime.attn`` returns
@@ -1237,6 +1273,10 @@ def _hrdit_install_hook(m, model_type: str, consumer: str = "spa") -> None:
         # wrapper advances it on EVERY attention call; resetting here keeps the
         # counter aligned with the model's block order on every forward.
         set_hrdit_layer_idx(0)
+        # Reset the HAP plan-layer ordinal too (2026-08-19 layer-index fix): it
+        # advances only for plan-covered calls, so it must restart per forward
+        # exactly like the raw counter.
+        set_hap_layer_idx(0)
         # Resolve the AUTHORITATIVE patcher (plan G4): the state ref is
         # re-pointed by _hrdit_carry_state to the newest clone, so a chained
         # SPA->HAP / HAP->SPA workflow reads the combined state, not the stale
@@ -1317,6 +1357,7 @@ def _hrdit_install_hook(m, model_type: str, consumer: str = "spa") -> None:
             set_hrdit_proportional(False)  # clear proportional flag -> no leak
             set_spa_layer_filter(None)  # clear layer filter -> no cross-model leak
             set_spa_step_gate(True)  # reopen so a non-SPA forward is unaffected
+            set_hap_layer_idx(0)  # clear HAP plan ordinal -> no cross-model leak
 
     m.set_model_unet_function_wrapper(_spa_unet_wrapper)
 

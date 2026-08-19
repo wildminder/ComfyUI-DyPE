@@ -285,6 +285,149 @@ class TestHapDispatch:
 
 
 # ---------------------------------------------------------------------------
+# HAP plan-layer ordinal (2026-08-19 runtime layer-index mismatch fix)
+# ---------------------------------------------------------------------------
+
+@pytest.mark.mock_integration
+class TestHapPlanLayerOrdinal:
+    """REGRESSION (2026-08-19): the runtime must index the scope plan by the
+    DOMINANT-HEAD-ONLY ordinal (mirroring calibration's heterogeneous-head-count
+    filter), NOT the raw all-call counter.
+
+    Krea2 runs 4 auxiliary 20-head projector calls before its 28 main 48-head
+    blocks.  The pre-fix wrapper fed the RAW counter into the plan, so the 4 aux
+    calls consumed indices 0-3, shifting every main block by 4 (block 0 read plan
+    layer 4 instead of 0) and pushing the last 4 main blocks past the 28-layer
+    plan ("layer 28 exceeds the scope plan").  Calibration enumerates plan layers
+    by the dominant-head-only ordinal, so the runtime must do the same.
+    """
+
+    def test_aux_head_mismatch_calls_do_not_shift_plan_index(self, mock_attn):
+        """4 aux calls (3 heads) + 4 main calls (2 heads; plan has 2 heads).
+
+        The main calls must receive plan layers [0,1,2,3] — NOT [4,5,6,7] — and
+        the ordinal must advance only for the covered (main) calls.
+        """
+        from src.spa_context import get_hap_layer_idx
+
+        m = _MockModel()
+        _hrdit_install_hook(m, "flux", consumer="hap")
+        set_hap_context(_hap_ctx(num_layers=4))  # num_heads=2 (dominant)
+
+        seen = []  # (layer, heads)
+        real_attn = hap.HapRuntime.attn
+
+        def spy(self, q, k, v, layer, **kw):
+            seen.append((layer, q.shape[1]))
+            return real_attn(self, q, k, v, layer, **kw)
+
+        hap.HapRuntime.attn = spy
+        try:
+            # 4 auxiliary calls with a DIFFERENT head count (3 heads).
+            qa, ka, va = _rand_qkv(H=3, seed=10)
+            for _ in range(4):
+                mock_attn.optimized_attention(qa, ka, va, 3)
+            # 4 main calls matching the plan's head count (2 heads).
+            qm, km, vm = _rand_qkv(H=2, seed=11)
+            for _ in range(4):
+                mock_attn.optimized_attention(qm, km, vm, 2)
+        finally:
+            hap.HapRuntime.attn = real_attn
+
+        aux = [l for (l, h) in seen if h == 3]
+        main = [l for (l, h) in seen if h == 2]
+        # Aux calls are non-covered: they keep the raw index and decline via the
+        # head-mismatch guard inside ``HapRuntime.attn``.
+        assert aux == [0, 1, 2, 3]
+        # MAIN calls: plan ordinal 0-3 — NOT shifted by the 4 aux calls.
+        assert main == [0, 1, 2, 3]
+        # The ordinal advanced only for the 4 covered (main) calls.
+        assert get_hap_layer_idx() == 4
+        # The raw counter advanced for all 8 calls (alignment is sacred).
+        assert get_hrdit_layer_idx() == 8
+
+    def test_main_calls_engage_hap_aux_calls_plain(self, mock_attn):
+        """Main (dominant-head) calls engage HAP (masked output); aux calls
+        decline to plain SDPA — proving correct routing, not just indexing."""
+        import torch.nn.functional as F
+
+        m = _MockModel()
+        _hrdit_install_hook(m, "flux", consumer="hap")
+        set_hap_context(_hap_ctx(num_layers=4, text_len=0))  # 2-head plan
+
+        # Aux call (3 heads): declines -> plain SDPA.
+        qa, ka, va = _rand_qkv(H=3, S=128, seed=20)
+        out_aux = mock_attn.optimized_attention(qa, ka, va, 3, skip_output_reshape=True)
+        ref_aux = F.scaled_dot_product_attention(qa, ka, va, scale=1.0)
+        assert torch.allclose(out_aux, ref_aux, atol=1e-6)
+
+        # Main call (2 heads): engages HAP -> dense-mask reference.
+        qm, km, vm = _rand_qkv(H=2, S=128, seed=21)
+        out_main = mock_attn.optimized_attention(qm, km, vm, 2, skip_output_reshape=True)
+        mask = hap.build_band_mask(128, 0, [0, 0], 0)
+        ref_main = hap.hap_attn_dense(qm, km, vm, mask)
+        assert torch.allclose(out_main, ref_main, atol=1e-6)
+
+    def test_plan_ordinal_resets_between_forwards(self, mock_attn):
+        """Simulating two forwards (manual reset, as the unet wrapper does)
+        restarts the plan ordinal at 0."""
+        from src.spa_context import get_hap_layer_idx, set_hap_layer_idx
+
+        m = _MockModel()
+        _hrdit_install_hook(m, "flux", consumer="hap")
+        set_hap_context(_hap_ctx(num_layers=4))
+        q, k, v = _rand_qkv(H=2)
+        mock_attn.optimized_attention(q, k, v, 2)
+        mock_attn.optimized_attention(q, k, v, 2)
+        assert get_hap_layer_idx() == 2
+        set_hap_layer_idx(0)  # what the unet wrapper does per forward
+        mock_attn.optimized_attention(q, k, v, 2)
+        assert get_hap_layer_idx() == 1
+
+    def test_non_square_and_masked_calls_do_not_consume_ordinal(self, mock_attn):
+        """Cross-attention (non-square) and masked calls are non-covered: they
+        must NOT advance the plan ordinal (calibration skips them too)."""
+        from src.spa_context import get_hap_layer_idx
+
+        m = _MockModel()
+        _hrdit_install_hook(m, "flux", consumer="hap")
+        set_hap_context(_hap_ctx(num_layers=4))
+
+        q, k, v = _rand_qkv(H=2, S=128)
+        # Non-square (cross-attention): k has a different sequence length.
+        k_short = k[:, :, :64, :]
+        v_short = v[:, :, :64, :]
+        mock_attn.optimized_attention(q, k_short, v_short, 2)
+        assert get_hap_layer_idx() == 0  # not consumed
+
+        # Masked call: an external mask is present.
+        mask = torch.ones(2, 128, 128, dtype=torch.bool)
+        mock_attn.optimized_attention(q, k, v, 2, mask=mask)
+        assert get_hap_layer_idx() == 0  # still not consumed
+
+        # A covered (square, unmasked, head-match) call DOES consume it.
+        mock_attn.optimized_attention(q, k, v, 2)
+        assert get_hap_layer_idx() == 1
+
+    def test_exceeds_warning_fires_once(self, mock_attn, caplog):
+        """A covered call overrunning the plan logs the 'exceeds' warning ONCE
+        (latched), not once per call/step (the live Krea2 spam)."""
+        import logging
+
+        m = _MockModel()
+        _hrdit_install_hook(m, "flux", consumer="hap")
+        set_hap_context(_hap_ctx(num_layers=1))  # only 1 layer
+
+        q, k, v = _rand_qkv(H=2, seed=30)
+        with caplog.at_level(logging.WARNING, logger="src.hap"):
+            for _ in range(4):  # ordinals 0,1,2,3 -> 3 exceed the 1-layer plan
+                mock_attn.optimized_attention(q, k, v, 2)
+
+        exceeds = [r for r in caplog.records if "exceeds the scope plan" in r.getMessage()]
+        assert len(exceeds) == 1
+
+
+# ---------------------------------------------------------------------------
 # T3.3 — ref-counted shared install policy
 # ---------------------------------------------------------------------------
 

@@ -420,8 +420,19 @@ class TestE2EAnimaRegression:
 
     def test_e2e_cross_attention_mix(self, mock_attn):
         """T5.2: a forward mixing square self-attn and non-square cross-attn calls.
-        Self-attn is HAP-masked, cross-attn is plain, and the layer counter advances
-        for BOTH (alignment is sacred)."""
+        Self-attn is HAP-masked, cross-attn is plain, and the RAW layer counter
+        advances for BOTH (alignment is sacred).
+
+        UPDATED (2026-08-19, plan-layer ordinal fix): the HAP PLAN-LAYER ORDINAL
+        advances ONLY for plan-covered calls (square + unmasked + head-match),
+        mirroring calibration — calibration SKIPS non-square cross-attention, so
+        the runtime must not consume a plan slot for it either.  The self-attn
+        calls therefore receive plan layers [0, 1] (not [0, 2]), and the
+        cross-attn calls keep their raw indices [1, 3] but decline to plain
+        attention via the non-square guard.  The pre-fix expectation
+        ``[(0,..),(1,..),(2,..),(3,..)]`` encoded the buggy raw-counter indexing
+        that shifted Krea2's main blocks by its 4 aux calls.
+        """
         orig_calls = _install_spy_orig(mock_attn)
         m = _MockModel()
         m._hap_ctx = _hap_ctx()  # HEADS=2 == q heads
@@ -468,12 +479,16 @@ class TestE2EAnimaRegression:
         finally:
             hap.HapRuntime.attn = real_attn
 
-        # The layer counter advances for BOTH self-attn and cross-attn (0,1,2,3).
+        # The RAW layer counter advances for BOTH self-attn and cross-attn
+        # (alignment is sacred), but the HAP PLAN-LAYER ORDINAL advances only for
+        # the covered (square) self-attn calls.  So the self-attn calls receive
+        # plan layers [0, 1] and the cross-attn calls keep their raw indices
+        # [1, 3] (declined to plain attention via the non-square guard).
         assert kernel_calls == [
-            (0, SEQ_LEN, SEQ_LEN),          # block 0 self-attn (square)
-            (1, SEQ_LEN, SEQ_LEN // 2),     # block 0 cross-attn (non-square)
-            (2, SEQ_LEN, SEQ_LEN),          # block 1 self-attn (square)
-            (3, SEQ_LEN, SEQ_LEN // 2),     # block 1 cross-attn (non-square)
+            (0, SEQ_LEN, SEQ_LEN),          # block 0 self-attn (square) -> plan 0
+            (1, SEQ_LEN, SEQ_LEN // 2),     # block 0 cross-attn (non-square) -> raw 1, declines
+            (1, SEQ_LEN, SEQ_LEN),          # block 1 self-attn (square) -> plan 1
+            (3, SEQ_LEN, SEQ_LEN // 2),     # block 1 cross-attn (non-square) -> raw 3, declines
         ]
         # Cross-attn (non-square) declined to plain attention: 2 orig fallbacks.
         assert len(orig_calls) == 2

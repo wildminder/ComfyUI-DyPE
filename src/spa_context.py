@@ -71,6 +71,19 @@ _HAP_ACTIVE: "contextvars.ContextVar" = contextvars.ContextVar("hap_active", def
 # early returns, so alignment with the model's block order is preserved).
 _HRDIT_LAYER_IDX: "contextvars.ContextVar" = contextvars.ContextVar("hrdit_layer_idx", default=0)
 
+# HAP plan-layer ordinal (2026-08-19, runtime layer-index mismatch fix): a
+# SEPARATE per-forward counter that advances ONLY for attention calls the scope
+# plan actually covers (square, unmasked, and matching the plan's head count).
+# Calibration enumerates plan layers by the dominant-head-only ordinal (its
+# heterogeneous-head-count filter drops auxiliary attention with other head
+# counts), so the runtime must index the plan by the SAME ordinal — not the raw
+# all-call counter.  Krea2 runs 4 auxiliary 20-head projector calls before its 28
+# main 48-head blocks; the raw counter consumed indices 0-3 for the aux calls,
+# shifting every main block by 4 and pushing the last 4 main blocks past the
+# 28-layer plan ("layer 28 exceeds the scope plan").  Reset to 0 by the unet
+# wrapper alongside ``_HRDIT_LAYER_IDX``.
+_HAP_LAYER_IDX: "contextvars.ContextVar" = contextvars.ContextVar("hap_layer_idx", default=0)
+
 # Proportional attention scaling flag (plan P7/T7.2, G4): the unet wrapper sets
 # this from ``m._hrdit_proportional_attention`` for the duration of a forward.
 # When True the unified attention wrapper pre-scales ``q`` by
@@ -141,6 +154,35 @@ def next_hrdit_layer_idx() -> int:
     """
     idx = _HRDIT_LAYER_IDX.get()
     _HRDIT_LAYER_IDX.set(idx + 1)
+    return idx
+
+
+# --- HAP plan-layer ordinal (2026-08-19 layer-index mismatch fix) -----------
+
+def get_hap_layer_idx() -> int:
+    """Return the current HAP plan-layer ordinal (0-based).
+
+    Unlike :func:`get_hrdit_layer_idx` (the RAW all-call counter), this ordinal
+    advances ONLY for attention calls the scope plan covers (square, unmasked,
+    head-count match) — mirroring calibration's dominant-head enumeration.
+    """
+    return _HAP_LAYER_IDX.get()
+
+
+def set_hap_layer_idx(idx: int) -> None:
+    """Set the HAP plan-layer ordinal (the unet wrapper resets to 0)."""
+    _HAP_LAYER_IDX.set(int(idx))
+
+
+def next_hap_layer_idx() -> int:
+    """Read the current HAP plan-layer ordinal and advance the counter.
+
+    Called ONLY by wrapper calls that the scope plan actually covers (the
+    HAP dispatch path), so the ordinal stays aligned with calibration's
+    dominant-head-only layer enumeration.
+    """
+    idx = _HAP_LAYER_IDX.get()
+    _HAP_LAYER_IDX.set(idx + 1)
     return idx
 
 

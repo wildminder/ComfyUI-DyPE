@@ -530,6 +530,7 @@ class HapRuntime:
         # with fresh latches — test hygiene).
         self._warned_nonsquare = False
         self._warned_head_mismatch = False
+        self._warned_exceeds = False
 
     @classmethod
     def get(cls) -> "HapRuntime":
@@ -621,10 +622,19 @@ class HapRuntime:
         if ctx is None or not ctx.active or ctx.plan is None:
             return None
         if layer >= ctx.plan.num_layers:
-            logger.warning(
-                "HAP: layer %d exceeds the scope plan (%d layers); using plain attention",
-                layer, ctx.plan.num_layers,
-            )
+            # ONE-TIME latch (2026-08-19): this fires once per attention call
+            # that overruns the plan; without a latch it spams every denoising
+            # step (the live Krea2 run logged it 4x per step).  The wrapper's
+            # dominant-head ordinal fix makes this path rare (only a genuine
+            # plan/model layer-count mismatch reaches it), but keep it spam-free.
+            if not self._warned_exceeds:
+                logger.warning(
+                    "HAP: layer %d exceeds the scope plan (%d layers); using "
+                    "plain attention for these calls (further occurrences "
+                    "suppressed).",
+                    layer, ctx.plan.num_layers,
+                )
+                self._warned_exceeds = True
             return None
 
         # DECLINE GUARDS (plan 2026-08-16 G3): never crash, never silent wrong

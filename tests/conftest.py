@@ -124,6 +124,21 @@ def _install_mock_attention_module():
     yield attn_mod
 
 
+@pytest.fixture(autouse=True)
+def _reset_hap_layer_ordinal():
+    """Reset the HAP plan-layer ordinal around every test (2026-08-19 fix).
+
+    The ordinal advances only for plan-covered attention calls; a test that
+    drives the wrapper must not leak a non-zero ordinal into the next test.
+    Mirrors the per-file ``set_hrdit_layer_idx(0)`` hygiene for the raw counter.
+    """
+    from src.spa_context import set_hap_layer_idx
+
+    set_hap_layer_idx(0)
+    yield
+    set_hap_layer_idx(0)
+
+
 @pytest.fixture
 def sample_pos_1d():
     """1D position tensor: (batch=1, seq_len=64, axes=1)"""
