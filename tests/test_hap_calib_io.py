@@ -57,6 +57,18 @@ class TestWriteScopePlan:
         with pytest.raises(ValueError, match="path"):
             write_scope_plan(_tiny_plan_dict(), str(tmp_path), bad_name)
 
+    def test_writes_excluded_head_counts_roundtrip(self, tmp_path):
+        """A plan WITH excluded_head_counts persists the field and reloads it
+        (2026-08-23 head-count warning fix)."""
+        plan_dict = dict(_tiny_plan_dict())
+        plan_dict["excluded_head_counts"] = [20]
+        path = write_scope_plan(plan_dict, str(tmp_path), "plan.json")
+        plan = ScopePlan.load(path)
+        assert plan.excluded_head_counts == [20]
+        with open(path, "r", encoding="utf-8") as fh:
+            d = json.load(fh)
+        assert d["excluded_head_counts"] == [20]
+
 
 # ---------------------------------------------------------------------------
 # T4.2 — resolve_output_dir fallback

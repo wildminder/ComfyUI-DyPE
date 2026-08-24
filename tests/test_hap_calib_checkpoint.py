@@ -683,6 +683,42 @@ class TestHeterogeneousHeadFilter:
         assert msgs == []
         assert quality.shape[0] == 3  # all layers kept
 
+    # -- excluded_head_counts metadata (2026-08-23 head-count warning fix) ----
+
+    def test_hetero_meta_records_excluded_head_counts(self):
+        """The collector records the NON-dominant head counts into ``meta``
+        so the runtime can log a friendly INFO instead of a scary WARNING."""
+        model, dit, loss_fn = _make_hetero_case()
+        meta = {}
+        hcn.collect_scope_scores_for_model(
+            model=model, model_type="flux", forward_fn=dit.forward,
+            loss_fn=loss_fn, num_scopes=4, text_len=4, chunk=4096, scale=1.0,
+            meta=meta,
+        )
+        # Dominant = 2 heads (3 layers); the single 3-head aux layer is excluded.
+        assert meta["excluded_head_counts"] == [3]
+
+    def test_uniform_meta_empty_excluded(self):
+        """A uniform-head model records an EMPTY excluded list (no aux)."""
+        model, dit, loss_fn = _make_case(num_layers=3)
+        meta = {}
+        hcn.collect_scope_scores_for_model(
+            model=model, model_type="flux", forward_fn=dit.forward,
+            loss_fn=loss_fn, num_scopes=4, text_len=4, chunk=4096, scale=1.0,
+            meta=meta,
+        )
+        assert meta["excluded_head_counts"] == []
+
+    def test_meta_none_backward_compatible(self):
+        """Omitting ``meta`` (the pre-fix call convention) still works and
+        returns the same 3-tuple."""
+        model, dit, loss_fn = _make_hetero_case()
+        result = hcn.collect_scope_scores_for_model(
+            model=model, model_type="flux", forward_fn=dit.forward,
+            loss_fn=loss_fn, num_scopes=4, text_len=4, chunk=4096, scale=1.0,
+        )
+        assert len(result) == 3  # (quality, compute, seq)
+
 
 # ---------------------------------------------------------------------------
 # text_len clamp (Krea2 live crash: band_compute_cost text_len=512 exceeds

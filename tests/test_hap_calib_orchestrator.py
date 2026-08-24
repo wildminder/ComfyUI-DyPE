@@ -18,6 +18,7 @@ import types
 import pytest
 import torch
 
+import src.hap_calib_node as hcn
 from src.hap import ScopePlan, flops_ratio
 from src.hap_calib_node import (
     CalibrationSpec,
@@ -170,6 +171,62 @@ class TestOrchestratorHapGuard:
             forward_fn=_toy_forward([]),
         )
         assert "alphas" in plan_dict
+
+
+# ---------------------------------------------------------------------------
+# excluded_head_counts metadata (2026-08-23 head-count warning fix)
+# ---------------------------------------------------------------------------
+
+@pytest.mark.unit
+class TestOrchestratorExcludedHeads:
+    """The orchestrator persists the collector's non-dominant head counts into
+    the plan dict so the runtime can log a friendly INFO (expected auxiliary
+    fallback) instead of a scary WARNING (wrong plan)."""
+
+    def _fake_collect(self, excluded):
+        """A stand-in collector that returns a tiny valid table and fills meta.
+
+        The compute table must have INCREASING per-scope costs (like the real
+        ``calibration_cost_table``) so the knapsack is feasible at the default
+        budget_ratio=0.5 — a flat all-ones table makes every scope equally
+        expensive and the solver reports "No feasible assignment".
+        """
+        def fake(model, model_type, forward_fn, loss_fn, num_scopes,
+                 text_len, chunk, scale, meta=None):
+            L, H, S = 2, 3, num_scopes
+            quality = torch.rand(L, H, S, dtype=torch.float64)
+            # cost[h][s] increases with scope index (scope 0 cheapest, last=full).
+            row = torch.arange(1, S + 1, dtype=torch.float64)
+            compute = row.unsqueeze(0).expand(H, -1).clone()
+            compute = compute.unsqueeze(0).expand(L, -1, -1).clone()
+            if meta is not None:
+                meta["excluded_head_counts"] = list(excluded)
+            return quality, compute, 1032
+        return fake
+
+    def test_excluded_heads_persisted_in_plan_dict(self, monkeypatch):
+        monkeypatch.setattr(
+            hcn, "collect_scope_scores_for_model", self._fake_collect([20])
+        )
+        spec = _spec(["p1"])
+        plan_dict, _ = run_hap_calibration(
+            model=object(), spec=spec, model_type="flux",
+        )
+        assert plan_dict.get("excluded_head_counts") == [20]
+        # The plan still validates and round-trips the field.
+        plan = ScopePlan.from_dict(plan_dict)
+        assert plan.excluded_head_counts == [20]
+
+    def test_no_excluded_heads_omits_key(self, monkeypatch):
+        """A uniform-head model (empty excluded list) keeps the legacy shape."""
+        monkeypatch.setattr(
+            hcn, "collect_scope_scores_for_model", self._fake_collect([])
+        )
+        spec = _spec(["p1"])
+        plan_dict, _ = run_hap_calibration(
+            model=object(), spec=spec, model_type="flux",
+        )
+        assert "excluded_head_counts" not in plan_dict
 
 
 # ---------------------------------------------------------------------------

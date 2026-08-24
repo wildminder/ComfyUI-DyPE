@@ -200,6 +200,45 @@ class TestScopePlan:
         reloaded = hap.ScopePlan.load(out)
         assert reloaded.to_dict() == plan.to_dict()
 
+    # -- excluded_head_counts metadata (2026-08-23 head-count warning fix) ----
+
+    def test_scopeplan_excluded_head_counts_roundtrip(self):
+        """A plan WITH excluded_head_counts round-trips the field exactly."""
+        d = dict(_tiny_plan_dict())
+        d["excluded_head_counts"] = [20]
+        plan = hap.ScopePlan.from_dict(d)
+        assert plan.excluded_head_counts == [20]
+        assert plan.to_dict() == d
+
+    def test_scopeplan_excluded_head_counts_omitted_when_absent(self):
+        """A legacy plan WITHOUT the field round-trips to the exact legacy
+        shape (no spurious key) — full backward compatibility."""
+        d = _tiny_plan_dict()
+        plan = hap.ScopePlan.from_dict(d)
+        assert plan.excluded_head_counts is None
+        assert plan.to_dict() == d
+        assert "excluded_head_counts" not in plan.to_dict()
+
+    def test_scopeplan_excluded_head_counts_empty_omitted(self):
+        """An EMPTY excluded list is treated as absent (omitted from to_dict)."""
+        plan = hap.ScopePlan(
+            alphas=_tiny_plan_dict()["alphas"],
+            betas=_tiny_plan_dict()["betas"],
+            excluded_head_counts=[],
+        )
+        assert "excluded_head_counts" not in plan.to_dict()
+
+    def test_scopeplan_rejects_bad_excluded_head_counts(self):
+        """excluded_head_counts must be a list of ints; else ValueError."""
+        d = dict(_tiny_plan_dict())
+        d["excluded_head_counts"] = [20, "x"]
+        with pytest.raises(ValueError, match="excluded_head_counts"):
+            hap.ScopePlan.from_dict(d)
+        d2 = dict(_tiny_plan_dict())
+        d2["excluded_head_counts"] = "not-a-list"
+        with pytest.raises(ValueError, match="excluded_head_counts"):
+            hap.ScopePlan.from_dict(d2)
+
     def test_scopeplan_rejects_ragged(self):
         d = {"alphas": [[1.0, 2.0], [3.0]], "betas": [[0.0, 0.0], [0.0]]}
         with pytest.raises(ValueError, match="ragged"):
@@ -656,6 +695,95 @@ class TestDeclineGuards:
         q, k, v = _rand_qkv(H=2, S=64, seed=34)
         out = runtime.attn(q, k, v, 0)
         assert out is not None and out.shape == q.shape
+
+    # -- EXPECTED auxiliary fallback vs GENUINE wrong plan (2026-08-23) -------
+
+    def _ctx_with_excluded(self, num_heads=2, excluded=(16,)):
+        """A plan that DECLARED ``excluded`` head counts during calibration."""
+        plan = hap.ScopePlan(
+            alphas=[[64.0] * num_heads for _ in range(3)],
+            betas=[[0.0] * num_heads for _ in range(3)],
+            excluded_head_counts=list(excluded),
+        )
+        return hap.HapContext(active=True, plan=plan, text_len=0, backend="dense")
+
+    def test_aux_head_mismatch_returns_none(self):
+        """A head count in excluded_head_counts still declines to None."""
+        from src.spa_context import set_hap_context
+
+        ctx = self._ctx_with_excluded(num_heads=2, excluded=(16,))
+        set_hap_context(ctx)
+        runtime = hap.HapRuntime.get()
+        q, k, v = _rand_qkv(H=16, S=64, seed=40)
+        assert runtime.attn(q, k, v, 0) is None
+
+    def test_aux_head_mismatch_decline_is_one_time_info(self, caplog):
+        """An EXPECTED aux fallback logs ONE INFO (not a WARNING) naming the
+        excluded head count, and stays silent on repeat calls."""
+        import logging
+
+        from src.spa_context import set_hap_context
+
+        ctx = self._ctx_with_excluded(num_heads=2, excluded=(16,))
+        set_hap_context(ctx)
+        runtime = hap.HapRuntime.get()
+        q, k, v = _rand_qkv(H=16, S=64, seed=41)
+        with caplog.at_level(logging.INFO, logger="src.hap"):
+            runtime.attn(q, k, v, 0)
+            runtime.attn(q, k, v, 1)  # second call must be silent
+        infos = [r for r in caplog.records
+                 if r.levelno == logging.INFO and "EXCLUDED during" in r.message]
+        warnings = [r for r in caplog.records
+                    if r.levelno == logging.WARNING and "does not match" in r.message]
+        assert len(infos) == 1
+        assert warnings == []  # NOT a scary wrong-plan warning
+        assert "16" in infos[0].message
+
+    def test_genuine_head_mismatch_still_warning(self, caplog):
+        """A head count NOT in excluded_head_counts still logs the WARNING
+        (genuinely wrong plan) — the pre-fix behaviour is preserved."""
+        import logging
+
+        from src.spa_context import set_hap_context
+
+        # Plan declares excluded=(99,) but the model runs 16 -> NOT excluded.
+        ctx = self._ctx_with_excluded(num_heads=2, excluded=(99,))
+        set_hap_context(ctx)
+        runtime = hap.HapRuntime.get()
+        q, k, v = _rand_qkv(H=16, S=64, seed=42)
+        with caplog.at_level(logging.WARNING, logger="src.hap"):
+            runtime.attn(q, k, v, 0)
+        warnings = [r for r in caplog.records
+                    if r.levelno == logging.WARNING and "does not match" in r.message]
+        infos = [r for r in caplog.records
+                 if r.levelno == logging.INFO and "EXCLUDED during" in r.message]
+        assert len(warnings) == 1
+        assert infos == []
+        assert "2" in warnings[0].message and "16" in warnings[0].message
+
+    def test_aux_and_genuine_latches_independent(self, caplog):
+        """The aux INFO latch and the genuine WARNING latch are independent:
+        an aux call then a genuine mismatch each log exactly once."""
+        import logging
+
+        from src.spa_context import set_hap_context
+
+        ctx = self._ctx_with_excluded(num_heads=2, excluded=(16,))
+        set_hap_context(ctx)
+        runtime = hap.HapRuntime.get()
+        q_aux, k_aux, v_aux = _rand_qkv(H=16, S=64, seed=43)
+        q_bad, k_bad, v_bad = _rand_qkv(H=8, S=64, seed=44)  # not excluded
+        with caplog.at_level(logging.INFO, logger="src.hap"):
+            runtime.attn(q_aux, k_aux, v_aux, 0)   # aux -> INFO
+            runtime.attn(q_bad, k_bad, v_bad, 1)   # genuine -> WARNING
+        infos = [r for r in caplog.records
+                 if r.levelno == logging.INFO and "EXCLUDED during" in r.message]
+        warnings = [r for r in caplog.records
+                    if r.levelno == logging.WARNING and "does not match" in r.message]
+        assert len(infos) == 1
+        assert len(warnings) == 1
+        assert runtime._noted_aux_fallback is True
+        assert runtime._warned_head_mismatch is True
 
     def test_decline_latches_reset_by_runtime_reset(self):
         """``HapRuntime.reset()`` drops the singleton -> fresh latches."""

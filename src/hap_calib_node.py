@@ -608,6 +608,7 @@ def collect_scope_scores_for_model(
     text_len: int = 0,
     chunk: int = 256,
     scale: Optional[float] = None,
+    meta: Optional[Dict] = None,
 ) -> Tuple[torch.Tensor, torch.Tensor, int]:
     """Collect per-(layer, head, scope) Taylor scores from ONE backward pass.
 
@@ -1083,6 +1084,18 @@ def collect_scope_scores_for_model(
             len(excluded), excluded,
         )
         sorted_keys = [k for k in sorted_keys if _heads_of(k) == dominant]
+        # EXCLUDED-HEAD-COUNT METADATA (2026-08-23 head-count warning fix):
+        # record the NON-dominant head counts so the runtime can log a friendly
+        # INFO ("expected auxiliary fallback") instead of a scary WARNING when
+        # those calls decline to plain attention.  Threaded to the caller via
+        # the optional ``meta`` container (backward compatible).
+        if meta is not None:
+            meta["excluded_head_counts"] = sorted(
+                h for h in head_counts if h != dominant
+            )
+    else:
+        if meta is not None:
+            meta["excluded_head_counts"] = []
 
     # OBSERVED GEOMETRY + TEXT_LEN CLAMP (text_len>seq_len root cause).
     # ``seq0`` is the OBSERVED attention sequence length — the authoritative
@@ -1239,6 +1252,10 @@ def run_hap_calibration(
     quality_per_layer: Optional[List[List[torch.Tensor]]] = None
     compute_costs: Optional[List[torch.Tensor]] = None
     observed_seq_len: Optional[int] = None
+    # EXCLUDED-HEAD-COUNT METADATA (2026-08-23): filled by the collector when
+    # the model has heterogeneous head counts (auxiliary attention).  Identical
+    # across prompts (same model), so one shared container suffices.
+    calib_meta: Dict = {}
     t0 = time.time()
 
     for pi in range(num_prompts):
@@ -1266,6 +1283,7 @@ def run_hap_calibration(
             # dim_head ** -0.5 (P19 scale fix — the old hardcoded 1.0 made
             # logits sqrt(dim_head)x too large during calibration).
             scale=None,
+            meta=calib_meta,
         )
 
         num_layers = quality.shape[0]
@@ -1283,6 +1301,14 @@ def run_hap_calibration(
         quality_per_layer, compute_costs,
         budget_ratio=spec.budget_ratio, bins=spec.bins,
     )
+
+    # EXCLUDED-HEAD-COUNT METADATA (2026-08-23): persist the non-dominant head
+    # counts into the plan so the runtime can distinguish an EXPECTED auxiliary
+    # fallback (INFO) from a genuinely wrong plan (WARNING).  Only emitted when
+    # non-empty, so single-head-count plans keep the exact legacy JSON shape.
+    excluded_heads = calib_meta.get("excluded_head_counts") or []
+    if excluded_heads:
+        plan_dict["excluded_head_counts"] = list(excluded_heads)
 
     # Validate round-trip.
     plan = ScopePlan.from_dict(plan_dict)

@@ -22,7 +22,7 @@ import logging
 import math
 import os
 from dataclasses import dataclass
-from typing import List, Sequence, Union
+from typing import List, Optional, Sequence, Union
 
 import torch
 
@@ -142,6 +142,15 @@ class ScopePlan:
 
     alphas: List[List[float]]
     betas: List[List[float]]
+    # OPTIONAL metadata (2026-08-23 head-count warning fix): the head counts
+    # calibration EXCLUDED because they were non-dominant (auxiliary attention,
+    # e.g. Krea2's 4 x 20-head projector calls vs the 48-head main blocks).
+    # The runtime uses this to log a friendly INFO ("expected auxiliary
+    # fallback") instead of a scary WARNING ("plan does not match this model")
+    # when those calls decline to plain attention.  Absent in plans calibrated
+    # before this field existed — fully backward compatible (``from_dict``
+    # tolerates a missing key; ``to_dict`` omits it when empty).
+    excluded_head_counts: Optional[List[int]] = None
 
     # -- construction ------------------------------------------------------
 
@@ -153,7 +162,19 @@ class ScopePlan:
         for key in ("alphas", "betas"):
             if key not in d:
                 raise ValueError(f"ScopePlan: missing required key {key!r}")
-        plan = cls(alphas=d["alphas"], betas=d["betas"])
+        excluded = d.get("excluded_head_counts")
+        if excluded is not None and not (
+            isinstance(excluded, (list, tuple))
+            and all(isinstance(h, int) and not isinstance(h, bool) for h in excluded)
+        ):
+            raise ValueError(
+                f"ScopePlan: excluded_head_counts must be a list of ints, "
+                f"got {excluded!r}"
+            )
+        plan = cls(
+            alphas=d["alphas"], betas=d["betas"],
+            excluded_head_counts=(list(excluded) if excluded is not None else None),
+        )
         plan.validate()
         return plan
 
@@ -164,8 +185,15 @@ class ScopePlan:
             return cls.from_dict(json.load(fh))
 
     def to_dict(self) -> dict:
-        """Serialize to the reference JSON shape (round-trip stable)."""
-        return {"alphas": self.alphas, "betas": self.betas}
+        """Serialize to the reference JSON shape (round-trip stable).
+
+        ``excluded_head_counts`` is only emitted when non-empty so plans
+        without auxiliary head counts round-trip to the exact legacy shape.
+        """
+        d = {"alphas": self.alphas, "betas": self.betas}
+        if self.excluded_head_counts:
+            d["excluded_head_counts"] = list(self.excluded_head_counts)
+        return d
 
     def save(self, path: Union[str, "os.PathLike"]) -> None:
         """Write the plan as JSON (reference format)."""
@@ -531,6 +559,10 @@ class HapRuntime:
         self._warned_nonsquare = False
         self._warned_head_mismatch = False
         self._warned_exceeds = False
+        # One-time INFO latch for the EXPECTED auxiliary-head fallback
+        # (2026-08-23): distinct from ``_warned_head_mismatch`` (a genuine
+        # wrong-plan WARNING) so each fires at most once per runtime.
+        self._noted_aux_fallback = False
 
     @classmethod
     def get(cls) -> "HapRuntime":
@@ -657,17 +689,37 @@ class HapRuntime:
             return None
         # 2. Head-count mismatch: the scope plan is model-specific (the shipped
         #    plan is FLUX 57x24; Anima runs 16 heads).  Engaging the mask with a
-        #    different head count is undefined -> decline with a one-time
-        #    WARNING naming both counts (actionable: wrong plan for this model).
+        #    different head count is undefined -> decline to plain attention.
+        #    TWO sub-cases (2026-08-23 head-count warning fix):
+        #    a. EXPECTED auxiliary attention: the mismatched head count is in
+        #       ``plan.excluded_head_counts`` (calibration declared it would
+        #       fall back).  Log a one-time INFO — harmless and intended.
+        #    b. GENUINE wrong plan: the head count was NOT declared.  Log a
+        #       one-time WARNING naming both counts (actionable: calibrate a
+        #       model-specific scope plan).
         if q.shape[1] != ctx.plan.num_heads:
-            if not self._warned_head_mismatch:
-                logger.warning(
-                    "HAP: scope plan has %d heads but the model runs %d heads; "
-                    "the plan does not match this model — using plain attention. "
-                    "Calibrate a model-specific scope plan to enable HAP.",
-                    ctx.plan.num_heads, q.shape[1],
-                )
-                self._warned_head_mismatch = True
+            excluded = getattr(ctx.plan, "excluded_head_counts", None) or []
+            if q.shape[1] in excluded:
+                if not self._noted_aux_fallback:
+                    logger.info(
+                        "HAP: %d-head attention does not match the %d-head "
+                        "scope plan; this head count was EXCLUDED during "
+                        "calibration (auxiliary attention), so it runs plain "
+                        "attention.  This is expected and harmless (further "
+                        "occurrences suppressed).",
+                        q.shape[1], ctx.plan.num_heads,
+                    )
+                    self._noted_aux_fallback = True
+            else:
+                if not self._warned_head_mismatch:
+                    logger.warning(
+                        "HAP: scope plan has %d heads but the model runs %d "
+                        "heads; the plan does not match this model — using "
+                        "plain attention.  Calibrate a model-specific scope "
+                        "plan to enable HAP.",
+                        ctx.plan.num_heads, q.shape[1],
+                    )
+                    self._warned_head_mismatch = True
             return None
 
         seq_len = q.shape[-2]
