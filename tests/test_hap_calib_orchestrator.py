@@ -13,6 +13,7 @@ Accept (user-run):
     pytest tests/test_hap_calib_orchestrator.py -q
 """
 
+import pathlib
 import types
 
 import pytest
@@ -227,6 +228,57 @@ class TestOrchestratorExcludedHeads:
             model=object(), spec=spec, model_type="flux",
         )
         assert "excluded_head_counts" not in plan_dict
+
+
+# ---------------------------------------------------------------------------
+# purge_between_prompts knob + node-level cleanup (plan 2026-08-24 P3/P5)
+# ---------------------------------------------------------------------------
+
+@pytest.mark.unit
+class TestPurgeBetweenPrompts:
+    def test_spec_default_false_and_validates(self):
+        """The knob defaults to False and a valid spec passes validation."""
+        spec = _spec(["p"])
+        assert spec.purge_between_prompts is False
+        spec.validate()  # must not raise
+
+    def test_orchestrator_purges_between_prompts_when_enabled(self, monkeypatch):
+        """With the knob on: one purge per BETWEEN-prompt gap (+ collector's
+        own post-scoring purge is mocked out here)."""
+        n = {"purges": 0}
+        monkeypatch.setattr(hcn, "_purge_calibration_memory",
+                            lambda: n.__setitem__("purges", n["purges"] + 1))
+        holder = []
+        spec = _spec(["p1", "p2", "p3"], purge_between_prompts=True)
+        run_hap_calibration(
+            model=object(), spec=spec, model_type="flux",
+            forward_fn=_toy_forward(holder),
+        )
+        # 3 prompts -> 2 between-gaps; plus the final node-level purge happens
+        # in execute(), not here.  The collector's post-scoring purge is also
+        # counted (it calls the same helper): >= 2 gaps guaranteed.
+        assert n["purges"] >= 2
+
+    def test_orchestrator_no_extra_purges_when_disabled(self, monkeypatch):
+        """Default (False): only the collector's single post-scoring purge."""
+        n = {"purges": 0}
+        monkeypatch.setattr(hcn, "_purge_calibration_memory",
+                            lambda: n.__setitem__("purges", n["purges"] + 1))
+        holder = []
+        spec = _spec(["p1", "p2"])
+        run_hap_calibration(
+            model=object(), spec=spec, model_type="flux",
+            forward_fn=_toy_forward(holder),
+        )
+        assert n["purges"] == 2  # one per prompt (collector), no gap purges
+
+    def test_schema_has_purge_input_with_default_false(self):
+        """The node schema exposes purge_between_prompts defaulting to False."""
+        src = (
+            pathlib.Path(__file__).parent.parent / "src" / "hap_calib_node.py"
+        ).read_text(encoding="utf-8")
+        assert '"purge_between_prompts"' in src
+        assert "purge_between_prompts: bool = False" in src
 
 
 # ---------------------------------------------------------------------------

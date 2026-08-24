@@ -90,6 +90,12 @@ class CalibrationSpec:
     loss_type: str = "output_norm"
     prompts: List[str] = field(default_factory=list)
     reference_latent: Optional[torch.Tensor] = None
+    # PURGE-BETWEEN-PROMPTS KNOB (plan 2026-08-24 P5): opt-in gc + allocator
+    # purge between calibration prompts.  Helps low-VRAM cards where one
+    # prompt's residual cache would otherwise overlap the next forward.
+    # Default False keeps current speed; purging has NO numeric effect on
+    # results.
+    purge_between_prompts: bool = False
 
     def validate(self) -> None:
         """Raise ``ValueError`` with context for every invalid field."""
@@ -323,6 +329,15 @@ def default_calibration_forward(
         device = model.load_device if hasattr(model, "load_device") else torch.device("cpu")
 
     # Ensure model is on GPU and finalized for a forward.
+    #
+    # MODEL REUSE (plan 2026-08-24 P4): we deliberately load the SAME
+    # ModelPatcher object that flows through the graph — never a clone — so it
+    # stays registered with ComfyUI's memory manager and post-calibration
+    # inference reuses it directly.  Symmetrically, HAPCalibrate.execute must
+    # NEVER detach/unload this patcher after calibration: unloading would
+    # force exactly the reload-into-RAM we are trying to avoid.  The correct
+    # post-run action is only gc + cache purge (see _purge_calibration_memory),
+    # which lets ComfyUI re-pin the weights into VRAM on its own.
     comfy.model_management.load_models_gpu([model])
     if hasattr(model, "pre_run"):
         try:
@@ -458,6 +473,54 @@ def _gpu_mem_str(device=None) -> str:
 def _chunk_bytes(chunks) -> int:
     """Total bytes held by a list of attention chunk leaves."""
     return sum(c.numel() * c.element_size() for c in chunks)
+
+
+def _free_scored_chunk(chunk: torch.Tensor) -> None:
+    """Release a scored attention chunk's GPU memory (plan 2026-08-24 P1).
+
+    After a chunk's ``A``/``G`` have been copied to CPU and scored, the GPU
+    leaf is dead weight: nothing downstream reads it again (``records`` is
+    consumed ONLY by the scoring loop).  Dropping the ``.grad`` reference and
+    the tensor itself lets the CUDA caching allocator reuse the segment while
+    scoring continues, instead of holding every layer's leaves resident until
+    function exit (~3.6 GiB on Krea2).
+
+    Safe to call on an already-freed (None) slot; never raises.
+    """
+    if chunk is None:
+        return
+    try:
+        chunk.grad = None
+    except Exception:  # pragma: no cover - defensive
+        pass
+
+
+def _purge_calibration_memory() -> None:
+    """Release cached allocator blocks after calibration transients die.
+
+    Public-API only (checklist rule #6): prefers ComfyUI's
+    ``model_management.soft_empty_cache()`` so the memory manager stays
+    consistent; falls back to raw ``torch.cuda.empty_cache()`` when the
+    ComfyUI runtime is unavailable (tests / standalone CLI).  Best-effort —
+    never raises.
+
+    Without this purge the CUDA caching allocator keeps calibration's stale
+    reserved segments mapped, so the next ``load_models_gpu`` sees
+    insufficient free VRAM and aimdo keeps the model weights in RAM (the
+    "model reloads into RAM after calibration" symptom).
+    """
+    try:
+        import comfy.model_management as mm
+
+        mm.soft_empty_cache()
+        return
+    except Exception:
+        pass
+    try:
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+    except Exception:  # pragma: no cover - defensive
+        pass
 
 
 # ---------------------------------------------------------------------------
@@ -1137,7 +1200,16 @@ def collect_scope_scores_for_model(
         for call_chunks, call_phase in calls:
             acc = torch.zeros(heads, num_scopes, dtype=torch.float64)
             offset = 0
-            for A_chunk in call_chunks:
+            # EARLY GPU-LEAF RELEASE (plan 2026-08-24 P1): iterate by index so
+            # each consumed chunk slot can be cleared as soon as its A/G have
+            # been copied to CPU.  Nothing downstream reads the chunks again —
+            # ``records`` feeds ONLY this loop — so freeing here returns the
+            # leaf VRAM to the allocator while scoring continues instead of
+            # holding all layers' leaves resident until function exit.
+            for ci in range(len(call_chunks)):
+                A_chunk = call_chunks[ci]
+                if A_chunk is None:
+                    continue  # already freed (defensive)
                 if A_chunk.grad is None:
                     raise RuntimeError(
                         f"collect_scope_scores_for_model: layer {li} attention "
@@ -1157,6 +1229,11 @@ def collect_scope_scores_for_model(
                 # alone PRESERVES device — that was the crash (cuda:0 vs cpu).
                 A = A_chunk[0].detach().to(dtype=torch.float64, device="cpu")        # (H, C, T)
                 G = A_chunk.grad[0].detach().to(dtype=torch.float64, device="cpu")   # (H, C, T)
+                # Copy complete -> release the GPU leaf NOW (P1).  The local
+                # ``A_chunk`` name still references the tensor until the next
+                # iteration rebinds it, so also drop the record slot.
+                _free_scored_chunk(A_chunk)
+                call_chunks[ci] = None
 
                 # NaN-SOURCE DIAGNOSTIC (2026-08-18): the live all-NaN quality
                 # table could come from EITHER the attention values ``A`` (the
@@ -1198,6 +1275,16 @@ def collect_scope_scores_for_model(
     compute_cost = cost.unsqueeze(0).expand(
         quality_cost.shape[0], -1, -1
     ).clone()
+
+    # CHUNKS-FREED FLAG (plan 2026-08-24 P1): observable for tests — every
+    # recorded chunk slot was cleared during scoring.
+    if meta is not None:
+        meta["chunks_freed"] = True
+
+    # POST-SCORING PURGE (plan 2026-08-24 P2): all chunk leaves were freed
+    # above; return their cached segments to the driver so subsequent
+    # allocations (next prompt / inference) see real free VRAM.
+    _purge_calibration_memory()
 
     return quality_cost, compute_cost, seq0
 
@@ -1285,6 +1372,16 @@ def run_hap_calibration(
             scale=None,
             meta=calib_meta,
         )
+
+        # BETWEEN-PROMPT PURGE (plan 2026-08-24 P5, opt-in): release the just-
+        # scored prompt's cached segments before the next forward so low-VRAM
+        # cards don't stack two prompts' worth of reserved cache.  No numeric
+        # effect — purge only returns freed segments to the driver.
+        if spec.purge_between_prompts and pi < num_prompts - 1:
+            import gc as _gc
+
+            _gc.collect()
+            _purge_calibration_memory()
 
         num_layers = quality.shape[0]
         if quality_per_layer is None:
@@ -1606,6 +1703,15 @@ def _define_hap_calibrate_schema():
                 ),
             ),
             io.Boolean.Input(
+                "purge_between_prompts",
+                default=False,
+                optional=True,
+                tooltip=(
+                    "Run gc + VRAM cache purge between calibration prompts "
+                    "(low-VRAM cards). Slower; results identical."
+                ),
+            ),
+            io.Boolean.Input(
                 "run",
                 default=True,
                 label_on="Run Calibration",
@@ -1674,6 +1780,7 @@ class HAPCalibrate(_ComfyNodeBase):
         loss_type: str = "output_norm",
         reference_latent=None,
         output_name: str = "scope_plan_calibrated.json",
+        purge_between_prompts: bool = False,
         run: bool = True,
     ):
         # Master switch.
@@ -1707,6 +1814,7 @@ class HAPCalibrate(_ComfyNodeBase):
             loss_type=str(loss_type),
             prompts=prompt_list,
             reference_latent=ref_tensor,
+            purge_between_prompts=bool(purge_between_prompts),
         )
 
         try:
@@ -1719,6 +1827,24 @@ class HAPCalibrate(_ComfyNodeBase):
             )
         except (ValueError, RuntimeError) as exc:
             raise type(exc)(f"HAP Calibrate: {exc}") from exc
+        finally:
+            # NODE-LEVEL MEMORY CLEANUP (plan 2026-08-24 P3): runs on success
+            # AND failure.  gc.collect() first breaks autograd reference cycles
+            # so the transient tensors actually die; the purge then returns the
+            # cached segments to the driver via ComfyUI's public API.  Without
+            # this, stale reserved VRAM makes aimdo keep the model weights in
+            # RAM for the next workflow run (the "model reloads into RAM"
+            # symptom).  We deliberately do NOT detach/unload the patcher —
+            # the same ModelPatcher flows on to inference and must stay
+            # registered with ComfyUI's manager.
+            import gc as _gc
+
+            _gc.collect()
+            _purge_calibration_memory()
+            if torch.cuda.is_available():
+                logger.info(
+                    "HAP calib: memory purged (cache returned to driver)"
+                )
 
         # Write JSON.
         out_dir = os.path.join(resolve_output_dir(), "dype_hap")

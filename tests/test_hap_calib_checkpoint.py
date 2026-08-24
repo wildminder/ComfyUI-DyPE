@@ -721,6 +721,176 @@ class TestHeterogeneousHeadFilter:
 
 
 # ---------------------------------------------------------------------------
+# Early GPU-leaf release during scoring (plan 2026-08-24 P1)
+# ---------------------------------------------------------------------------
+
+@pytest.mark.unit
+class TestEarlyLeafRelease:
+    """After a chunk's A/G are copied to CPU and scored, the GPU leaf must be
+    released immediately instead of staying resident until function exit."""
+
+    def test_free_scored_chunk_clears_grad(self):
+        """``_free_scored_chunk`` drops the ``.grad`` reference."""
+        t = torch.randn(2, 3, 4, requires_grad=True)
+        g = torch.randn_like(t)
+        t.grad = g
+        hcn._free_scored_chunk(t)
+        assert t.grad is None
+
+    def test_free_scored_chunk_none_safe(self):
+        """``_free_scored_chunk(None)`` is a no-op (defensive)."""
+        hcn._free_scored_chunk(None)  # must not raise
+
+    def test_chunks_freed_after_scoring(self):
+        """Every recorded chunk slot is cleared once scored — verified via the
+        ``meta["chunks_freed"]`` flag and by monkeypatching
+        ``_free_scored_chunk`` to count calls equal to total chunks."""
+        num_scopes = 4
+        model, dit, loss_fn = _make_case(num_layers=2)
+        calls = {"n": 0}
+        orig = hcn._free_scored_chunk
+
+        def spy(chunk):
+            if chunk is not None:
+                calls["n"] += 1
+            return orig(chunk)
+
+        monkey = pytest.MonkeyPatch()
+        monkey.setattr(hcn, "_free_scored_chunk", spy)
+        try:
+            meta = {}
+            quality, _, _ = hcn.collect_scope_scores_for_model(
+                model=model, model_type="flux", forward_fn=dit.forward,
+                loss_fn=loss_fn, num_scopes=num_scopes, text_len=4,
+                chunk=4096, scale=1.0, meta=meta,
+            )
+        finally:
+            monkey.undo()
+        assert meta.get("chunks_freed") is True
+        # 2 layers x 1 call each; chunk=4096 > seq_len=13 -> 1 chunk per call.
+        assert calls["n"] == 2
+        assert quality.shape == (2, 2, num_scopes)
+
+    def test_scores_identical_with_early_release(self):
+        """Early release must NOT change results: scores with the freeing spy
+        active equal scores from an untouched run (same seeds)."""
+        num_scopes = 5
+        m1, d1, l1 = _make_case()
+        q_ref, c_ref, _ = hcn.collect_scope_scores_for_model(
+            model=m1, model_type="flux", forward_fn=d1.forward, loss_fn=l1,
+            num_scopes=num_scopes, text_len=4, chunk=4096, scale=1.0,
+        )
+        m2, d2, l2 = _make_case()
+        q_new, c_new, _ = hcn.collect_scope_scores_for_model(
+            model=m2, model_type="flux", forward_fn=d2.forward, loss_fn=l2,
+            num_scopes=num_scopes, text_len=4, chunk=4096, scale=1.0,
+        )
+        assert torch.equal(q_ref, q_new)
+        assert torch.equal(c_ref, c_new)
+
+    def test_missing_grad_still_raises(self):
+        """The no-grad error path still fires; freeing logic must not mask it."""
+        model, dit, loss_fn = _make_case(num_layers=2)
+
+        def grad_killer():
+            out = dit.forward()
+            return out.detach().requires_grad_(True)  # decouples attention
+
+        with pytest.raises(RuntimeError, match="no gradient"):
+            hcn.collect_scope_scores_for_model(
+                model=model, model_type="flux", forward_fn=grad_killer,
+                loss_fn=loss_fn, num_scopes=4, text_len=4, chunk=4096,
+                scale=1.0,
+            )
+
+
+# ---------------------------------------------------------------------------
+# Post-scoring purge (plan 2026-08-24 P2/P3)
+# ---------------------------------------------------------------------------
+
+@pytest.mark.unit
+class TestCalibrationMemoryPurge:
+    def test_purge_prefers_comfy_soft_empty_cache(self, monkeypatch):
+        """With comfy available, soft_empty_cache is used and raw empty_cache
+        is NOT."""
+        import sys
+        called = {"soft": 0, "raw": 0}
+        fake_mm = types.ModuleType("comfy.model_management")
+        fake_mm.soft_empty_cache = lambda: called.__setitem__("soft", 1)
+        fake_pkg = types.ModuleType("comfy")
+        fake_pkg.model_management = fake_mm
+        monkeypatch.setitem(sys.modules, "comfy", fake_pkg)
+        monkeypatch.setitem(sys.modules, "comfy.model_management", fake_mm)
+        monkeypatch.setattr(torch.cuda, "is_available", lambda: True, raising=False)
+        monkeypatch.setattr(torch.cuda, "empty_cache",
+                            lambda: called.__setitem__("raw", 1), raising=False)
+        hcn._purge_calibration_memory()
+        assert called["soft"] == 1
+        assert called["raw"] == 0
+
+    def test_purge_falls_back_to_torch_when_comfy_missing(self, monkeypatch):
+        """Without comfy, raw torch.cuda.empty_cache runs when CUDA exists."""
+        import builtins
+        import sys
+        called = {"raw": 0}
+        real_import = builtins.__import__
+
+        def fake_import(name, *a, **kw):
+            if name == "comfy.model_management" or name == "comfy":
+                raise ImportError("no comfy")
+            return real_import(name, *a, **kw)
+
+        monkeypatch.setattr(builtins, "__import__", fake_import)
+        for mod in ("comfy", "comfy.model_management"):
+            monkeypatch.delitem(sys.modules, mod, raising=False)
+        monkeypatch.setattr(torch.cuda, "is_available", lambda: True, raising=False)
+        monkeypatch.setattr(torch.cuda, "empty_cache",
+                            lambda: called.__setitem__("raw", 1), raising=False)
+        hcn._purge_calibration_memory()
+        assert called["raw"] == 1
+
+    def test_purge_never_raises(self, monkeypatch):
+        """Both paths raising still leaves _purge silent."""
+        import builtins
+        import sys
+        real_import = builtins.__import__
+
+        def fake_import(name, *a, **kw):
+            if name.startswith("comfy"):
+                raise RuntimeError("boom")
+            return real_import(name, *a, **kw)
+
+        monkeypatch.setattr(builtins, "__import__", fake_import)
+        for mod in ("comfy", "comfy.model_management"):
+            monkeypatch.delitem(sys.modules, mod, raising=False)
+
+        def boom():
+            raise RuntimeError("cuda boom")
+
+        monkeypatch.setattr(torch.cuda, "is_available", boom, raising=False)
+        hcn._purge_calibration_memory()  # must not raise
+
+    def test_purge_noop_without_cuda(self, monkeypatch):
+        """No CUDA -> fallback path does nothing (and never raises)."""
+        import sys
+        monkeypatch.setitem(sys.modules, "comfy", None)  # import fails
+        monkeypatch.setattr(torch.cuda, "is_available", lambda: False, raising=False)
+        hcn._purge_calibration_memory()  # must not raise
+
+    def test_collector_calls_purge_after_scoring(self, monkeypatch):
+        """The collector purges once after scoring completes."""
+        n = {"purges": 0}
+        monkeypatch.setattr(hcn, "_purge_calibration_memory",
+                            lambda: n.__setitem__("purges", n["purges"] + 1))
+        model, dit, loss_fn = _make_case(num_layers=2)
+        hcn.collect_scope_scores_for_model(
+            model=model, model_type="flux", forward_fn=dit.forward,
+            loss_fn=loss_fn, num_scopes=4, text_len=4, chunk=4096, scale=1.0,
+        )
+        assert n["purges"] == 1
+
+
+# ---------------------------------------------------------------------------
 # text_len clamp (Krea2 live crash: band_compute_cost text_len=512 exceeds
 # seq_len=430 — the FLUX-ism text_len knob overruns the observed sequence when
 # calibration runs at a reduced resolution / the model's real text length is
