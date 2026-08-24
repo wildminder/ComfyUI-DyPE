@@ -506,6 +506,11 @@ def _spa_ensure_no_incompatible_embedder(orig_embedder) -> None:
     """Reject DyPE/SEGA embedders; allow re-application of an existing SPA embedder.
 
     Resolves remediation decision 6 (mutual exclusivity of SPA and DyPE/SEGA).
+
+    MESSAGE (2026-08-24): names the offending embedder class and the recovery
+    path.  The pre-fix message ("Apply only one") gave no actionable remedy —
+    users hit it after switching SEGA->SPA in one session and had to discover
+    the reload requirement by trial.
     """
     if isinstance(orig_embedder, SPABasePosEmbed):
         return  # already SPA -> allow (re-apply / idempotent)
@@ -517,8 +522,14 @@ def _spa_ensure_no_incompatible_embedder(orig_embedder) -> None:
         "PosEmbedZImage",
         "PosEmbedAnima",
     }:
+        kind = "SEGA" if name.startswith("SegA") else "DyPE"
         raise ValueError(
-            "SPA and DyPE/SEGA are mutually exclusive in v1. Apply only one."
+            f"SPA: the model already has {kind} applied "
+            f"(embedder class {name!r}).  SPA and DyPE/SEGA are mutually "
+            f"exclusive — they both rewrite position encoding and cannot be "
+            f"stacked.  To switch methods, reload the model (Load Model node) "
+            f"or route this branch from a fresh loader; bypassing the {kind} "
+            f"node alone does NOT remove its patch."
         )
 
 
@@ -710,9 +721,16 @@ def parse_layer_filter(spec: str):
     Invalid specs (reversed range, non-integer token, negative index, empty
     range part) raise :class:`ValueError` naming the offending token.  The
     result is deduplicated and sorted (frozenset).
+
+    IDEMPOTENT (2026-08-24): an already-parsed ``frozenset`` passes through
+    unchanged, so callers may pre-parse (the SPADyPE node parses first to
+    scope the "invalid spa_layer_filter" error prefix to filter failures only)
+    and :func:`apply_spa_to_model` re-parses safely.
     """
     if spec is None:
         return None
+    if isinstance(spec, frozenset):
+        return spec
     spec = str(spec).strip()
     if not spec:
         return None

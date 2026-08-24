@@ -5,7 +5,7 @@ from comfy_api.latest import ComfyExtension, io
 from .src.hap import ScopePlan, apply_hap_to_model
 from .src.hap_calib_node import HAPCalibrate
 from .src.patch_utils import apply_dype_to_model, apply_sega_to_model
-from .src.spa import apply_spa_to_model
+from .src.spa import apply_spa_to_model, parse_layer_filter
 from .src.pixelrush_node import PixelRushNode
 from .src.freescale_node import FreeScaleNode
 from .src.qwen2d_vae_patch import install_qwen2d_patch
@@ -333,17 +333,24 @@ class SPA(io.ComfyNode):
         # "nor" RoPE).  The DyPE extrapolation methods are a no-op for SPA, so
         # the knob was removed to avoid misleading A/B testing.
         bs = None if (bundle_size is None or bundle_size <= 0) else int(bundle_size)
+        # NOTE (2026-08-24): only FILTER-PARSE failures get the
+        # "invalid spa_layer_filter" prefix.  The pre-fix wrapper re-wrapped
+        # EVERY ValueError from apply_spa_to_model, so the mutual-exclusion
+        # guard surfaced as "SPA: invalid spa_layer_filter '': SPA and DyPE/
+        # SEGA are mutually exclusive ..." — naming an unrelated knob and
+        # sending users to debug the wrong input.
         try:
-            patched_model = apply_spa_to_model(
-                model, model_type, width, height,
-                enable_spa=enable_spa, bundle_size=bs,
-                spa_start_sigma=float(spa_start_sigma),
-                spa_steps=int(spa_steps),
-                spa_layer_filter=spa_layer_filter,
-                proportional_attention=bool(proportional_attention),
-            )
+            parsed_filter = parse_layer_filter(spa_layer_filter)
         except ValueError as exc:
             raise ValueError(f"SPA: invalid spa_layer_filter {spa_layer_filter!r}: {exc}") from exc
+        patched_model = apply_spa_to_model(
+            model, model_type, width, height,
+            enable_spa=enable_spa, bundle_size=bs,
+            spa_start_sigma=float(spa_start_sigma),
+            spa_steps=int(spa_steps),
+            spa_layer_filter=parsed_filter,
+            proportional_attention=bool(proportional_attention),
+        )
         return io.NodeOutput(patched_model)
 
 

@@ -110,6 +110,22 @@ class TestSpaNodeSchema:
     def test_imports_apply_spa(self):
         assert "apply_spa_to_model" in _INIT.read_text(encoding="utf-8")
 
+    def test_filter_error_scope_is_narrow(self):
+        """The 'invalid spa_layer_filter' prefix must wrap ONLY filter-parse
+        failures — not every ValueError from apply_spa_to_model (2026-08-24:
+        the mutual-exclusion guard surfaced as 'invalid spa_layer_filter'
+        because the node re-wrapped all ValueErrors)."""
+        content = _INIT.read_text(encoding="utf-8")
+        start = content.index("class SPA(io.ComfyNode):")
+        end = content.index("class DyPEExtension")
+        spa_section = content[start:end]
+        # Pre-parses the filter in its own try/except.
+        assert "parse_layer_filter(spa_layer_filter)" in spa_section
+        assert "invalid spa_layer_filter" in spa_section
+        # The apply call itself is NOT inside a blanket try/except ValueError
+        # that would re-wrap unrelated errors with the filter message.
+        assert "except ValueError as exc:\n            raise type(exc)" not in spa_section
+
     def test_has_bundle_size_input(self):
         content = _INIT.read_text(encoding="utf-8")
         assert "bundle_size" in content
@@ -463,6 +479,45 @@ class TestSpaComposition:
         m.model.diffusion_model.pe_embedder = PosEmbedSPAFlux(10000, [16, 56, 56])
         with pytest.raises(ValueError, match="mutually exclusive"):
             apply_sega_to_model(m, "flux", 4096, 4096)
+
+    # --- Improved guard message + node error scoping (2026-08-24) ------------
+
+    def test_guard_message_names_embedder_class_and_recovery(self):
+        """The SEGA->SPA guard names the offending embedder class, the method
+        kind (SEGA/DyPE), and the recovery path (reload)."""
+        from src.models.sega_anima import SegAPosEmbedAnima
+        from src.spa import _spa_ensure_no_incompatible_embedder
+
+        embedder = SegAPosEmbedAnima(theta=[10000.0, 10000.0, 10000.0],
+                                     axes_dim=[16, 56, 56])
+        with pytest.raises(ValueError) as exc_info:
+            _spa_ensure_no_incompatible_embedder(embedder)
+        msg = str(exc_info.value)
+        assert "SegAPosEmbedAnima" in msg      # embedder class named
+        assert "SEGA" in msg                    # method kind named
+        assert "reload" in msg.lower()          # recovery path given
+        assert "mutually exclusive" in msg      # original semantics kept
+
+    def test_guard_message_dype_kind(self):
+        """A DyPE (non-SEGA) embedder reports kind 'DyPE'."""
+        from src.models.flux import PosEmbedFlux
+        from src.spa import _spa_ensure_no_incompatible_embedder
+
+        embedder = PosEmbedFlux(10000, [16, 56, 56])
+        with pytest.raises(ValueError) as exc_info:
+            _spa_ensure_no_incompatible_embedder(embedder)
+        msg = str(exc_info.value)
+        assert "DyPE" in msg
+        assert "PosEmbedFlux" in msg
+
+    def test_parse_layer_filter_idempotent_on_frozenset(self):
+        """parse_layer_filter passes an already-parsed frozenset through
+        unchanged (the node pre-parses; apply_spa_to_model re-parses)."""
+        from src.spa import parse_layer_filter
+
+        fs = frozenset({0, 1, 5})
+        assert parse_layer_filter(fs) is fs
+        assert parse_layer_filter(None) is None
 
 
 @pytest.mark.unit
