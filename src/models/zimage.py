@@ -1,7 +1,10 @@
-import torch
 import math
+
+import torch
+
 from ..base import DyPEBasePosEmbed
 from ..rope import get_1d_dype_yarn_pos_embed, get_1d_ntk_pos_embed, get_1d_yarn_pos_embed
+
 
 class PosEmbedZImage(DyPEBasePosEmbed):
     """
@@ -21,7 +24,7 @@ class PosEmbedZImage(DyPEBasePosEmbed):
             t_norm = 1.0
         else:
             t_norm = t_effective / self.dype_start_sigma
-        
+
         t_factor = math.pow(t_norm, self.dype_exponent)
         return 1.0 - t_factor
 
@@ -35,7 +38,7 @@ class PosEmbedZImage(DyPEBasePosEmbed):
         if not image_mask.any(): return pos
 
         blend_val = self._blend_to_full_scale()
-        if blend_val <= 0.001: return pos 
+        if blend_val <= 0.001: return pos
 
         blend = torch.tensor(blend_val, device=pos.device, dtype=pos.dtype)
         pos_rescaled = pos.clone()
@@ -47,7 +50,7 @@ class PosEmbedZImage(DyPEBasePosEmbed):
 
             unique_coords = torch.unique(coords_image)
             if unique_coords.numel() <= 1: continue
-            
+
             unique_sorted, _ = torch.sort(unique_coords)
             deltas = torch.diff(unique_sorted)
             if deltas.numel() == 0: continue
@@ -65,7 +68,7 @@ class PosEmbedZImage(DyPEBasePosEmbed):
     def _calc_zimage_components(self, pos: torch.Tensor, freqs_dtype: torch.dtype):
         n_axes = pos.shape[-1]
         components = []
-        
+
         scale_global = self.external_scale_hint
 
         if scale_global > 1.0 and self.dype:
@@ -80,9 +83,9 @@ class PosEmbedZImage(DyPEBasePosEmbed):
         for i in range(n_axes):
             axis_pos = pos[..., i]
             axis_dim = self.axes_dim[i]
-            
+
             common_kwargs = {
-                'dim': axis_dim, 'pos': axis_pos, 'theta': self.theta, 
+                'dim': axis_dim, 'pos': axis_pos, 'theta': self.theta,
                 'use_real': True, 'repeat_interleave_real': True, 'freqs_dtype': freqs_dtype
             }
 
@@ -95,34 +98,34 @@ class PosEmbedZImage(DyPEBasePosEmbed):
                 # VISION YARN
                 if self.method == 'vision_yarn':
                     dype_kwargs = {
-                        'dype': self.dype, 'current_timestep': self.current_timestep, 
+                        'dype': self.dype, 'current_timestep': self.current_timestep,
                         'dype_scale': self.dype_scale, 'dype_exponent': self.dype_exponent,
                         'ntk_scale': scale_global, 'override_mscale': current_mscale,
-                        'linear_scale': scale_global 
+                        'linear_scale': scale_global
                     }
                     cos, sin = get_1d_dype_yarn_pos_embed(
                         **common_kwargs, ori_max_pe_len=base_axis_len, **dype_kwargs
                     )
-                
+
                 # LEGACY YARN
                 elif self.method == 'yarn':
                     fake_current_len = int(base_axis_len * scale_global)
                     max_pe_len = torch.tensor(fake_current_len, dtype=freqs_dtype, device=pos.device)
-                    
+
                     dype_kwargs = {'dype': self.dype, 'current_timestep': self.current_timestep, 'dype_scale': self.dype_scale, 'dype_exponent': self.dype_exponent}
-                    
+
                     cos, sin = get_1d_yarn_pos_embed(
-                        **common_kwargs, max_pe_len=max_pe_len, ori_max_pe_len=base_axis_len, 
-                        **dype_kwargs, use_aggressive_mscale=False 
+                        **common_kwargs, max_pe_len=max_pe_len, ori_max_pe_len=base_axis_len,
+                        **dype_kwargs, use_aggressive_mscale=False
                     )
-                    
+
                     if self.dype:
                         mscale_tensor = torch.tensor(current_mscale, dtype=cos.dtype, device=cos.device)
                         cos = cos * mscale_tensor
                         sin = sin * mscale_tensor
-                
+
                 # NTK
-                else: 
+                else:
                     base_ntk = scale_global ** (axis_dim / (axis_dim - 2))
                     if self.dype:
                         k_t = self.dype_scale * (self.current_timestep ** self.dype_exponent)
@@ -136,7 +139,7 @@ class PosEmbedZImage(DyPEBasePosEmbed):
                 cos, sin = get_1d_ntk_pos_embed(**common_kwargs, ntk_factor=1.0)
 
             components.append((cos, sin))
-            
+
         return components
 
     def get_components(self, pos: torch.Tensor, freqs_dtype: torch.dtype):

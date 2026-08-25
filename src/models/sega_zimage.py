@@ -1,7 +1,9 @@
-import torch
 import math
+
+import torch
+
+from ..rope import get_1d_ntk_pos_embed
 from ..sega_base import SegAPosEmbed
-from ..rope import get_1d_dype_yarn_pos_embed, get_1d_ntk_pos_embed, get_1d_yarn_pos_embed
 
 
 class SegAPosEmbedZImage(SegAPosEmbed):
@@ -99,9 +101,6 @@ class SegAPosEmbedZImage(SegAPosEmbed):
             is_spatial = i > 0
 
             if is_spatial and scale_global > 1.0:
-                grid_idx = i - 1
-                base_axis_len = self.base_patch_grid[grid_idx] if grid_idx < len(self.base_patch_grid) else self.base_patches
-
                 # NTK base frequency scaling
                 base_ntk = scale_global ** (axis_dim / (axis_dim - 2))
                 ntk_factor = max(1.0, base_ntk)

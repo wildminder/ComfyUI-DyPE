@@ -1,9 +1,9 @@
 """Tests for the SPA Anima/Cosmos adapter (3D RoPE, bundle h/w, keep t)."""
-import torch
 import pytest
+import torch
 
-from src.spa import build_bundle_id_variants, get_spa_context
 from src.models.spa_anima import PosEmbedSPAAnima
+from src.spa import build_bundle_id_variants, get_spa_context
 
 
 @pytest.mark.unit
@@ -69,7 +69,7 @@ class TestPosEmbedSPAAnima:
         emb = PosEmbedSPAAnima(theta=[10000.0, 10000.0, 10000.0], axes_dim=[44, 42, 42],
                                method="vision_yarn", enable_spa=True, bundle_size=1)
         x = self._make(T=1, H=16, W=16, C=128)
-        out = emb(x)
+        emb(x)  # output unused; the assertion targets the CONTEXT state
         ctx = get_spa_context()
         assert ctx is None or ctx.active is False
 

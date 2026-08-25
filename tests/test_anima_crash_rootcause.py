@@ -37,7 +37,6 @@ so a positional regression crashes the test exactly like production).
 Markers: @pytest.mark.mock_integration
 """
 
-import types
 
 import pytest
 import torch

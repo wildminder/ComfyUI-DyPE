@@ -1,6 +1,7 @@
 """Tests for PixelRush node schema (Tier 2: node schema tests)."""
-import pytest
 import pathlib
+
+import pytest
 import torch
 
 
@@ -380,8 +381,9 @@ class TestPixelRushVAEAdaptersFunctional:
         """Verify 5D handling doesn't corrupt batch dimension (the Krea2 bug)."""
         import sys
         sys.path.insert(0, str(pathlib.Path(__file__).parent.parent))
-        from src.pixelrush_node import _make_vae_adapters
         import torch.nn.functional as F
+
+        from src.pixelrush_node import _make_vae_adapters
 
         vae = self._make_mock_vae_3d()
         model = self._make_mock_model_3d()
@@ -402,8 +404,8 @@ class TestPixelRushVAEAdaptersFunctional:
         """pixelrush_cascade should squeeze 5D vae_encode output to 4D for refine_latent_once."""
         import sys
         sys.path.insert(0, str(pathlib.Path(__file__).parent.parent))
-        from src.pixelrush import pixelrush_cascade, PixelRushConfig
-        import torch.nn.functional as F
+
+        from src.pixelrush import PixelRushConfig, pixelrush_cascade
 
         # Track shapes passed to predict_eps
         eps_shapes = []
@@ -507,7 +509,7 @@ class TestPixelRushProgressBar:
         """refine_latent_once should call progress_callback after each patch."""
         import sys
         sys.path.insert(0, str(pathlib.Path(__file__).parent.parent))
-        from src.pixelrush import refine_latent_once, PixelRushConfig
+        from src.pixelrush import PixelRushConfig, refine_latent_once
 
         # Track callback invocations
         callback_calls = []
@@ -529,7 +531,7 @@ class TestPixelRushProgressBar:
             gaussian_sigma=8.0, gaussian_kernel_size=41,
         )
 
-        result = refine_latent_once(
+        refine_latent_once(
             coarse_latent=coarse_latent,
             predict_eps=predict_eps,
             alpha_bar_at=alpha_bar_at,
@@ -550,7 +552,7 @@ class TestPixelRushProgressBar:
         """pixelrush_cascade should pass stage info to progress_callback."""
         import sys
         sys.path.insert(0, str(pathlib.Path(__file__).parent.parent))
-        from src.pixelrush import pixelrush_cascade, PixelRushConfig
+        from src.pixelrush import PixelRushConfig, pixelrush_cascade
 
         callback_calls = []
 
@@ -580,7 +582,7 @@ class TestPixelRushProgressBar:
         )
 
         initial_latent = torch.randn(1, 4, 32, 32)
-        result = pixelrush_cascade(
+        pixelrush_cascade(
             initial_latent=initial_latent,
             num_cascade_stages=2,
             vae_decode=vae_decode,
@@ -725,8 +727,9 @@ class TestPixelRushInferenceBugFix:
         """
         import sys
         sys.path.insert(0, str(pathlib.Path(__file__).parent.parent))
-        from src.pixelrush import spherical_lerp
         import torch
+
+        from src.pixelrush import spherical_lerp
         torch.manual_seed(0)
         a = 0.1 * torch.randn(1, 4, 32, 32)   # eps_pred-like (small norm)
         b = torch.randn(1, 4, 32, 32)          # eps_rand-like (large norm)
@@ -781,8 +784,9 @@ class TestPixelRushInferenceBugFixFunctional:
         """alpha_bar_at should return reasonable values for various timesteps."""
         import sys
         sys.path.insert(0, str(pathlib.Path(__file__).parent.parent))
-        from src.pixelrush_node import _make_alpha_bar_at
         import types
+
+        from src.pixelrush_node import _make_alpha_bar_at
 
         model = types.SimpleNamespace()
         model.model = types.SimpleNamespace()
@@ -810,8 +814,9 @@ class TestPixelRushInferenceBugFixFunctional:
         """alpha_bar_at(249) should NOT be near zero (the old bug returned 0)."""
         import sys
         sys.path.insert(0, str(pathlib.Path(__file__).parent.parent))
-        from src.pixelrush_node import _make_alpha_bar_at
         import types
+
+        from src.pixelrush_node import _make_alpha_bar_at
 
         model = types.SimpleNamespace()
         model.model = types.SimpleNamespace()

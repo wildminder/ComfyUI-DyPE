@@ -11,21 +11,14 @@ Reference: FreeScale paper (arXiv:2412.09626).
 from __future__ import annotations
 
 import logging
-import math
 from typing import Any
 
 import torch
 import torch.nn.functional as F
-
-from comfy_api.latest import ComfyExtension, io
+from comfy_api.latest import io
 
 from .freescale import (
-    FreeScaleConfig,
-    gaussian_blur_2d,
-    scale_fusion,
     forward_noise,
-    blend_detail_latents,
-    cosine_detail_weight,
 )
 
 logger = logging.getLogger("ComfyUI-DyPE")
@@ -121,17 +114,16 @@ def _make_patched_forward(module: Any, name: str):
     ) -> torch.Tensor:
         # Get scale parameters
         hw = getattr(module, '_freescale_hw', None)
-        fast_mode = getattr(module, '_freescale_fast_mode', True)
-        kernel_size = getattr(module, '_freescale_kernel_size', 5)
-        sigma = getattr(module, '_freescale_sigma', 1.0)
 
         if hw is None or (hw[0] <= 1024 and hw[1] <= 1024):
             # Base resolution — no scale fusion needed
             return original_forward(hidden_states, *args, **kwargs)
 
-        scale_num_h = hw[0] // 1024
-        scale_num_w = hw[1] // 1024
-        current_scale_num = max(scale_num_h, scale_num_w)
+        # (fast_mode / kernel_size / sigma knobs are consumed by the full
+        # scale-fusion integration; the current passthrough implementation
+        # reads only `hw` to decide whether patching applies.  The scale-num
+        # computation lives in execute(), which passes it to
+        # patch_scale_attention.)
 
         # Run self-attention normally (global attention)
         # The original forward includes self-attention + cross-attention + FF
@@ -318,8 +310,8 @@ class FreeScaleNode(io.ComfyNode):
     def execute(cls, model, vae, positive, negative, latent_image, cfg=7.5,
                 num_inference_steps=50, target_resolution=2048, cosine_scale=2.0,
                 noise_timestep=700, fast_mode=True) -> io.NodeOutput:
-        import comfy.samplers
         import comfy.model_management
+        import comfy.samplers
         import comfy.utils
 
         # Get initial latent
@@ -431,10 +423,10 @@ class FreeScaleNode(io.ComfyNode):
             )
             z_up = vae_encode(image_up)
 
-            # 2. Add noise at timestep K
-            noise = torch.randn_like(z_up)
+            # 2. Noise level at timestep K.  The actual noising is performed
+            # INSIDE comfy.sample.sample() via the `denoise` fraction (step 4),
+            # so we only need alpha_k here — not a materialized noisy latent.
             alpha_k = alpha_bar_at(noise_timestep)
-            z_noisy = forward_noise(z_up, noise, alpha_k)
 
             # 3. Patch attention with scale fusion
             stored = patch_scale_attention(

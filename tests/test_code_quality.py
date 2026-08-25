@@ -1,6 +1,8 @@
 """Code quality meta-tests — verify structural invariants (Tier 1)."""
 import ast
 import pathlib
+import re
+
 import pytest
 
 PROJECT_ROOT = pathlib.Path(__file__).parent.parent
@@ -18,6 +20,26 @@ class TestNoBareExcept:
                 if isinstance(node, ast.ExceptHandler) and node.type is None:
                     violations.append(f"{py_file.relative_to(PROJECT_ROOT)}:{node.lineno}")
         assert violations == [], f"Bare except found at: {violations}"
+
+
+@pytest.mark.unit
+class TestRetiredDebugArtifacts:
+    """W9.e (NTH-106): temporary diagnostics must not linger in production."""
+
+    def test_shape_diag_latch_retired(self):
+        """The 2026-08-18 ``_shape_diag`` diagnostic latch was removed once its
+        hypothesis was confirmed and fixed."""
+        spa_src = (SRC_DIR / "spa.py").read_text(encoding="utf-8")
+        assert "_shape_diag" not in spa_src, (
+            "the retired _shape_diag diagnostic latch reappeared in spa.py"
+        )
+
+    def test_tmp_dir_is_gitignored(self):
+        """Scratch files live in tmp/, which must stay untracked."""
+        gitignore = (PROJECT_ROOT / ".gitignore").read_text(encoding="utf-8")
+        assert re.search(r"^tmp/$", gitignore, re.MULTILINE), (
+            "tmp/ is missing from .gitignore"
+        )
 
 
 @pytest.mark.unit
@@ -48,10 +70,15 @@ class TestZImageScaleHintDocumented:
 class TestTypeAnnotations:
     def test_rope_functions_have_return_annotations(self):
         import inspect
+
         from src.rope import (
-            find_correction_factor, find_correction_range,
-            linear_ramp_mask, find_newbase_ntk,
-            get_1d_dype_yarn_pos_embed, get_1d_yarn_pos_embed, get_1d_ntk_pos_embed
+            find_correction_factor,
+            find_correction_range,
+            find_newbase_ntk,
+            get_1d_dype_yarn_pos_embed,
+            get_1d_ntk_pos_embed,
+            get_1d_yarn_pos_embed,
+            linear_ramp_mask,
         )
         functions = [
             find_correction_factor, find_correction_range,
@@ -65,6 +92,7 @@ class TestTypeAnnotations:
 
     def test_base_class_methods_have_annotations(self):
         import inspect
+
         from src.base import DyPEBasePosEmbed
         methods = ['set_timestep', '_get_mscale', 'get_components', 'forward']
         for name in methods:

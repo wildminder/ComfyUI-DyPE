@@ -9,10 +9,9 @@ Works with any ComfyUI model (SDXL, SD1.5, FLUX, etc.).
 from __future__ import annotations
 
 import logging
-import torch
-import torch.nn.functional as F
 
-from comfy_api.latest import ComfyExtension, io
+import torch
+from comfy_api.latest import io
 
 from .pixelrush import PixelRushConfig, pixelrush_cascade
 
@@ -40,7 +39,7 @@ def _scale_k_timestep(model, k_timestep):
                 k_timestep, scaled,
             )
             return scaled
-    except Exception as e:
+    except Exception as e:  # degrade: keep raw k_timestep (user action may matter)
         logger.warning("PixelRush: could not detect timestep range (%s), using raw k_timestep", e)
     return k_timestep
 
@@ -154,9 +153,9 @@ def _make_predict_eps(model, positive, negative, cfg_scale, latent_dimensions=2,
 
     Returns a callable: predict_eps(latent, timestep) -> eps [B, C, H, W]
     """
-    import comfy.samplers
-    import comfy.sampler_helpers
     import comfy.model_management
+    import comfy.sampler_helpers
+    import comfy.samplers
     import comfy.utils
 
     device = model.load_device if hasattr(model, 'load_device') else torch.device("cpu")
@@ -167,12 +166,11 @@ def _make_predict_eps(model, positive, negative, cfg_scale, latent_dimensions=2,
     # resulting epsilon back to VAE space. When None (no process_latent_in/out
     # on the model, or legacy mode), the conversions are no-ops.
     process_latent_in = getattr(model.model, 'process_latent_in', None)
-    process_latent_out = getattr(model.model, 'process_latent_out', None)
     if not operate_in_vae_space:
         # Legacy mode: execute() already applied process_latent_in; eps stays in
-        # model space. Disable the conversions here.
+        # model space. Disable the conversion here (process_latent_out is only
+        # needed in VAE-space mode, so it is not captured at all).
         process_latent_in = None
-        process_latent_out = None
 
     # Ensure the model is loaded to GPU and pre_run is called
     # pre_run sets model.model.current_patcher = model (the ModelPatcher)
@@ -746,7 +744,6 @@ class PixelRushNode(io.ComfyNode):
 
         # Progress bar
         pbar = comfy.utils.ProgressBar(total_patches)
-        patches_done = [0]  # mutable counter for closure
 
         def progress_callback(patch_idx, total_patches_in_stage, stage, num_stages):
             # Accumulate patches from previous stages + current patch

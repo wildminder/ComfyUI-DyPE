@@ -1,0 +1,16 @@
+# Pre-commit hooks (plan 2026-08-25 W1.3, tracker CRIT-001).
+#
+# Install once per clone:   pre-commit install
+# Run on everything:        pre-commit run --all-files
+#
+# The version-sync hook enforces CRIT-001 locally: pyproject.toml version
+# must equal the README changelog's top '#### vX.Y.Z' entry.
+repos:
+  - repo: local
+    hooks:
+      - id: version-sync
+        name: version-sync (pyproject == README changelog)
+        entry: python tests/test_version_sync.py
+        language: system
+        pass_filenames: false
+        files: ^(pyproject\.toml|README\.md)$

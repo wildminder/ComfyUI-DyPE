@@ -10,7 +10,6 @@ is the right unit to verify end-to-end patching for every supported model type.
 The node *wiring* (schema, inputs, registration) is covered separately by the
 schema text-checks below, which read ``__init__.py`` directly.
 """
-import inspect
 import pathlib
 import types
 
@@ -208,14 +207,15 @@ class TestSpaNodePatching:
         assert embedder.bundle_size == 0
 
     def test_explicit_n_stored_verbatim_and_pass_count(self):
+        import torch
+
         from src.models.spa_flux import PosEmbedSPAFlux
         from src.spa import (
+            SPA_MAX_PASSES,
             apply_spa_to_model,
             build_bundle_id_variants,
             derive_bundle_s,
-            SPA_MAX_PASSES,
         )
-        import torch
 
         def _latent_ids(H, W):
             ids = torch.zeros(1, H * W, 3)
@@ -337,7 +337,6 @@ class TestSpaNodePatching:
         assert isinstance(out_z._object_patches["diffusion_model.rope_embedder"], PosEmbedSPAZImage)
 
     def test_nunchaku_and_anima_patched(self):
-        from src.models.spa_nunchaku import PosEmbedSPANunchaku
         from src.models.spa_anima import PosEmbedSPAAnima
         from src.spa import apply_spa_to_model
 
@@ -364,6 +363,73 @@ class TestSpaNodePatching:
         assert out._object_patches["diffusion_model.pe_embedder"].bundle_size == 0
 
 
+@pytest.mark.unit
+class TestSpaDoubleApplyWarning:
+    """W9.g (NTH-108): a GENUINE SPA re-apply warns; the HAP chain does not."""
+
+    def test_double_apply_warns(self, caplog):
+        """Applying SPA onto a patcher that ALREADY has the hook AND an SPA
+        embedder emits the double-application WARNING."""
+        import logging
+
+        from src.models.spa_flux import PosEmbedSPAFlux
+        from src.spa import apply_spa_to_model
+
+        apply_spa_to_model(  # first apply establishes the baseline state
+            _make_flux_mock(), "flux", 2048, 2048, "ntk",
+            enable_spa=True, bundle_size=3,
+        )
+        # Simulate a genuine re-apply: the SOURCE patcher carries BOTH the
+        # hook flag AND an SPA embedder AS THE LIVE ATTRIBUTE (the mock clone
+        # copies dm attributes, mirroring how get_model_object resolves the
+        # patched embedder in real ComfyUI).
+        second_src = _make_flux_mock()
+        second_src._spa_installed = True
+        second_src.model.diffusion_model.pe_embedder = PosEmbedSPAFlux(
+            theta=10000, axes_dim=[16, 56, 56], method="ntk",
+            base_resolution=1024, enable_spa=True, bundle_size=3,
+        )
+        with caplog.at_level(logging.WARNING, logger="ComfyUI-DyPE"):
+            apply_spa_to_model(
+                second_src, "flux", 2048, 2048, "ntk",
+                enable_spa=True, bundle_size=3,
+            )
+        assert any(
+            "applied twice" in r.message for r in caplog.records
+        ), "expected the double-application WARNING"
+
+    def test_fresh_apply_no_warning(self, caplog):
+        """A fresh apply (no prior hook) must NOT warn."""
+        import logging
+
+        from src.spa import apply_spa_to_model
+
+        with caplog.at_level(logging.WARNING, logger="ComfyUI-DyPE"):
+            apply_spa_to_model(
+                _make_flux_mock(), "flux", 2048, 2048, "ntk",
+                enable_spa=True, bundle_size=3,
+            )
+        assert not any("applied twice" in r.message for r in caplog.records)
+
+    def test_hap_chain_no_false_positive(self, caplog):
+        """SPA-after-HAP: the source patcher HAS _spa_installed but its
+        embedder is NOT an SPA embedder -> no warning."""
+        import logging
+
+        from src.spa import apply_spa_to_model
+
+        src_patcher = _make_flux_mock()
+        src_patcher._spa_installed = True  # HAP installed the shared hook
+        with caplog.at_level(logging.WARNING, logger="ComfyUI-DyPE"):
+            apply_spa_to_model(
+                src_patcher, "flux", 2048, 2048, "ntk",
+                enable_spa=True, bundle_size=3,
+            )
+        assert not any("applied twice" in r.message for r in caplog.records), (
+            "false positive: the legitimate HAP->SPA chain was flagged"
+        )
+
+
 # ---------------------------------------------------------------------------
 # P3 — install policy / lifecycle (T-P3-3, T-P3-4)
 # ---------------------------------------------------------------------------
@@ -380,7 +446,6 @@ class TestSpaInstallPolicy:
 
         import comfy.ldm.modules.attention as attn_mod
 
-        from src.models.spa_nunchaku import PosEmbedSPANunchaku
         from src.spa import apply_spa_to_model
 
         orig_attn = attn_mod.optimized_attention

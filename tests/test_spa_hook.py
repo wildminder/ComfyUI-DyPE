@@ -16,8 +16,6 @@ whose ``optimized_attention`` is a plain scaled-dot-product-attention shim with
 
 Markers: @pytest.mark.unit
 """
-import sys
-import types
 
 import pytest
 import torch

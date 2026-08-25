@@ -14,15 +14,13 @@ Source: https://github.com/anzhc/qwen2d-comfyui
 import logging
 import types
 
-import torch
-
 import comfy.model_management as model_management
 import comfy.model_patcher
 import comfy.sd as comfy_sd
 import comfy.utils
+import torch
 
 from .qwen2d_vae import Qwen2DVAE
-
 
 _PATCH_INSTALLED_ATTR = "_anzhc_qwen2d_patch_installed"
 _ORIGINAL_INIT_ATTR = "_anzhc_qwen2d_original_init"

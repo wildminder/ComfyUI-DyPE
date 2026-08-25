@@ -23,19 +23,19 @@ Markers: @pytest.mark.unit (T-P4-7 is @pytest.mark.comfyui_integration and skipp
 """
 import types
 
+import pytest
 import torch
 import torch.nn.functional as F
-import pytest
 
+from src.models.spa_anima import PosEmbedSPAAnima
+from src.models.spa_flux import PosEmbedSPAFlux
 from src.spa import (
     apply_spa_to_model,
     build_bundle_id_variants,
     restore_spa_attention_hook,
 )
-from src.spa_attn import apply_rope_matrix, inv_rope, compose_rope
+from src.spa_attn import apply_rope_matrix, compose_rope, inv_rope
 from src.spa_context import get_spa_context, get_spa_step_gate, set_spa_context
-from src.models.spa_flux import PosEmbedSPAFlux
-from src.models.spa_anima import PosEmbedSPAAnima
 
 try:
     from tests._spa_math_helpers import (
@@ -279,8 +279,8 @@ def _make_e2e_krea2_mock():
     return m
 
 
-def _scaled_attn(q, k, v, heads, skip_reshape=False, mask=None,
-                 transformer_options=None, **kw):
+def _scaled_attn(q, k, v, heads, mask=None, attn_precision=None,
+                 skip_reshape=False, skip_output_reshape=False, **kw):
     """Drop-in ``optimized_attention`` using the ``1/sqrt(d)`` scale — the SAME
     math the P4 ripple threshold (1.25) was calibrated on
     (``tests/test_spa_ripple_detector._plain_attn``).
@@ -291,6 +291,10 @@ def _scaled_attn(q, k, v, heads, skip_reshape=False, mask=None,
     at the calibrated scale and the T5.2 ripple assertion is directly comparable
     to the P4 gate.  ``heads`` is accepted for signature compatibility but the
     tensors are already head-shaped ``(B, H, L, D)``.
+
+    W2.1 (plan 2026-08-25): signature locked to the REAL ComfyUI convention
+    (slots 5-8 = mask/attn_precision/skip_reshape/skip_output_reshape) — the
+    pre-fix ad-hoc order broke when the wrapper forwarded all 8 positional args.
     """
     d = q.shape[-1]
     scores = torch.einsum("bhld,bhmd->bhlm", q, k) / (d ** 0.5)
@@ -412,7 +416,6 @@ class TestP5MockEndToEnd:
         embedder = out._object_patches["diffusion_model.pe_embedder"]
 
         H = W = 80
-        L = H * W
         ids = _flux_ids(H, W)
         q, k, v = structured_qkv(H, W, self.D, 0)
 

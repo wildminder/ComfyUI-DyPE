@@ -1,7 +1,8 @@
 """Tests for src/base.py — DyPEBasePosEmbed (Tier 1: pure unit tests)."""
 import math
-import torch
+
 import pytest
+import torch
 
 from src.base import DyPEBasePosEmbed
 
@@ -63,6 +64,30 @@ class TestAxisTokenSpan:
         span64 = emb._axis_token_span(pos64)
         assert span32 == 32.0
         assert span64 == 64.0
+
+    def test_span_cache_bounded_fifo(self):
+        """W9.c (NTH-004): filling past the cap evicts the OLDEST entry."""
+        emb = ConcreteEmbed(theta=10000, axes_dim=[16, 56, 56])
+        cap = emb._span_cache_max
+        assert cap == 64
+        # Insert `cap` distinct keys directly.
+        for i in range(cap):
+            key = ((i,), 'cpu', torch.float32)
+            emb._span_cache_put(key, float(i))
+        assert len(emb._span_cache) == cap
+        first_key = ((0,), 'cpu', torch.float32)
+        assert first_key in emb._span_cache
+        # One more insert -> the FIRST key is evicted (FIFO).
+        new_key = ((999,), 'cpu', torch.float32)
+        emb._span_cache_put(new_key, 9.0)
+        assert len(emb._span_cache) == cap
+        assert first_key not in emb._span_cache
+        assert emb._span_cache[new_key] == 9.0
+        # Re-inserting an EXISTING key must not evict anything.
+        existing = ((1,), 'cpu', torch.float32)
+        before_len = len(emb._span_cache)
+        emb._span_cache_put(existing, 5.0)
+        assert len(emb._span_cache) == before_len
 
 
 @pytest.mark.unit

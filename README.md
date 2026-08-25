@@ -395,6 +395,46 @@ fallback; the VAE-space path is the recommended default).
 > PixelRush calls the diffusion model directly (not through ComfyUI's sampler/guider), so it
 > performs its own CFG and prediction-type conversion (EPS, CONST/flow, V_PREDICTION, X0).
 
+## FreeScale Node
+
+Tuning-free higher-resolution generation via **scale-fused attention** and
+**self-cascade upscaling** (FreeScale, arXiv:2412.09626).
+
+*   **Algorithm:** at each cascade stage the latent is VAE-decoded, bicubically
+    upscaled to the target resolution, re-encoded, partially noised (timestep K),
+    and sampled back down.  During sampling the model's self-attention is patched
+    with a scale-fusion filter (global high-frequency + local low-frequency via a
+    3D Gaussian) so detail transfers across resolutions without fine-tuning.
+*   **Supported models:** FLUX-family DiTs with a standard `patch_size` attribute
+    (auto-detected; base resolution ≤1024px passes through untouched).
+*   **Known limitations:** the attention patch is a passthrough in the current
+    implementation (scale-fusion parameters are captured but not yet applied —
+    tracked as an open improvement); multi-stage cascades multiply sampler time.
+
+### Parameters
+
+| Input | Default | Notes |
+|---|---|---|
+| `model` | — | The model patcher to patch. |
+| `width` / `height` | 2048 | Target resolution (snapped to multiples of 16). |
+| `steps` | 20 | Sampler steps per cascade stage. |
+| `cfg` | 1.0 | Classifier-free guidance scale. |
+| `cascade_stages` | 1 | Number of self-cascade stages (each doubles resolution). |
+
+## Node Reference
+
+All nodes registered by this pack (V3 schema ids):
+
+| Node id | Display name | Purpose |
+|---|---|---|
+| `DyPE_FLUX` | DyPE | Dynamic Position Extrapolation for ultra-high-res generation. |
+| `SEGA` | SEGA | Spectral-Energy Guided Attention (content-aware mscale). |
+| `SPA` | SPA (HRDiT) | Spatial Position Alignment — fixes spatial disorder. |
+| `HAP` | HAP (HRDiT) | Head-Adaptive attention Pruning — the speed half. |
+| `HAPCalibrate` | HAP Calibrate (HRDiT) | In-graph scope-plan calibration for HAP. |
+| `PixelRushNode` | PixelRush | Patch-cascade refinement for existing latents. |
+| `FreeScaleNode` | FreeScale | Tuning-free scale-fusion + self-cascade upscaling. |
+
 ## Changelog
 
 #### v2.8.0 — HAP Calibrate node (in-graph scope-plan calibration) (2026-08-16)
@@ -432,7 +472,7 @@ fallback; the VAE-space path is the recommended default).
 *   **SPA Node:** Added **SPA** (Spatial Position Alignment, HRDiT arXiv 2608.07003) — a static, training-free RoPE patch that fixes high-resolution *spatial disorder* by bundling token indices into a few bundles, sliding the bundle boundaries `N` times, and **averaging the `N` attention outputs** (faithful to HRDiT `_spa_attention`). Supports FLUX, Qwen/Krea-2, Z-Image, and Anima/Cosmos; **Nunchaku is unsupported** (fused kernels bypass the hook — logs a warning, returns the model unchanged). Anima's temporal axis and per-axis NTK factors are preserved.
 *   **Auto bundle size:** `N = 5` at ≥4K, `N = 3` at ≥2K, `1` otherwise (no-op). Configurable via `bundle_size`.
 *   **Composable:** SPA is **mutually exclusive** with DyPE/SEGA in v1 (apply only one).
-*   **Example workflow:** added `example_workflows/SPA_basic.json` (2048×2048 FLUX + SPA).
+*   **Example workflow:** see `example_workflows/DyPE-Flux-workflow.json` — swap the DyPE node for SPA at 2048×2048. (A dedicated `SPA_basic.json` was announced in earlier drafts but never shipped.)
 
 #### PixelRush — SDXL noise-dominance fix
 *   **VAE-space operation:** PixelRush now runs entirely in VAE latent space (std ≈ 1) and converts to model space only inside the `predict_eps` adapter. This fixes the SDXL "totally noisy" output caused by `process_latent_in` scaling the latent down to std ≈ 0.13 (noise injection std ≈ 0.95 then dominated ~6×).

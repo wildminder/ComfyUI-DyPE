@@ -1,14 +1,15 @@
 import os
 
-import torch
 from comfy_api.latest import ComfyExtension, io
+
+from .src.freescale_node import FreeScaleNode
 from .src.hap import ScopePlan, apply_hap_to_model
 from .src.hap_calib_node import HAPCalibrate
 from .src.patch_utils import apply_dype_to_model, apply_sega_to_model
-from .src.spa import apply_spa_to_model, parse_layer_filter
 from .src.pixelrush_node import PixelRushNode
-from .src.freescale_node import FreeScaleNode
 from .src.qwen2d_vae_patch import install_qwen2d_patch
+from .src.spa import apply_spa_to_model, parse_layer_filter
+from .src.validation import validate_resolution
 
 # Repo root (this file lives at the root) — used to resolve the default
 # scope-plan path shipped with the node pack.
@@ -109,6 +110,11 @@ class DyPE_FLUX(io.ComfyNode):
                 ),
             ],
         )
+
+    @classmethod
+    def validate_inputs(cls, **kwargs):
+        """W5.2 (IMP-002): reject bad resolutions at graph-build time."""
+        return validate_resolution(kwargs.get("width", 0), kwargs.get("height", 0))
 
     @classmethod
     def execute(cls, model, width: int, height: int, model_type: str, method: str, yarn_alt_scaling: bool, enable_dype: bool, base_resolution: int = 1024, dype_start_sigma: float = 1.0, dype_scale: float = 2.0, dype_exponent: float = 2.0, base_shift: float = 0.5, max_shift: float = 1.15) -> io.NodeOutput:
@@ -225,6 +231,11 @@ class SEGA(io.ComfyNode):
         )
 
     @classmethod
+    def validate_inputs(cls, **kwargs):
+        """W5.2 (IMP-002): reject bad resolutions at graph-build time."""
+        return validate_resolution(kwargs.get("width", 0), kwargs.get("height", 0))
+
+    @classmethod
     def execute(cls, model, width: int, height: int, model_type: str, method: str, mscale_alpha: float, mscale_beta: float, mscale_min: float, spread_min: float, spread_max: float, spread_alpha: float, base_mscale_formula: str, base_mscale_coefficient: float, base_resolution: int = 1024, base_shift: float = 0.5, max_shift: float = 1.15) -> io.NodeOutput:
         patched_model = apply_sega_to_model(
             model, model_type, width, height, method,
@@ -325,6 +336,11 @@ class SPA(io.ComfyNode):
                 ),
             ],
         )
+
+    @classmethod
+    def validate_inputs(cls, **kwargs):
+        """W5.2 (IMP-002): reject bad resolutions at graph-build time."""
+        return validate_resolution(kwargs.get("width", 0), kwargs.get("height", 0))
 
     @classmethod
     def execute(cls, model, width: int, height: int, model_type: str, enable_spa: bool, bundle_size: int = 0, spa_start_sigma: float = 1.0, spa_steps: int = 3, spa_layer_filter: str = "", proportional_attention: bool = False) -> io.NodeOutput:

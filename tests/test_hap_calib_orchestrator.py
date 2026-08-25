@@ -129,7 +129,6 @@ class TestOrchestratorAveraging:
     def test_identical_prompts_equal_single(self):
         """Feeding 3 identical prompts equals feeding 1 prompt (mean is
         idempotent)."""
-        holder1, holder3 = [], []
         spec1 = _spec(["p"])
         spec3 = _spec(["p", "p", "p"])
 

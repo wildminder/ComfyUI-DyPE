@@ -28,7 +28,7 @@ import logging
 import os
 import time
 from dataclasses import dataclass, field
-from typing import Callable, Dict, List, Optional, Sequence, Tuple
+from typing import Callable, Dict, List, Optional, Tuple
 
 import torch
 
@@ -315,9 +315,9 @@ def default_calibration_forward(
     """
     try:
         import comfy.model_management
-        import comfy.samplers
-        import comfy.sampler_helpers
         import comfy.sample
+        import comfy.sampler_helpers
+        import comfy.samplers
     except ImportError as exc:
         raise RuntimeError(
             "HAP calibration requires the ComfyUI runtime.  Run this node "
@@ -342,7 +342,7 @@ def default_calibration_forward(
     if hasattr(model, "pre_run"):
         try:
             model.pre_run()
-        except Exception:  # pragma: no cover - defensive
+        except Exception:  # pragma: no cover - defensive  # leak-guard: pre_run is best-effort
             pass
 
     # Build empty latent at target resolution.
@@ -466,7 +466,7 @@ def _gpu_mem_str(device=None) -> str:
         reserved = torch.cuda.memory_reserved(idx) / (1024 ** 3)
         total = torch.cuda.get_device_properties(idx).total_memory / (1024 ** 3)
         return f"alloc={alloc:.2f}GiB reserved={reserved:.2f}GiB total={total:.2f}GiB"
-    except Exception:  # pragma: no cover - diagnostic only
+    except Exception:  # pragma: no cover - diagnostic only  # leak-guard: diagnostic string only
         return "n/a"
 
 
@@ -491,7 +491,7 @@ def _free_scored_chunk(chunk: torch.Tensor) -> None:
         return
     try:
         chunk.grad = None
-    except Exception:  # pragma: no cover - defensive
+    except Exception:  # pragma: no cover - defensive  # leak-guard: grad release is best-effort
         pass
 
 
@@ -514,12 +514,12 @@ def _purge_calibration_memory() -> None:
 
         mm.soft_empty_cache()
         return
-    except Exception:
+    except Exception:  # leak-guard: allocator flush best-effort
         pass
     try:
         if torch.cuda.is_available():
             torch.cuda.empty_cache()
-    except Exception:  # pragma: no cover - defensive
+    except Exception:  # pragma: no cover - defensive  # leak-guard: allocator flush best-effort
         pass
 
 
@@ -629,8 +629,17 @@ def _install_block_checkpointing(diffusion_model) -> List[Tuple]:
 
         def _make_ckpt_forward(orig):
             def _ckpt_forward(*args, **kwargs):
+                # preserve_rng_state=False (W2.7, 2026-08-25): calibration
+                # forwards are DETERMINISTIC (no dropout / RNG consumers), so
+                # stashing RNG state is unnecessary — and torch >= 2.6 hard-
+                # rejects checkpointed forwards where the accelerator module
+                # initializes mid-forward (CPU-only test environments hit this
+                # on every block).  Disabling RNG preservation removes the
+                # device-state stash entirely and keeps backward recompute
+                # bit-identical for our deterministic graphs.
                 return _torch_checkpoint(
-                    orig, *args, use_reentrant=False, **kwargs
+                    orig, *args, use_reentrant=False,
+                    preserve_rng_state=False, **kwargs
                 )
             return _ckpt_forward
 
@@ -658,7 +667,7 @@ def _flush_gpu_allocator() -> None:
     try:
         if torch.cuda.is_available():
             torch.cuda.empty_cache()
-    except Exception:  # pragma: no cover - defensive
+    except Exception:  # pragma: no cover - defensive  # leak-guard: allocator flush best-effort
         pass
 
 
@@ -709,7 +718,6 @@ def collect_scope_scores_for_model(
         sequence length (authoritative for cost/summary accounting).
     """
     import importlib
-    import sys
 
     from .hap_calib import (
         _chunk_row_scores,
@@ -724,7 +732,7 @@ def collect_scope_scores_for_model(
         try:
             dm = model.model.diffusion_model
             model_type = _spa_resolve_type("auto", dm)
-        except Exception:
+        except Exception:  # probe: auto type detection fallback
             model_type = "flux"  # safe fallback
 
     targets = list(_spa_patch_targets(model_type))
@@ -992,7 +1000,7 @@ def collect_scope_scores_for_model(
     for mod_path, attr, _is_masked in targets:
         try:
             mod = importlib.import_module(mod_path)
-        except Exception:
+        except Exception:  # probe: target module may be absent
             continue
         orig = getattr(mod, attr, None)
         if orig is None:
@@ -1019,7 +1027,7 @@ def collect_scope_scores_for_model(
     diffusion_model = None
     try:
         diffusion_model = model.model.diffusion_model
-    except Exception:
+    except Exception:  # probe: dm shape probe
         diffusion_model = None
     ckpt_installed = _install_block_checkpointing(diffusion_model)
     if ckpt_installed:
@@ -1420,7 +1428,7 @@ def run_hap_calibration(
             plan, seq_len, text_len=spec.text_len,
             anchor_stride=spec.anchor_stride,
         )
-    except Exception:
+    except Exception:  # degrade: flops ratio is informational
         fr = None
 
     mean_betas = []
@@ -1453,7 +1461,7 @@ def run_hap_calibration(
 def format_summary(summary: Dict) -> str:
     """Format the summary dict as a human-readable string."""
     lines = [
-        f"HAP Calibration Summary",
+        "HAP Calibration Summary",
         f"  layers={summary['num_layers']} heads={summary['num_heads']} "
         f"seq_len={summary['seq_len']}",
         f"  prompts={summary['num_prompts']} scopes={summary['num_scopes']} "
@@ -1482,7 +1490,7 @@ def resolve_output_dir() -> str:
     try:
         import folder_paths
         return folder_paths.get_output_directory()
-    except (ImportError, Exception):
+    except (ImportError, Exception):  # degrade: output-dir fallback
         fallback = os.path.join(_PACK_ROOT, "tmp")
         logger.warning(
             "HAP calib: folder_paths unavailable; writing to fallback %r",

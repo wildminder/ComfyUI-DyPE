@@ -3,7 +3,6 @@
 Inherits the FLUX rotation-matrix formatting from :class:`PosEmbedFlux` and the
 SPA averaging logic from :class:`SPABasePosEmbed`.
 """
-from ..base import DyPEBasePosEmbed
 from ..spa import SPABasePosEmbed
 from .flux import PosEmbedFlux
 

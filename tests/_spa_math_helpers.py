@@ -16,7 +16,6 @@ from typing import List, Tuple
 import torch
 import torch.nn.functional as F
 
-
 # ---------------------------------------------------------------------------
 # Angle <-> rotation matrix / (cos, sin) utilities
 # ---------------------------------------------------------------------------

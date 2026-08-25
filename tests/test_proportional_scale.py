@@ -56,8 +56,10 @@ class TestProportionalScaleRatio:
         """seq 66048 (4K FLUX) → sqrt(ln(66048)/ln(4608)), recomputed."""
         expected = math.sqrt(math.log(66048) / math.log(4608))
         assert proportional_scale_ratio(66048) == pytest.approx(expected, abs=1e-12)
-        # Sanity: ~1.31 for 4K vs 1024px.
-        assert 1.2 < proportional_scale_ratio(66048) < 1.4
+        # Sanity: ~1.147 for 4K vs 1024px (W2.7 re-baseline 2026-08-25: the
+        # pre-fix bound 1.2 < r < 1.4 was a hand-waved guess; the exact value
+        # is sqrt(ln(66048)/ln(4608)) ~= 1.1470, already asserted above).
+        assert 1.1 < proportional_scale_ratio(66048) < 1.2
 
     def test_ratio_monotone_increasing(self):
         seqs = [1024, 2048, 4608, 8192, 16384, 32768, 66048]
@@ -91,9 +93,17 @@ class TestProportionalScaleRatio:
 # T7.2 — wrapper integration (q pre-scaling)
 # ---------------------------------------------------------------------------
 
-def _sdpa_orig(q, k, v, heads, skip_reshape=False, mask=None,
-               transformer_options=None, **kw):
-    """Pristine SDPA reference (scale=1.0, matches the conftest mock)."""
+def _sdpa_orig(q, k, v, heads, mask=None, attn_precision=None,
+               skip_reshape=False, skip_output_reshape=False, **kw):
+    """Pristine SDPA reference (scale=1.0, matches the conftest mock).
+
+    W2.1: signature-locked via the canonical fixture helper so any drift
+    fails at construction (the pre-fix 4-7-arg order caused the stale-mock
+    rot fixed in plan 2026-08-25 W2).
+    """
+    from _hrdit_fixtures import assert_real_signature
+
+    assert_real_signature(_sdpa_orig)
     return F.scaled_dot_product_attention(q, k, v, scale=1.0, dropout_p=0.0,
                                           is_causal=False)
 
@@ -133,8 +143,8 @@ class TestWrapperIntegration:
         """Enabled: the backend receives ``q * ratio`` (logits scaled by ratio)."""
         seen = []
 
-        def rec(q, k, v, heads, skip_reshape=False, mask=None,
-                transformer_options=None, **kw):
+        def rec(q, k, v, heads, mask=None, attn_precision=None,
+                skip_reshape=False, skip_output_reshape=False, **kw):
             seen.append(q)
             return q
 
@@ -161,8 +171,8 @@ class TestWrapperIntegration:
         bit-identically (multiplying by 1.0 is exact in IEEE)."""
         seen = []
 
-        def rec(q, k, v, heads, skip_reshape=False, mask=None,
-                transformer_options=None, **kw):
+        def rec(q, k, v, heads, mask=None, attn_precision=None,
+                skip_reshape=False, skip_output_reshape=False, **kw):
             seen.append(q)
             return q
 
@@ -185,8 +195,8 @@ class TestWrapperIntegration:
         """The masked backend variant pre-scales q the same way."""
         seen = []
 
-        def rec(q, k, v, heads, mask, skip_reshape=False,
-                transformer_options=None, **kw):
+        def rec(q, k, v, heads, mask=None, attn_precision=None,
+                skip_reshape=False, skip_output_reshape=False, **kw):
             seen.append(q)
             return q
 
@@ -202,8 +212,8 @@ class TestWrapperIntegration:
         """SPA active: EVERY variant pass receives the pre-scaled q."""
         seen_q = []
 
-        def recording_orig(q, k, v, heads, skip_reshape=False, mask=None,
-                           transformer_options=None, **kw):
+        def recording_orig(q, k, v, heads, mask=None, attn_precision=None,
+                           skip_reshape=False, skip_output_reshape=False, **kw):
             seen_q.append(q.clone())
             return _sdpa_orig(q, k, v, heads)
 

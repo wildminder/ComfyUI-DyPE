@@ -12,13 +12,11 @@ Reference: PixelRush paper (arXiv:2602.12769).
 from __future__ import annotations
 
 import logging
-import math
 from dataclasses import dataclass
 from typing import Callable, Iterator, Tuple
 
 import torch
 import torch.nn.functional as F
-
 
 Tensor = torch.Tensor
 

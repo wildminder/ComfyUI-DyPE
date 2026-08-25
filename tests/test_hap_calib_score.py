@@ -21,8 +21,8 @@ import torch
 
 from src import hap
 from src.hap_calib import (
-    calibration_cost_table,
     calibrate_scope_plan,
+    calibration_cost_table,
     estimate_head_scope_costs,
     scope_keep_mask,
     scope_to_beta,
@@ -418,11 +418,19 @@ def _synthetic_stats(num_layers=3, H=4, S=6, prompts=2, seed=7):
 
 @pytest.mark.unit
 class TestCalibrateScopePlan:
+    # W2.7 re-baseline (2026-08-25): the seq=256/text_len=64 geometry has a
+    # TRUE minimum-cost ratio of 0.625 (per-head min scope cost 0.15625 x 4
+    # heads), so any budget below that is genuinely infeasible — the pre-fix
+    # tests used budgets under the floor and crashed with "No feasible".
+    # Budgets here are >= 0.7 (above the floor); the sub-floor infeasibility
+    # path itself is covered by test_calibrate_infeasible_budget_raises.
+    _FLOOR = 0.625
+
     def test_calibrate_produces_valid_plan(self):
         """Synthetic 3-layer/4-head stats → ScopePlan validates; the solved
         assignment honours the compute budget (via T1.4 costs)."""
         H, S = 4, 6
-        budget_ratio = 0.6
+        budget_ratio = 0.8
         quality, compute = _synthetic_stats(num_layers=3, H=H, S=S)
 
         plan_dict = calibrate_scope_plan(quality, compute, budget_ratio=budget_ratio)
@@ -434,15 +442,24 @@ class TestCalibrateScopePlan:
         assert all(all(a == 0.0 for a in layer) for layer in plan_dict["alphas"])
 
         # Budget honoured per layer with the chosen scopes.
-        full_halves = hap.half_blocks(hap.band_blocks([0.0] * H, [0.5] * H, 256))
+        # W2.7 re-baseline (2026-08-25): the reference FULL cost must use
+        # beta=1.0 (exact full attention under the current scope_to_beta
+        # mapping — matching calibration_cost_table's last column).  The
+        # pre-fix [0.5]*H reference predates the beta=1.0 full-scope fix and
+        # computed a mid-range scope instead.
+        full_halves = hap.half_blocks(hap.band_blocks([0.0] * H, [1.0] * H, 256))
         full_cost = hap.band_compute_cost(256, 64, full_halves, 0)
+        # Ceil-discretization slack: the solver's H-bin rounding allowance
+        # admits assignments whose TRUE cost exceeds the budget by at most
+        # H * budget / bins (same bound as TestKnapsack::test_budget_respected).
+        slack = H * (budget_ratio * full_cost) / 4000.0
         for layer in range(3):
             chosen_halves = hap.half_blocks(
                 hap.band_blocks(plan_dict["alphas"][layer],
                                 plan_dict["betas"][layer], 256)
             )
             chosen_cost = hap.band_compute_cost(256, 64, chosen_halves, 0)
-            assert chosen_cost <= budget_ratio * full_cost + 1e-6
+            assert chosen_cost <= budget_ratio * full_cost + slack + 1e-6
 
     def test_calibrate_full_budget_selects_full_scope(self):
         """budget_ratio=1.0 → every head picks the full scope (beta == 1.0):
@@ -454,9 +471,43 @@ class TestCalibrateScopePlan:
 
     def test_calibrate_deterministic(self):
         quality, compute = _synthetic_stats()
-        a = calibrate_scope_plan(quality, compute, budget_ratio=0.5)
-        b = calibrate_scope_plan(quality, compute, budget_ratio=0.5)
+        # W2.7 re-baseline: budget raised above the geometry's true
+        # feasibility floor (0.625 for seq=256/text_len=64, H=4).
+        a = calibrate_scope_plan(quality, compute, budget_ratio=0.8)
+        b = calibrate_scope_plan(quality, compute, budget_ratio=0.8)
         assert a == b
+
+    def test_calibrate_infeasible_budget_raises(self):
+        """W2.7 regression guard: a budget BELOW the geometry's true minimum
+        (sum of per-head min scope costs) must still raise RuntimeError -- the
+        H-bin rounding allowance in the solver must not mask genuine
+        infeasibility."""
+        H, S = 4, 6
+        quality, compute = _synthetic_stats(num_layers=1, H=H, S=S)
+        with pytest.raises(RuntimeError, match="No feasible"):
+            calibrate_scope_plan(quality, compute, budget_ratio=self._FLOOR * 0.5)
+
+    def test_solver_boundary_rounding_feasible(self):
+        """W2.7 REGRESSION (production bug): ceil-discretization used to add
+        up to 1 bin per head of rounding error, so a truly-feasible boundary
+        assignment was falsely rejected ("No feasible") whenever H did not
+        divide the geometry evenly.  Exact reproduction: H=3 heads x full-scope
+        cost 1334 bins each = 4002 > budget_int=4000 at budget_ratio=1.0.
+        The solver must now accept it (H-bin capacity allowance)."""
+        from src.hap_calib import solve_multiple_choice_knapsack
+
+        H, S = 3, 5
+        # Real cost table for seq=256/text_len=64: full scope == seq^2 per head.
+        compute = calibration_cost_table(H, 256, text_len=64, num_scopes=S)
+        quality = torch.zeros(H, S, dtype=torch.float64)
+        choices = solve_multiple_choice_knapsack(
+            quality, compute, budget_ratio=1.0, bins=4000
+        )
+        assert len(choices) == H
+        # True cost sanity: full-everywhere is exactly the budget.
+        full_cost = float(compute[:, -1].sum().item())
+        chosen = sum(float(compute[h, choices[h]].item()) for h in range(H))
+        assert chosen <= full_cost + 1e-9
 
     def test_calibrate_averages_prompts(self):
         """Averaging over prompts must change the solution vs a single prompt
@@ -470,9 +521,11 @@ class TestCalibrateScopePlan:
         p1 = torch.full((H, S), 10.0, dtype=torch.float64)
         p1[:, 1] = 0.0
         p1[:, -1] = 0.0
-        # Averaged: both scopes 0 and 1 tie at 5.0 < 10.0 → deterministic
+        # Averaged: both scopes 0 and 1 tie at 5.0 < 10.0 -> deterministic
         # tie-break picks the LOWEST scope index (0).
-        plan_dict = calibrate_scope_plan([[p0, p1]], compute, budget_ratio=0.3)
+        # W2.7 re-baseline: min-scope ratio for this geometry is 0.5, so the
+        # pre-fix budget_ratio=0.3 was genuinely infeasible; 0.55 clears it.
+        plan_dict = calibrate_scope_plan([[p0, p1]], compute, budget_ratio=0.55)
         assert all(b == scope_to_beta(1, S) for b in plan_dict["betas"][0])
 
     def test_calibrate_rejects_bad_inputs(self):

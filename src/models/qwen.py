@@ -1,5 +1,7 @@
 import torch
+
 from ..base import DyPEBasePosEmbed
+
 
 class PosEmbedQwen(DyPEBasePosEmbed):
     """

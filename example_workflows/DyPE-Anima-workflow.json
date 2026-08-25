@@ -1,8 +1,8 @@
 {
   "id": "f7a250a1-53fb-496b-8c39-c60d9e764028",
   "revision": 0,
-  "last_node_id": 75,
-  "last_link_id": 124,
+  "last_node_id": 86,
+  "last_link_id": 150,
   "nodes": [
     {
       "id": 66,
@@ -13,16 +13,16 @@
       ],
       "size": [
         350,
-        474
+        480
       ],
       "flags": {},
-      "order": 8,
+      "order": 16,
       "mode": 0,
       "inputs": [
         {
           "name": "model",
           "type": "MODEL",
-          "link": 122
+          "link": 150
         },
         {
           "name": "positive",
@@ -70,149 +70,16 @@
         "er_sde",
         "simple",
         1
-      ]
-    },
-    {
-      "id": 67,
-      "type": "CLIPTextEncode",
-      "pos": [
-        -200,
-        -860
       ],
-      "size": [
-        490,
-        610
-      ],
-      "flags": {},
-      "order": 5,
-      "mode": 0,
-      "inputs": [
-        {
-          "name": "clip",
-          "type": "CLIP",
-          "link": 111
-        }
-      ],
-      "outputs": [
-        {
-          "name": "CONDITIONING",
-          "type": "CONDITIONING",
-          "links": [
-            108
-          ]
-        }
-      ],
-      "title": "CLIP Text Encode (Positive Prompt)",
-      "properties": {
-        "Node name for S&R": "CLIPTextEncode",
-        "enableTabs": false,
-        "tabWidth": 65,
-        "tabXOffset": 10,
-        "hasSecondTab": false,
-        "secondTabText": "Send Back",
-        "secondTabOffset": 80,
-        "secondTabWidth": 65,
-        "cnr_id": "comfy-core",
-        "ver": "0.3.65"
-      },
-      "widgets_values": [
-        "newest, masterpiece, best quality, year 2025, @nyanya, 1girl, solo, yakumo yukari, cowboy shot, garden, petals, looking to the side, parasol,"
-      ],
-      "color": "#232",
-      "bgcolor": "#353"
-    },
-    {
-      "id": 46,
-      "type": "SaveImage",
-      "pos": [
-        750,
-        -920
-      ],
-      "size": [
-        700,
-        800
-      ],
-      "flags": {},
-      "order": 10,
-      "mode": 0,
-      "inputs": [
-        {
-          "name": "images",
-          "type": "IMAGE",
-          "link": 112
-        }
-      ],
-      "outputs": [
-        {
-          "name": "images",
-          "type": "IMAGE",
-          "links": null
-        }
-      ],
-      "properties": {
-        "Node name for S&R": "SaveImage",
-        "enableTabs": false,
-        "tabWidth": 65,
-        "tabXOffset": 10,
-        "hasSecondTab": false,
-        "secondTabText": "Send Back",
-        "secondTabOffset": 80,
-        "secondTabWidth": 65,
-        "cnr_id": "comfy-core",
-        "ver": "0.11.1"
-      },
-      "widgets_values": [
-        "Anima"
-      ]
-    },
-    {
-      "id": 65,
-      "type": "CLIPTextEncode",
-      "pos": [
-        -200,
-        -200
-      ],
-      "size": [
-        490,
-        140
-      ],
-      "flags": {},
-      "order": 4,
-      "mode": 0,
-      "inputs": [
-        {
-          "name": "clip",
-          "type": "CLIP",
-          "link": 106
-        }
-      ],
-      "outputs": [
-        {
-          "name": "CONDITIONING",
-          "type": "CONDITIONING",
-          "links": [
-            109
-          ]
-        }
-      ],
-      "title": "CLIP Text Encode (Negative Prompt)",
-      "properties": {
-        "Node name for S&R": "CLIPTextEncode",
-        "enableTabs": false,
-        "tabWidth": 65,
-        "tabXOffset": 10,
-        "hasSecondTab": false,
-        "secondTabText": "Send Back",
-        "secondTabOffset": 80,
-        "secondTabWidth": 65,
-        "cnr_id": "comfy-core",
-        "ver": "0.3.65"
-      },
-      "widgets_values": [
-        "worst quality, low quality, score_1, score_2, score_3, blurry, jpeg artifacts, sepia"
-      ],
-      "color": "#322",
-      "bgcolor": "#533"
+      "widgets_values_named": {
+        "seed": 42,
+        "control_after_generate": "fixed",
+        "steps": 20,
+        "cfg": 4,
+        "sampler_name": "er_sde",
+        "scheduler": "simple",
+        "denoise": 1
+      }
     },
     {
       "id": 61,
@@ -263,6 +130,11 @@
         "stable_diffusion",
         "default"
       ],
+      "widgets_values_named": {
+        "clip_name": "qwen_3_06b_base_[anima].safetensors",
+        "type": "stable_diffusion",
+        "device": "default"
+      },
       "color": "#332922",
       "bgcolor": "#593930"
     },
@@ -312,8 +184,127 @@
       "widgets_values": [
         "qwen_image_vae.safetensors"
       ],
+      "widgets_values_named": {
+        "vae_name": "qwen_image_vae.safetensors"
+      },
       "color": "#332922",
       "bgcolor": "#593930"
+    },
+    {
+      "id": 80,
+      "type": "DyPE_FLUX",
+      "pos": [
+        -540,
+        110
+      ],
+      "size": [
+        350,
+        420
+      ],
+      "flags": {},
+      "order": 13,
+      "mode": 4,
+      "inputs": [
+        {
+          "name": "model",
+          "type": "MODEL",
+          "link": 146
+        }
+      ],
+      "outputs": [
+        {
+          "name": "Patched Model",
+          "type": "MODEL",
+          "links": []
+        }
+      ],
+      "properties": {
+        "Node name for S&R": "DyPE_FLUX",
+        "cnr_id": "ComfyUI-DyPE",
+        "ver": "7dbea3b189ef5d75ead0f7bb5c237eee180ac19a"
+      },
+      "widgets_values": [
+        2048,
+        2048,
+        "auto",
+        "base",
+        true,
+        true,
+        1024,
+        1,
+        2,
+        2,
+        0.5,
+        1.15
+      ],
+      "widgets_values_named": {
+        "width": 2048,
+        "height": 2048,
+        "model_type": "auto",
+        "method": "base",
+        "yarn_alt_scaling": true,
+        "enable_dype": true,
+        "base_resolution": 1024,
+        "dype_start_sigma": 1,
+        "dype_scale": 2,
+        "dype_exponent": 2,
+        "base_shift": 0.5,
+        "max_shift": 1.15
+      },
+      "color": "#332922",
+      "bgcolor": "#593930"
+    },
+    {
+      "id": 65,
+      "type": "CLIPTextEncode",
+      "pos": [
+        -190,
+        -380
+      ],
+      "size": [
+        470,
+        140
+      ],
+      "flags": {},
+      "order": 6,
+      "mode": 0,
+      "inputs": [
+        {
+          "name": "clip",
+          "type": "CLIP",
+          "link": 106
+        }
+      ],
+      "outputs": [
+        {
+          "name": "CONDITIONING",
+          "type": "CONDITIONING",
+          "links": [
+            109
+          ]
+        }
+      ],
+      "title": "CLIP Text Encode (Negative Prompt)",
+      "properties": {
+        "Node name for S&R": "CLIPTextEncode",
+        "enableTabs": false,
+        "tabWidth": 65,
+        "tabXOffset": 10,
+        "hasSecondTab": false,
+        "secondTabText": "Send Back",
+        "secondTabOffset": 80,
+        "secondTabWidth": 65,
+        "cnr_id": "comfy-core",
+        "ver": "0.3.65"
+      },
+      "widgets_values": [
+        "worst quality, low quality, score_1, score_2, score_3, blurry, jpeg artifacts, sepia"
+      ],
+      "widgets_values_named": {
+        "text": "worst quality, low quality, score_1, score_2, score_3, blurry, jpeg artifacts, sepia"
+      },
+      "color": "#322",
+      "bgcolor": "#533"
     },
     {
       "id": 68,
@@ -362,146 +353,114 @@
         "anima-preview3-base.safetensors",
         "default"
       ],
+      "widgets_values_named": {
+        "unet_name": "anima-preview3-base.safetensors",
+        "weight_dtype": "default"
+      },
       "color": "#332922",
       "bgcolor": "#593930"
     },
     {
-      "id": 64,
-      "type": "EmptyLatentImage",
+      "id": 77,
+      "type": "HAPCalibrate",
       "pos": [
-        -570,
-        -200
-      ],
-      "size": [
-        310,
-        150
-      ],
-      "flags": {},
-      "order": 3,
-      "mode": 0,
-      "inputs": [],
-      "outputs": [
-        {
-          "name": "LATENT",
-          "type": "LATENT",
-          "links": [
-            110
-          ]
-        }
-      ],
-      "properties": {
-        "Node name for S&R": "EmptyLatentImage",
-        "enableTabs": false,
-        "tabWidth": 65,
-        "tabXOffset": 10,
-        "hasSecondTab": false,
-        "secondTabText": "Send Back",
-        "secondTabOffset": 80,
-        "secondTabWidth": 65,
-        "cnr_id": "comfy-core",
-        "ver": "0.3.40"
-      },
-      "widgets_values": [
-        1704,
-        2304,
-        1
-      ],
-      "color": "#223",
-      "bgcolor": "#335"
-    },
-    {
-      "id": 71,
-      "type": "DyPE_FLUX",
-      "pos": [
-        360,
-        -270
-      ],
-      "size": [
         340,
-        410
-      ],
-      "flags": {},
-      "order": 7,
-      "mode": 0,
-      "inputs": [
-        {
-          "name": "model",
-          "type": "MODEL",
-          "link": 124
-        }
-      ],
-      "outputs": [
-        {
-          "name": "Patched Model",
-          "type": "MODEL",
-          "links": [
-            122
-          ]
-        }
-      ],
-      "properties": {
-        "Node name for S&R": "DyPE_FLUX",
-        "cnr_id": "ComfyUI-DyPE",
-        "ver": "7dbea3b189ef5d75ead0f7bb5c237eee180ac19a"
-      },
-      "widgets_values": [
-        2048,
-        2048,
-        "auto",
-        "vision_yarn",
-        true,
-        true,
-        1024,
-        1,
-        2,
-        2,
-        0.5,
-        1.15
-      ],
-      "color": "#332922",
-      "bgcolor": "#593930"
-    },
-    {
-      "id": 75,
-      "type": "LoraLoaderModelOnly",
-      "pos": [
-        -200,
-        20
+        530
       ],
       "size": [
-        490,
-        120
+        250,
+        550
       ],
-      "flags": {},
-      "order": 6,
-      "mode": 0,
+      "flags": {
+        "collapsed": true
+      },
+      "order": 3,
+      "mode": 4,
       "inputs": [
         {
           "name": "model",
           "type": "MODEL",
-          "link": 123
+          "link": null
+        },
+        {
+          "name": "positive",
+          "type": "CONDITIONING",
+          "link": null
+        },
+        {
+          "name": "negative",
+          "type": "CONDITIONING",
+          "link": null
+        },
+        {
+          "name": "reference_latent",
+          "shape": 7,
+          "type": "LATENT",
+          "link": null
         }
       ],
       "outputs": [
         {
-          "name": "MODEL",
-          "type": "MODEL",
+          "name": "scope_plan",
+          "type": "SCOPE_PLAN",
           "links": [
-            124
+            128
           ]
+        },
+        {
+          "name": "plan_path",
+          "type": "STRING",
+          "links": null
+        },
+        {
+          "name": "summary",
+          "type": "STRING",
+          "links": []
         }
       ],
       "properties": {
-        "Node name for S&R": "LoraLoaderModelOnly",
-        "cnr_id": "comfy-core",
-        "ver": "0.12.3"
+        "Node name for S&R": "HAPCalibrate"
       },
       "widgets_values": [
-        "anima-highres-aesthetic-boost.safetensors",
-        1
+        512,
+        512,
+        2,
+        20,
+        0.5,
+        4000,
+        18,
+        128,
+        32,
+        1,
+        1583158119,
+        "randomize",
+        "output_norm",
+        true,
+        "",
+        "",
+        "scope_krea2turbo_calibrated4.json",
+        false
       ],
-      "color": "#332922",
-      "bgcolor": "#593930"
+      "widgets_values_named": {
+        "width": 512,
+        "height": 512,
+        "num_prompts": 2,
+        "num_scopes": 20,
+        "budget_ratio": 0.5,
+        "bins": 4000,
+        "chunk": 18,
+        "text_len": 128,
+        "anchor_stride": 32,
+        "calib_sigma": 1,
+        "seed": 1583158119,
+        "control_after_generate": "randomize",
+        "loss_type": "output_norm",
+        "run": true,
+        "prompts": "",
+        "prompts_file": "",
+        "output_name": "scope_krea2turbo_calibrated4.json",
+        "purge_between_prompts": false
+      }
     },
     {
       "id": 63,
@@ -517,7 +476,7 @@
       "flags": {
         "collapsed": true
       },
-      "order": 9,
+      "order": 17,
       "mode": 0,
       "inputs": [
         {
@@ -552,8 +511,594 @@
         "secondTabWidth": 65,
         "cnr_id": "comfy-core",
         "ver": "0.3.40"
+      }
+    },
+    {
+      "id": 64,
+      "type": "EmptyLatentImage",
+      "pos": [
+        80,
+        -180
+      ],
+      "size": [
+        310,
+        150
+      ],
+      "flags": {
+        "collapsed": true
       },
-      "widgets_values": []
+      "order": 9,
+      "mode": 0,
+      "inputs": [
+        {
+          "name": "width",
+          "type": "INT",
+          "widget": {
+            "name": "width"
+          },
+          "link": 131
+        },
+        {
+          "name": "height",
+          "type": "INT",
+          "widget": {
+            "name": "height"
+          },
+          "link": 132
+        }
+      ],
+      "outputs": [
+        {
+          "name": "LATENT",
+          "type": "LATENT",
+          "links": [
+            110
+          ]
+        }
+      ],
+      "properties": {
+        "Node name for S&R": "EmptyLatentImage",
+        "enableTabs": false,
+        "tabWidth": 65,
+        "tabXOffset": 10,
+        "hasSecondTab": false,
+        "secondTabText": "Send Back",
+        "secondTabOffset": 80,
+        "secondTabWidth": 65,
+        "cnr_id": "comfy-core",
+        "ver": "0.3.40"
+      },
+      "widgets_values": [
+        1000,
+        1704,
+        1
+      ],
+      "widgets_values_named": {
+        "width": 1000,
+        "height": 1704,
+        "batch_size": 1
+      },
+      "color": "#223",
+      "bgcolor": "#335"
+    },
+    {
+      "id": 85,
+      "type": "Reroute",
+      "pos": [
+        -180,
+        -220
+      ],
+      "size": [
+        75,
+        26
+      ],
+      "flags": {},
+      "order": 10,
+      "mode": 0,
+      "inputs": [
+        {
+          "name": "",
+          "type": "*",
+          "link": 143
+        }
+      ],
+      "outputs": [
+        {
+          "name": "",
+          "type": "MODEL",
+          "links": [
+            144,
+            145,
+            146
+          ]
+        }
+      ],
+      "properties": {
+        "showOutputText": false,
+        "horizontal": false
+      }
+    },
+    {
+      "id": 75,
+      "type": "LoraLoaderModelOnly",
+      "pos": [
+        -560,
+        -290
+      ],
+      "size": [
+        300,
+        90
+      ],
+      "flags": {},
+      "order": 8,
+      "mode": 4,
+      "inputs": [
+        {
+          "name": "model",
+          "type": "MODEL",
+          "link": 123
+        }
+      ],
+      "outputs": [
+        {
+          "name": "MODEL",
+          "type": "MODEL",
+          "links": [
+            143
+          ]
+        }
+      ],
+      "properties": {
+        "Node name for S&R": "LoraLoaderModelOnly",
+        "cnr_id": "comfy-core",
+        "ver": "0.12.3"
+      },
+      "widgets_values": [
+        "anima-highres-aesthetic-boost.safetensors",
+        1
+      ],
+      "widgets_values_named": {
+        "lora_name": "anima-highres-aesthetic-boost.safetensors",
+        "strength_model": 1
+      },
+      "color": "#232",
+      "bgcolor": "#353"
+    },
+    {
+      "id": 81,
+      "type": "PrimitiveNode",
+      "pos": [
+        -570,
+        -100
+      ],
+      "size": [
+        270,
+        90
+      ],
+      "flags": {},
+      "order": 4,
+      "mode": 0,
+      "inputs": [],
+      "outputs": [
+        {
+          "name": "INT",
+          "type": "INT",
+          "widget": {
+            "name": "width"
+          },
+          "links": [
+            126,
+            129,
+            131
+          ]
+        }
+      ],
+      "title": "width",
+      "properties": {
+        "Run widget replace on values": false
+      },
+      "widgets_values": [
+        1000,
+        "fixed"
+      ],
+      "widgets_values_named": {
+        "value": 1000,
+        "control_after_generate": "fixed"
+      },
+      "color": "#232",
+      "bgcolor": "#353"
+    },
+    {
+      "id": 79,
+      "type": "SEGA",
+      "pos": [
+        -100,
+        120
+      ],
+      "size": [
+        320,
+        480
+      ],
+      "flags": {
+        "collapsed": false
+      },
+      "order": 12,
+      "mode": 4,
+      "inputs": [
+        {
+          "name": "model",
+          "type": "MODEL",
+          "link": 145
+        },
+        {
+          "name": "width",
+          "type": "INT",
+          "widget": {
+            "name": "width"
+          },
+          "link": 129
+        },
+        {
+          "name": "height",
+          "type": "INT",
+          "widget": {
+            "name": "height"
+          },
+          "link": 130
+        }
+      ],
+      "outputs": [
+        {
+          "name": "Patched Model",
+          "type": "MODEL",
+          "links": []
+        }
+      ],
+      "properties": {
+        "Node name for S&R": "SEGA"
+      },
+      "widgets_values": [
+        1000,
+        1704,
+        "auto",
+        "sega",
+        0.15,
+        1.5,
+        1,
+        0,
+        1,
+        1.5,
+        "power_res",
+        0.08,
+        1024,
+        0.5,
+        1.15
+      ],
+      "widgets_values_named": {
+        "width": 1000,
+        "height": 1704,
+        "model_type": "auto",
+        "method": "sega",
+        "mscale_alpha": 0.15,
+        "mscale_beta": 1.5,
+        "mscale_min": 1,
+        "spread_min": 0,
+        "spread_max": 1,
+        "spread_alpha": 1.5,
+        "base_mscale_formula": "power_res",
+        "base_mscale_coefficient": 0.08,
+        "base_resolution": 1024,
+        "base_shift": 0.5,
+        "max_shift": 1.15
+      },
+      "color": "#332922",
+      "bgcolor": "#593930"
+    },
+    {
+      "id": 86,
+      "type": "Reroute",
+      "pos": [
+        400,
+        -110
+      ],
+      "size": [
+        75,
+        26
+      ],
+      "flags": {},
+      "order": 15,
+      "mode": 0,
+      "inputs": [
+        {
+          "name": "",
+          "type": "*",
+          "link": 149
+        }
+      ],
+      "outputs": [
+        {
+          "name": "",
+          "type": "MODEL",
+          "links": [
+            150
+          ]
+        }
+      ],
+      "properties": {
+        "showOutputText": false,
+        "horizontal": false
+      }
+    },
+    {
+      "id": 67,
+      "type": "CLIPTextEncode",
+      "pos": [
+        -200,
+        -860
+      ],
+      "size": [
+        480,
+        410
+      ],
+      "flags": {},
+      "order": 7,
+      "mode": 0,
+      "inputs": [
+        {
+          "name": "clip",
+          "type": "CLIP",
+          "link": 111
+        }
+      ],
+      "outputs": [
+        {
+          "name": "CONDITIONING",
+          "type": "CONDITIONING",
+          "links": [
+            108
+          ]
+        }
+      ],
+      "title": "CLIP Text Encode (Positive Prompt)",
+      "properties": {
+        "Node name for S&R": "CLIPTextEncode",
+        "enableTabs": false,
+        "tabWidth": 65,
+        "tabXOffset": 10,
+        "hasSecondTab": false,
+        "secondTabText": "Send Back",
+        "secondTabOffset": 80,
+        "secondTabWidth": 65,
+        "cnr_id": "comfy-core",
+        "ver": "0.3.65"
+      },
+      "widgets_values": [
+        "ancient warrior, pointing flamable sword to the sky, dynamic scene, masterpiece, best quality"
+      ],
+      "widgets_values_named": {
+        "text": "ancient warrior, pointing flamable sword to the sky, dynamic scene, masterpiece, best quality"
+      },
+      "color": "#232",
+      "bgcolor": "#353"
+    },
+    {
+      "id": 82,
+      "type": "PrimitiveNode",
+      "pos": [
+        -270,
+        -100
+      ],
+      "size": [
+        250,
+        90
+      ],
+      "flags": {},
+      "order": 5,
+      "mode": 0,
+      "inputs": [],
+      "outputs": [
+        {
+          "name": "INT",
+          "type": "INT",
+          "widget": {
+            "name": "height"
+          },
+          "links": [
+            127,
+            130,
+            132
+          ]
+        }
+      ],
+      "title": "height",
+      "properties": {
+        "Run widget replace on values": false
+      },
+      "widgets_values": [
+        1704,
+        "fixed"
+      ],
+      "widgets_values_named": {
+        "value": 1704,
+        "control_after_generate": "fixed"
+      },
+      "color": "#232",
+      "bgcolor": "#353"
+    },
+    {
+      "id": 78,
+      "type": "HAP",
+      "pos": [
+        340,
+        120
+      ],
+      "size": [
+        290,
+        270
+      ],
+      "flags": {},
+      "order": 11,
+      "mode": 0,
+      "inputs": [
+        {
+          "name": "model",
+          "type": "MODEL",
+          "link": 144
+        },
+        {
+          "name": "scope_plan",
+          "shape": 7,
+          "type": "SCOPE_PLAN",
+          "link": 128
+        }
+      ],
+      "outputs": [
+        {
+          "name": "Patched Model",
+          "type": "MODEL",
+          "links": [
+            125
+          ]
+        }
+      ],
+      "properties": {
+        "Node name for S&R": "HAP"
+      },
+      "widgets_values": [
+        "configs/scope_plan_flux.json",
+        "auto",
+        true,
+        32,
+        512,
+        true
+      ],
+      "widgets_values_named": {
+        "scope_plan_path": "configs/scope_plan_flux.json",
+        "model_type": "auto",
+        "enable_hap": true,
+        "anchor_stride": 32,
+        "text_len": 512,
+        "proportional_attention": true
+      }
+    },
+    {
+      "id": 76,
+      "type": "SPA",
+      "pos": [
+        670,
+        120
+      ],
+      "size": [
+        270,
+        340
+      ],
+      "flags": {},
+      "order": 14,
+      "mode": 0,
+      "inputs": [
+        {
+          "name": "model",
+          "type": "MODEL",
+          "link": 125
+        },
+        {
+          "name": "width",
+          "type": "INT",
+          "widget": {
+            "name": "width"
+          },
+          "link": 126
+        },
+        {
+          "name": "height",
+          "type": "INT",
+          "widget": {
+            "name": "height"
+          },
+          "link": 127
+        }
+      ],
+      "outputs": [
+        {
+          "name": "Patched Model",
+          "type": "MODEL",
+          "links": [
+            149
+          ]
+        }
+      ],
+      "properties": {
+        "Node name for S&R": "SPA"
+      },
+      "widgets_values": [
+        1000,
+        1704,
+        "auto",
+        true,
+        0,
+        1,
+        2,
+        "",
+        true
+      ],
+      "widgets_values_named": {
+        "width": 1000,
+        "height": 1704,
+        "model_type": "auto",
+        "enable_spa": true,
+        "bundle_size": 0,
+        "spa_start_sigma": 1,
+        "spa_steps": 2,
+        "spa_layer_filter": "",
+        "proportional_attention": true
+      }
+    },
+    {
+      "id": 46,
+      "type": "SaveImage",
+      "pos": [
+        750,
+        -920
+      ],
+      "size": [
+        700,
+        800
+      ],
+      "flags": {},
+      "order": 18,
+      "mode": 0,
+      "inputs": [
+        {
+          "name": "images",
+          "type": "IMAGE",
+          "link": 112
+        }
+      ],
+      "outputs": [
+        {
+          "name": "images",
+          "type": "IMAGE",
+          "links": null
+        }
+      ],
+      "properties": {
+        "Node name for S&R": "SaveImage",
+        "enableTabs": false,
+        "tabWidth": 65,
+        "tabXOffset": 10,
+        "hasSecondTab": false,
+        "secondTabText": "Send Back",
+        "secondTabOffset": 80,
+        "secondTabWidth": 65,
+        "cnr_id": "comfy-core",
+        "ver": "0.11.1"
+      },
+      "widgets_values": [
+        "Anima"
+      ],
+      "widgets_values_named": {
+        "filename_prefix": "Anima"
+      }
     }
   ],
   "links": [
@@ -622,14 +1167,6 @@
       "IMAGE"
     ],
     [
-      122,
-      71,
-      0,
-      66,
-      0,
-      "MODEL"
-    ],
-    [
       123,
       68,
       0,
@@ -638,10 +1175,114 @@
       "MODEL"
     ],
     [
-      124,
+      125,
+      78,
+      0,
+      76,
+      0,
+      "MODEL"
+    ],
+    [
+      126,
+      81,
+      0,
+      76,
+      1,
+      "INT"
+    ],
+    [
+      127,
+      82,
+      0,
+      76,
+      2,
+      "INT"
+    ],
+    [
+      128,
+      77,
+      0,
+      78,
+      1,
+      "SCOPE_PLAN"
+    ],
+    [
+      129,
+      81,
+      0,
+      79,
+      1,
+      "INT"
+    ],
+    [
+      130,
+      82,
+      0,
+      79,
+      2,
+      "INT"
+    ],
+    [
+      131,
+      81,
+      0,
+      64,
+      0,
+      "INT"
+    ],
+    [
+      132,
+      82,
+      0,
+      64,
+      1,
+      "INT"
+    ],
+    [
+      143,
       75,
       0,
-      71,
+      85,
+      0,
+      "MODEL"
+    ],
+    [
+      144,
+      85,
+      0,
+      78,
+      0,
+      "MODEL"
+    ],
+    [
+      145,
+      85,
+      0,
+      79,
+      0,
+      "MODEL"
+    ],
+    [
+      146,
+      85,
+      0,
+      80,
+      0,
+      "MODEL"
+    ],
+    [
+      149,
+      76,
+      0,
+      86,
+      0,
+      "MODEL"
+    ],
+    [
+      150,
+      86,
+      0,
+      66,
       0,
       "MODEL"
     ]
@@ -654,19 +1295,7 @@
         -600,
         -950,
         360,
-        640
-      ],
-      "color": "#3f789e",
-      "flags": {}
-    },
-    {
-      "id": 2,
-      "title": "Image Size(1MP))",
-      "bounding": [
-        -600,
-        -280,
-        360,
-        240
+        780
       ],
       "color": "#3f789e",
       "flags": {}
@@ -677,8 +1306,44 @@
       "bounding": [
         -220,
         -950,
-        530,
-        910
+        520,
+        780
+      ],
+      "color": "#3f789e",
+      "flags": {}
+    },
+    {
+      "id": 4,
+      "title": "DyPE",
+      "bounding": [
+        -570,
+        30,
+        410,
+        590
+      ],
+      "color": "#3f789e",
+      "flags": {}
+    },
+    {
+      "id": 5,
+      "title": "SEGA",
+      "bounding": [
+        -130,
+        30,
+        390,
+        590
+      ],
+      "color": "#3f789e",
+      "flags": {}
+    },
+    {
+      "id": 6,
+      "title": "HAP+SPA",
+      "bounding": [
+        310,
+        30,
+        660,
+        590
       ],
       "color": "#3f789e",
       "flags": {}
@@ -687,13 +1352,13 @@
   "config": {},
   "extra": {
     "ds": {
-      "scale": 0.6519016697588238,
+      "scale": 0.6209213230591553,
       "offset": [
-        979.8626823194542,
-        1110.5044468160775
+        1246.5420688204022,
+        1185.484376191463
       ]
     },
-    "frontendVersion": "1.47.12",
+    "frontendVersion": "1.49.6",
     "workflowRendererVersion": "Vue-corrected",
     "VHS_latentpreview": false,
     "VHS_latentpreviewrate": 0,

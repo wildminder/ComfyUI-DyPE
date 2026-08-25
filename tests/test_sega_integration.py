@@ -1,10 +1,10 @@
 """Tests for SEGA integration with patch_utils (Tier 2: mock ComfyUI)."""
 import types
-import torch
+
 import pytest
+import torch
 
 from src.patch_utils import apply_sega_to_model
-
 
 # Reuse mock fixtures from conftest
 try:

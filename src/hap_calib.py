@@ -421,32 +421,47 @@ def solve_multiple_choice_knapsack(
     cost_int = torch.ceil(compute_cost.double() * scale).to(torch.long)
     budget_int = int(math.floor(budget * scale))
 
+    # W2.7 FIX (2026-08-25, boundary-rounding false infeasibility): ceil
+    # discretization adds < 1 bin of rounding PER HEAD, so a truly-feasible
+    # assignment can sum to up to ``budget_int + (H - 1)`` bins and was
+    # wrongly rejected as infeasible.  Production symptom: any head count H
+    # that does not divide the geometry evenly crashed with "No feasible HAP
+    # scope assignment found." at high budget ratios (budget_ratio=1.0 with
+    # H=3, seq=256: full-everywhere sums to 4002 bins > budget_int=4000).
+    #
+    # Give the DP an explicit H-bin rounding allowance: every truly-feasible
+    # assignment becomes binned-feasible.  Cost: the returned assignment's
+    # TRUE cost may exceed the budget by at most ``H * budget / bins`` — the
+    # exact slack already documented (and asserted) in
+    # tests/test_hap_knapsack.py::TestKnapsack::test_budget_respected.
+    capacity = budget_int + H
+
     inf = float("inf")
-    dp = torch.full((budget_int + 1,), inf, dtype=torch.float64)
+    dp = torch.full((capacity + 1,), inf, dtype=torch.float64)
     dp[0] = 0.0
 
     parents: List[Tuple[torch.Tensor, torch.Tensor]] = []
 
     for h in range(H):
         next_dp = torch.full_like(dp, inf)
-        parent_scope = torch.full((budget_int + 1,), -1, dtype=torch.long)
-        parent_budget = torch.full((budget_int + 1,), -1, dtype=torch.long)
+        parent_scope = torch.full((capacity + 1,), -1, dtype=torch.long)
+        parent_budget = torch.full((capacity + 1,), -1, dtype=torch.long)
 
         for s in range(S):
             c = int(cost_int[h, s].item())
             q = float(quality_cost[h, s].item())
 
-            if c > budget_int:
+            if c > capacity:
                 continue
 
-            prior = dp[: budget_int + 1 - c]
+            prior = dp[: capacity + 1 - c]
             candidate = prior + q
             target = next_dp[c:]
 
             improved = candidate < target
             target[improved] = candidate[improved]
 
-            idx = torch.arange(budget_int + 1 - c)[improved]
+            idx = torch.arange(capacity + 1 - c)[improved]
             parent_scope[c + idx] = s
             parent_budget[c + idx] = idx
 
@@ -730,16 +745,20 @@ def collect_scope_scores(
     attn_module.optimized_attention = chunked_attn
     try:
         output = model_forward()
+        # W2.7 FIX (2026-08-25): raise the "no calls" error BEFORE backward.
+        # The pre-fix order ran ``loss.backward()`` first, so a forward that
+        # never called optimized_attention crashed with an unrelated autograd
+        # error ("element 0 of tensors does not require grad") instead of the
+        # intended actionable message.
+        if not records:
+            raise RuntimeError(
+                "collect_scope_scores: model_forward made no optimized_attention "
+                "calls — nothing to calibrate."
+            )
         loss = loss_fn(output)
         loss.backward()
     finally:
         attn_module.optimized_attention = orig
-
-    if not records:
-        raise RuntimeError(
-            "collect_scope_scores: model_forward made no optimized_attention "
-            "calls — nothing to calibrate."
-        )
 
     # OBSERVED GEOMETRY + TEXT_LEN CLAMP (text_len>seq_len root cause).  The
     # cost model requires ``text_len <= seq_len`` (seq = text + image).  The

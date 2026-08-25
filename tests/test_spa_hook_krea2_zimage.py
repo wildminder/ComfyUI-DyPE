@@ -26,15 +26,14 @@ import torch
 import torch.nn.functional as F
 
 from src.spa import (
-    _spa_install_hook,
-    _spa_resolve_type,
-    _spa_patch_targets,
     _spa_assemble_zimage_posids,
     _spa_dispatch_attention,
+    _spa_install_hook,
+    _spa_patch_targets,
+    _spa_resolve_type,
 )
 from src.spa_attn import apply_rope_matrix
 from src.spa_context import SPAContext, get_spa_context, set_spa_context
-
 
 # ---------------------------------------------------------------------------
 # Krea-2
@@ -312,9 +311,8 @@ def test_zimage_old_single_group_path_crashes_documentation():
 
     H, D = 4, 192
     L = Lc + Li
+    # Only `q` is needed: apply_rope_matrix must reject the mismatched PE.
     q = torch.randn(1, H, L, D)
-    k = torch.randn(1, H, L, D)
-    v = torch.randn(1, H, L, D)
 
     with pytest.raises(RuntimeError):
         apply_rope_matrix(q, ctx_old.variant_pes[0], "flux")

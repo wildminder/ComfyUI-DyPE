@@ -35,15 +35,18 @@ import math
 from typing import List, Optional
 
 import torch
-import torch.nn as nn
 
 from .base import DyPEBasePosEmbed
 from .patch_utils import _snap_to_multiple
 from .rope import get_1d_ntk_pos_embed
+from .spa_attn import (
+    compose_rope,
+    inv_rope,
+    spa_averaged_attention,
+)
 from .spa_context import (
     SPAContext,
     get_hap_context,
-    get_hrdit_layer_idx,
     get_hrdit_proportional,
     get_spa_context,
     get_spa_layer_filter,
@@ -57,12 +60,6 @@ from .spa_context import (
     set_spa_context,
     set_spa_layer_filter,
     set_spa_step_gate,
-)
-from .spa_attn import (
-    apply_rope_matrix,
-    compose_rope,
-    inv_rope,
-    spa_averaged_attention,
 )
 
 logger = logging.getLogger("ComfyUI-DyPE")
@@ -570,47 +567,17 @@ def _spa_patch_targets(model_type: str):
 
 
 def _spa_resolve_type(model_type: str, dm) -> str:
-    """Resolve the concrete SPA backend key from the requested ``model_type`` and the
-    live diffusion model ``dm``.
+    """Resolve the concrete SPA backend key from the requested ``model_type``
+    and the live diffusion model ``dm``.
 
-    Returns one of ``"flux"``, ``"qwen"``, ``"krea2"``, ``"zimage"``, ``"anima"``,
-    ``"nunchaku"``.  Used by :func:`apply_spa_to_model` (and unit-tested directly).
-
-    Krea-2 detection note: Krea-2's ``SingleStreamDiT`` shares the Qwen architecture but
-    binds ``optimized_attention_masked`` into its own module, so it MUST be detected by the
-    diffusion_model class name BEFORE the ``model_type`` string is consulted — otherwise a
-    user who follows the README and passes ``model_type="qwen"`` for Krea-2 would patch the
-    wrong attention symbol and get a silent no-op.
+    W4.3 (2026-08-25): thin adapter over the canonical
+    :func:`src.model_detect.resolve_model_type` — SPA no longer owns its own
+    detector copy.  Kept under this name/signature because many tests import
+    it directly.
     """
-    model_class_name = dm.__class__.__name__
-    if model_class_name == "SingleStreamDiT":
-        return "krea2"
-    if model_type == "krea2":
-        return "krea2"
-    if model_type == "nunchaku":
-        return "nunchaku"
-    if model_type == "qwen":
-        return "qwen"
-    if model_type in ("z_image", "zimage"):
-        return "zimage"
-    if model_type == "anima":
-        return "anima"
-    if model_type == "flux":
-        return "flux"
-    # auto
-    if "QwenImage" in model_class_name:
-        return "qwen"
-    if "Anima" in model_class_name or "MiniTrainDIT" in model_class_name:
-        return "anima"
-    if hasattr(dm, "rope_embedder"):
-        return "zimage"
-    if hasattr(dm, "model") and hasattr(dm.model, "pos_embed"):
-        return "nunchaku"
-    if hasattr(dm, "pe_embedder"):
-        return "flux"
-    if hasattr(dm, "pos_embedder") and hasattr(dm.pos_embedder, "dim_spatial_range"):
-        return "anima"
-    raise ValueError("The provided model is not a compatible model.")
+    from .model_detect import resolve_model_type
+
+    return resolve_model_type(dm, model_type)
 
 
 def _spa_run_averaged(q, k, v, ctx, attn_fn):
@@ -805,7 +772,7 @@ def _spa_derive_text_len(ids: torch.Tensor):
                 break
             run += 1
         return run
-    except Exception:
+    except Exception:  # leak-guard: diagnostic run-length read
         return None
 
 
@@ -966,12 +933,12 @@ def _make_hrdit_wrapper(orig, is_masked: bool):
 
     ``is_masked`` is retained for patch-target bookkeeping and tests but no longer
     changes the call convention (the two real symbols are the same function).
+
+    W9.e (2026-08-25): the temporary shape-diagnostic latch from the 2026-08-18
+    krea2 investigation is RETIRED — its hypothesis was confirmed and fixed
+    (see the output-reshape comment below); behaviour is covered by
+    tests/test_anima_crash_rootcause.py + krea2 integration tests.
     """
-    # DIAGNOSTIC latch (2026-08-18, krea2 inference shape-mismatch): one-time
-    # log of the HAP output shape vs the caller's output-reshape convention.
-    # Hypothesis: HAP returns head format (B, H, T, D) but the caller (krea2)
-    # expects flattened (B, T, H*D) because it did not pass skip_output_reshape.
-    _shape_diag = [False]
 
     def _wrapper(q, k, v, heads, mask=None, attn_precision=None,
                  skip_reshape=False, skip_output_reshape=False, **kw):
@@ -1070,14 +1037,6 @@ def _make_hrdit_wrapper(orig, is_masked: bool):
                 # This fixes both the direct HAP path and the SPA-averaged path
                 # (which averages ``_attn`` results, so each pass is reshaped
                 # before averaging — shape-invariant mean).
-                if not _shape_diag[0]:
-                    _shape_diag[0] = True
-                    logger.debug(
-                        "[HAP shape-diag] HAP returned shape=%s; caller convention: "
-                        "skip_output_reshape=%s (False => flatten to (B, T, H*D)), "
-                        "skip_reshape=%s, heads=%s.",
-                        tuple(out.shape), skip_output_reshape, skip_reshape, heads,
-                    )
                 if skip_output_reshape:
                     return out  # (B, H, T, D) head format, as the caller wants
                 b, h, t, d = out.shape
@@ -1227,7 +1186,6 @@ def _hrdit_install_hook(m, model_type: str, consumer: str = "spa") -> None:
     """
     import importlib
 
-    import comfy.ldm.modules.attention as attn_mod
 
     # Shared-hook fast path: already installed -> just record the consumer.
     # The unet wrapper reads ``m._hap_ctx`` at CALL time, so HAP state applied
@@ -1253,7 +1211,7 @@ def _hrdit_install_hook(m, model_type: str, consumer: str = "spa") -> None:
     for mod_path, attr, is_masked in targets:
         try:
             mod = importlib.import_module(mod_path)
-        except Exception as exc:  # backend not importable in this environment
+        except Exception as exc:  # backend not importable in this environment  # probe: backend module not importable here
             logger.warning(
                 "SPA: cannot import %r to patch attention; SPA may be a no-op for "
                 "backend %r. (%s)", mod_path, model_type, exc
@@ -1326,7 +1284,7 @@ def _hrdit_install_hook(m, model_type: str, consumer: str = "spa") -> None:
         t = args_dict.get("timestep")
         try:
             sigma = float(t.detach().flatten()[0]) if torch.is_tensor(t) else float(t)
-        except Exception:
+        except Exception:  # degrade: unreadable timestep -> plain attention
             sigma = None  # unreadable timestep
 
         # STEP-COUNT GATE (P2, HRDiT-faithful fix for D4): SPA is only useful on
@@ -1397,7 +1355,7 @@ def restore_spa_attention_hook(m, attn_module=None) -> None:
     if attn_module is None:
         try:
             import comfy.ldm.modules.attention as attn_module
-        except Exception:
+        except Exception:  # probe: attention module availability
             attn_module = None
     if attn_module is not None:
         orig = getattr(m, "_spa_orig_optimized_attention", None)
@@ -1565,6 +1523,22 @@ def apply_spa_to_model(
     # --- composition guard (decision 6) -------------------------------------
     _spa_ensure_no_incompatible_embedder(orig_embedder)
 
+    # --- W9.g (NTH-108): genuine double-application warning ------------------
+    # A re-apply onto an ALREADY-SPA embedder resets the step counters and
+    # double-registers variants.  Distinguish it from the legitimate
+    # SPA-after-HAP chain: in that case the SOURCE patcher carried the hook
+    # (``_spa_installed``) but the embedder is NOT an SPA embedder (HAP does
+    # not replace the embedder).  Only when BOTH the incoming patcher had the
+    # hook AND the resolved embedder is already an SPA embedder is this a real
+    # double apply.
+    if isinstance(orig_embedder, SPABasePosEmbed) and getattr(
+        model, "_spa_installed", False
+    ):
+        logger.warning(
+            "SPA applied twice onto the same model; step counters reset. "
+            "This usually means two SPA nodes are chained — remove one."
+        )
+
     # --- Nunchaku guard (decision 4): unsupported, return unchanged ----------
     if is_nunchaku:
         logger.warning(
@@ -1575,12 +1549,8 @@ def apply_spa_to_model(
         return m
 
     # --- read theta / axes_dim from the original embedder -------------------
-    base_patch_h_tokens = base_patch_w_tokens = None
-    if is_z_image:
-        axes_lens = getattr(m.model.diffusion_model, "axes_lens", None)
-        if isinstance(axes_lens, (list, tuple)) and len(axes_lens) >= 3:
-            base_patch_h_tokens = int(axes_lens[1])
-            base_patch_w_tokens = int(axes_lens[2])
+    # (Z-Image axes_lens probing was removed: the values were never consumed
+    # downstream — the Z-Image adapter derives its base grid itself.)
 
     try:
         if is_anima:

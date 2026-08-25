@@ -3,10 +3,11 @@ Root conftest.py — installs ComfyUI mocks before any test collection.
 This must exist at the project root so pytest loads it before importing
 the project's __init__.py (which requires comfy_api).
 """
+import copy
 import os
 import sys
 import types
-import copy
+
 import torch
 
 # Ensure the project root is on sys.path so `from src.xxx import ...` works
@@ -21,6 +22,7 @@ collect_ignore = ["__init__.py", "src"]
 # import __init__.py (which has relative imports that fail outside ComfyUI).
 # This allows `from src.xxx import ...` to work in tests.
 import importlib.util
+
 _pkg_name = os.path.basename(_PROJECT_ROOT)
 if _pkg_name not in sys.modules:
     _spec = importlib.util.spec_from_file_location(

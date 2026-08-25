@@ -39,7 +39,12 @@ class TestFlexProbe:
         assert hap.hap_flex_available() is False
 
     def test_flex_probe_false_when_import_fails(self, monkeypatch):
-        """Probe returns False (never raises) if the flex_attention import blows up."""
+        """Probe returns False (never raises) if the flex_attention import blows up.
+
+        W3 note (2026-08-25): the probe now imports via
+        ``from torch.nn.attention import flex_attention`` (the F823 fix), so
+        the simulated failure must trigger on that module path.
+        """
         monkeypatch.setattr(torch.cuda, "is_available", lambda: True)
         monkeypatch.setattr(hap, "_torch_version_at_least", lambda maj, mnr: True)
 
@@ -47,7 +52,7 @@ class TestFlexProbe:
         real_import = builtins.__import__
 
         def fake_import(name, *args, **kwargs):
-            if "flex_attention" in name:
+            if name == "torch.nn.attention":
                 raise ImportError("simulated missing flex_attention")
             return real_import(name, *args, **kwargs)
 
@@ -59,6 +64,29 @@ class TestFlexProbe:
         monkeypatch.setattr(torch.cuda, "is_available", lambda: True)
         monkeypatch.setattr(hap, "_torch_version_at_least", lambda maj, mnr: False)
         assert hap.hap_flex_available() is False
+
+    def test_flex_probe_cuda_gate_reachable(self, monkeypatch):
+        """W3 REGRESSION (ruff F823): the local
+        ``import torch.nn.attention.flex_attention`` used to bind ``torch``
+        function-locally, so ``torch.cuda.is_available()`` raised
+        UnboundLocalError (swallowed by the except) and the probe returned
+        False on EVERY environment — the CUDA gate was unreachable.  With a
+        CUDA-mocked-positive env and an old-torch stub, the version gate must
+        be what returns False (proving execution reached past the CUDA check).
+        """
+        reached = {"version_gate": False}
+
+        monkeypatch.setattr(torch.cuda, "is_available", lambda: True)
+
+        def _version_gate(maj, mnr):
+            reached["version_gate"] = True
+            return False
+
+        monkeypatch.setattr(hap, "_torch_version_at_least", _version_gate)
+        assert hap.hap_flex_available() is False
+        assert reached["version_gate"], (
+            "execution never reached the version gate — the CUDA check raised "
+            "(UnboundLocalError regression)")
 
 
 @pytest.mark.unit
@@ -501,9 +529,17 @@ class TestHapRuntime:
         hap.HapRuntime.reset()
 
     def _ctx(self, num_layers=3, backend="dense"):
+        # W2.7 fix (2026-08-25): DISTINCT betas per layer.  The mask cache is
+        # keyed by the RESOLVED halves, so a plan with identical per-layer
+        # scopes shares one mask across all layers and a "one prepare per
+        # distinct scope" count can never reach ``num_layers`` (the pre-fix
+        # fixture used [0.5, 0.5] everywhere -> prepare_count == 1).
+        # Cycle [0.5, 0.75, 1.0]: at nbx=4 (seq 256) these resolve to halves
+        # {1, 2, 3} — three distinct masks.
+        cycle = [0.5, 0.75, 1.0]
         plan = hap.ScopePlan(
             alphas=[[0.0, 0.0]] * num_layers,
-            betas=[[0.5, 0.5]] * num_layers,
+            betas=[[cycle[i % len(cycle)]] * 2 for i in range(num_layers)],
         )
         return hap.HapContext(active=True, plan=plan, text_len=0, backend=backend)
 
@@ -514,7 +550,8 @@ class TestHapRuntime:
         ctx = self._ctx(num_layers=3)
         set_hap_context(ctx)
         runtime = hap.HapRuntime.get()
-        q, k, v = _rand_qkv(H=2, S=128, seed=21)
+        # S=256 -> nbx=4 so the cycled betas resolve to DISTINCT halves.
+        q, k, v = _rand_qkv(H=2, S=256, seed=21)
         for _ in range(2):
             for layer in range(3):
                 out = runtime.attn(q, k, v, layer)

@@ -23,18 +23,14 @@ Markers: @pytest.mark.unit
 """
 import math
 
-import pytest
 import torch
 
 from src.rope import get_1d_ntk_pos_embed
 from src.spa import SPA_MAX_PASSES, build_bundle_id_variants, derive_bundle_s
 from src.spa_attn import (
     apply_rope_matrix,
-    compose_rope,
-    inv_rope,
     spa_averaged_attention,
 )
-
 
 # --- Krea config (verified against comfy/ldm/krea2/model.py SingleStreamDiT) --
 KREA_AXES_DIM = [32, 48, 48]
@@ -85,7 +81,6 @@ def _spa_format_flux(components, ids):
 
 def test_krea_base_pe_parity_with_flux_rope():
     """SPA's base PE must equal FLUX's rope() block-for-block for axes_dim=[32,48,48]."""
-    g = torch.Generator().manual_seed(7)
     # mixed token ids: text (0,0,0) + image grid spanning 0..127 on h,w
     ids = torch.zeros(1, 200, 3)
     ids[0, 4:, 1] = torch.arange(128).float().repeat(1)[:196] if False else torch.arange(196).float()
@@ -219,7 +214,7 @@ def test_krea_averaged_attention_is_smooth_not_mosaic():
     # always within the SPA_MAX_PASSES cost cap.
     s = (len(variant_pes) + 1) // 2
     assert s == derive_bundle_s(127, 3), f"expected s={derive_bundle_s(127, 3)}, got s={s}"
-    assert len(variant_pes) <= SPA_MAX_PASSES, f"pass count exceeds cap"
+    assert len(variant_pes) <= SPA_MAX_PASSES, "pass count exceeds cap"
 
 
 def test_krea_variant_count_bounded_at_cap():

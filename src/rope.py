@@ -1,6 +1,7 @@
-import torch
-import numpy as np
 import math
+
+import numpy as np
+import torch
 
 
 def find_correction_factor(num_rotations: float, dim: int, base: float, max_position_embeddings: int) -> float:
@@ -81,19 +82,19 @@ def get_1d_dype_yarn_pos_embed(
     low, high = max(0, low), min(dim // 2, high)
     mask_gamma = (1 - linear_ramp_mask(low, high, dim // 2).to(device).to(freqs_dtype))
     freqs = freqs * (1 - mask_gamma) + freqs_base * mask_gamma
-    
+
     freqs = torch.einsum("...s,d->...sd", pos, freqs)
 
     if use_real and repeat_interleave_real:
         freqs_cos = freqs.cos().repeat_interleave(2, dim=-1).float()
         freqs_sin = freqs.sin().repeat_interleave(2, dim=-1).float()
-        
+
         if override_mscale is not None:
             mscale = torch.tensor(override_mscale, dtype=freqs_dtype, device=device)
         else:
             mscale_val = 1.0 + 0.1 * math.log(ntk_scale) / math.sqrt(ntk_scale)
             mscale = torch.tensor(mscale_val, dtype=freqs_dtype, device=device)
-        
+
         return freqs_cos * mscale, freqs_sin * mscale
     elif use_real:
         return freqs.cos().float(), freqs.sin().float()
@@ -149,19 +150,19 @@ def get_1d_yarn_pos_embed(
     low, high = max(0, low), min(dim // 2, high)
     freqs_mask = (1 - linear_ramp_mask(low, high, dim // 2).to(device).to(freqs_dtype))
     freqs = freqs * (1 - freqs_mask) + freqs_base * freqs_mask
-    
+
     freqs = torch.einsum("...s,d->...sd", pos, freqs)
 
     if use_real and repeat_interleave_real:
         freqs_cos = freqs.cos().repeat_interleave(2, dim=-1).float()
         freqs_sin = freqs.sin().repeat_interleave(2, dim=-1).float()
-        
+
         mscale = None
         if use_aggressive_mscale:
             mscale = torch.where(scale <= 1., torch.tensor(1.0), 0.1 * torch.log(scale) + 1.0).to(scale)
         else:
             mscale = torch.where(scale <= 1., torch.tensor(1.0), 1.0 + 0.1 * torch.log(scale) / torch.sqrt(scale)).to(scale)
-        
+
         return freqs_cos * mscale, freqs_sin * mscale
     elif use_real:
         return freqs.cos().float(), freqs.sin().float()

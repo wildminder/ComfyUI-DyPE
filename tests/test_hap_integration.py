@@ -29,7 +29,6 @@ Accept (user-run):
     pytest tests/test_hap_integration.py -k cross_attention
 """
 
-import types
 
 import pytest
 import torch

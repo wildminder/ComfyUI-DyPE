@@ -45,9 +45,8 @@ def flux_math_binding():
     the module attribute alone does not affect it.  The FLUX-bound name is restored on
     teardown so the session stays clean.
     """
-    import torch.nn.functional as F
-
     import comfy.ldm.modules.attention as attn_mod
+    import torch.nn.functional as F
 
     def _sdpa(q, k, v, heads, skip_reshape=False, mask=None,
               transformer_options=None, **kw):

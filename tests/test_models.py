@@ -1,11 +1,11 @@
 """Tests for src/models/ — adapter output format tests (Tier 1)."""
-import torch
 import pytest
+import torch
 
+from src.models.anima import PosEmbedAnima
 from src.models.flux import PosEmbedFlux
 from src.models.nunchaku import PosEmbedNunchaku
 from src.models.qwen import PosEmbedQwen
-from src.models.anima import PosEmbedAnima
 
 
 @pytest.fixture
@@ -272,3 +272,66 @@ class TestPosEmbedAnima:
         # D/2 = 64, but we have 3 axes with dims [44, 42, 42]
         # Total freq dim = 44//2 + 42//2 + 42//2 = 22 + 21 + 21 = 64
         assert out.shape == (64, 64, 2, 2)
+
+
+@pytest.mark.unit
+class TestNoDypeBaseHwAttr:
+    """W6.2a (IMP-003): the shared diffusion_model must NOT carry DyPE-private
+    state.  ``_dype_base_hw`` was write-only; both writes are removed."""
+
+    def _patcher(self, dm):
+        import types
+
+        class _P:
+            def __init__(self, dm):
+                self.model = types.SimpleNamespace(
+                    diffusion_model=dm,
+                    model_sampling=types.SimpleNamespace(
+                        sigma_max=types.SimpleNamespace(item=lambda: 1.0)),
+                )
+                self._object_patches = {}
+                self._unet_wrapper = None
+
+            def clone(self):
+                new = _P(self.model.diffusion_model)
+                new._object_patches = dict(self._object_patches)
+                new._unet_wrapper = self._unet_wrapper
+                return new
+
+            def add_object_patch(self, path, obj):
+                self._object_patches[path] = obj
+
+            def set_model_unet_function_wrapper(self, fn):
+                self._unet_wrapper = fn
+
+        return _P(dm)
+
+    def test_dype_zimage_leaves_no_base_hw_attr(self):
+        import types
+
+        from src.patch_utils import apply_dype_to_model
+
+        dm = types.SimpleNamespace(
+            patch_size=2,
+            rope_embedder=types.SimpleNamespace(theta=10000, axes_dim=[32, 48, 48]),
+            axes_lens=[128, 64, 64],
+        )
+        m = apply_dype_to_model(
+            self._patcher(dm), "zimage", 2048, 2048, "ntk", False,
+            enable_dype=False, dype_scale=1.0, dype_exponent=1.0,
+            base_shift=0.5, max_shift=1.15,
+        )
+        assert not hasattr(m.model.diffusion_model, "_dype_base_hw")
+
+    def test_sega_zimage_leaves_no_base_hw_attr(self):
+        import types
+
+        from src.patch_utils import apply_sega_to_model
+
+        dm = types.SimpleNamespace(
+            patch_size=2,
+            rope_embedder=types.SimpleNamespace(theta=10000, axes_dim=[32, 48, 48]),
+            axes_lens=[128, 64, 64],
+        )
+        m = apply_sega_to_model(self._patcher(dm), "zimage", 2048, 2048)
+        assert not hasattr(m.model.diffusion_model, "_dype_base_hw")

@@ -14,7 +14,6 @@ import types
 
 import pytest
 
-from src import hap
 from src.hap import ScopePlan, apply_hap_to_model, restore_hap_attention_hook
 
 _INIT = pathlib.Path(__file__).parent.parent / "__init__.py"
@@ -64,11 +63,17 @@ def _make_flux_mock():
 
 def _make_nunchaku_mock():
     m = _MockModel()
-    m.model.diffusion_model.model = types.SimpleNamespace(
-        pos_embed=types.SimpleNamespace(theta=10000, axes_dim=[16, 56, 56])
-    )
-    # Mark as nunchaku so _spa_resolve_type detects it.
-    m.model.diffusion_model.__class__ = type("NunchakuModel", (), {})
+
+    class _NunchakuInner:
+        def __init__(self):
+            self.pos_embed = types.SimpleNamespace(theta=10000, axes_dim=[16, 56, 56])
+
+    # W2.7 fix (2026-08-25): build the dm AS a mutable class instance instead
+    # of assigning ``__class__`` on a SimpleNamespace (which raises
+    # "assignment only supported for mutable types" on Python 3.13).
+    dm = _NunchakuInner()
+    dm.model = _NunchakuInner()
+    m.model.diffusion_model = dm
     return m
 
 

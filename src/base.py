@@ -1,7 +1,10 @@
+import math
+
 import torch
 import torch.nn as nn
-import math
-from .rope import get_1d_dype_yarn_pos_embed, get_1d_yarn_pos_embed, get_1d_ntk_pos_embed
+
+from .rope import get_1d_dype_yarn_pos_embed, get_1d_ntk_pos_embed, get_1d_yarn_pos_embed
+
 
 class DyPEBasePosEmbed(nn.Module):
     """
@@ -25,9 +28,12 @@ class DyPEBasePosEmbed(nn.Module):
         self.dype_exponent = dype_exponent
         self.base_resolution = base_resolution
         self.dype_start_sigma = max(0.001, min(1.0, dype_start_sigma)) # Clamp 0.001-1.0
-        
+
         self.current_timestep = 1.0
+        # W9.c (NTH-004): bounded FIFO cache — unbounded growth was possible
+        # when a workflow cycles many distinct grid shapes.
         self._span_cache: dict[tuple, float] = {}
+        self._span_cache_max = 64
 
         # Determine Base Patch Grid and Max Patches
         if base_patch_grid is None:
@@ -38,11 +44,17 @@ class DyPEBasePosEmbed(nn.Module):
              self.base_patch_grid = (base_patch_grid, base_patch_grid)
         else:
             self.base_patch_grid = base_patch_grid
-            
+
         self.base_patches = max(self.base_patch_grid)
 
     def set_timestep(self, timestep: float) -> None:
         self.current_timestep = timestep
+
+    def _span_cache_put(self, key, value: float) -> None:
+        """FIFO-bounded insert (W9.c): evict the OLDEST entry past the cap."""
+        if len(self._span_cache) >= self._span_cache_max and key not in self._span_cache:
+            self._span_cache.pop(next(iter(self._span_cache)))
+        self._span_cache[key] = value
 
     def _axis_token_span(self, axis_pos: torch.Tensor) -> float:
         cache_key = (axis_pos.shape, axis_pos.device, axis_pos.dtype)
@@ -52,20 +64,20 @@ class DyPEBasePosEmbed(nn.Module):
         flat = axis_pos.float().reshape(-1)
 
         if flat.numel() <= 1:
-            self._span_cache[cache_key] = 1.0
+            self._span_cache_put(cache_key, 1.0)
             return 1.0
 
         min_val, max_val = flat.min(), flat.max()
         span = max_val - min_val
 
         if span <= 0:
-            self._span_cache[cache_key] = 1.0
+            self._span_cache_put(cache_key, 1.0)
             return 1.0
 
         unique_vals = torch.unique(flat)
 
         if unique_vals.numel() <= 1:
-            self._span_cache[cache_key] = 1.0
+            self._span_cache_put(cache_key, 1.0)
             return 1.0
 
         step = torch.diff(unique_vals).min().item()
@@ -75,7 +87,7 @@ class DyPEBasePosEmbed(nn.Module):
         else:
             result = float((span / step) + 1.0)
 
-        self._span_cache[cache_key] = result
+        self._span_cache_put(cache_key, result)
         return result
 
     def _get_mscale(self, scale_global: float) -> float:
@@ -88,7 +100,7 @@ class DyPEBasePosEmbed(nn.Module):
     def _calc_vision_yarn_components(self, pos: torch.Tensor, freqs_dtype: torch.dtype) -> list[tuple[torch.Tensor, torch.Tensor]]:
         n_axes = pos.shape[-1]
         components = []
-        
+
         if n_axes >= 3:
             h_span = self._axis_token_span(pos[..., 1])
             w_span = self._axis_token_span(pos[..., 2])
@@ -96,24 +108,24 @@ class DyPEBasePosEmbed(nn.Module):
         else:
             max_current_patches = self._axis_token_span(pos)
             scale_global = max(1.0, max_current_patches / self.base_patches)
-            
+
         current_mscale = self._get_mscale(scale_global)
 
         for i in range(n_axes):
             axis_pos = pos[..., i]
             axis_dim = self.axes_dim[i]
             current_patches = self._axis_token_span(axis_pos)
-            
+
             axis_theta = self.thetas[i] if self.thetas is not None else self.theta
             common_kwargs = {'dim': axis_dim, 'pos': axis_pos, 'theta': axis_theta, 'use_real': True, 'repeat_interleave_real': True, 'freqs_dtype': freqs_dtype}
             dype_kwargs = {'dype': self.dype, 'current_timestep': self.current_timestep, 'dype_scale': self.dype_scale, 'dype_exponent': self.dype_exponent, 'ntk_scale': scale_global, 'override_mscale': current_mscale}
 
             if i > 0:
                 base_axis_len = self.base_patch_grid[i-1] if (n_axes >=3 and i-1 < len(self.base_patch_grid)) else self.base_patches
-                
+
                 scale_local = max(1.0, current_patches / base_axis_len)
-                dype_kwargs['linear_scale'] = scale_local 
-                
+                dype_kwargs['linear_scale'] = scale_local
+
                 if scale_global > 1.0:
                     cos, sin = get_1d_dype_yarn_pos_embed(**common_kwargs, ori_max_pe_len=base_axis_len, **dype_kwargs)
                 else:
@@ -122,13 +134,13 @@ class DyPEBasePosEmbed(nn.Module):
                 cos, sin = get_1d_ntk_pos_embed(**common_kwargs, ntk_factor=1.0)
 
             components.append((cos, sin))
-            
+
         return components
 
     def _calc_yarn_components(self, pos: torch.Tensor, freqs_dtype: torch.dtype) -> list[tuple[torch.Tensor, torch.Tensor]]:
         n_axes = pos.shape[-1]
         components = []
-        
+
         if n_axes >= 3:
             h_span = self._axis_token_span(pos[..., 1])
             w_span = self._axis_token_span(pos[..., 2])
@@ -154,7 +166,7 @@ class DyPEBasePosEmbed(nn.Module):
                     cos, sin = get_1d_yarn_pos_embed(**common_kwargs, max_pe_len=max_pe_len, ori_max_pe_len=base_axis_len, **dype_kwargs, use_aggressive_mscale=True)
                 else:
                     cos, sin = get_1d_ntk_pos_embed(**common_kwargs, ntk_factor=1.0)
-                
+
                 components.append((cos, sin))
         else:
             cos_full_spatial, sin_full_spatial = None, None
@@ -163,7 +175,7 @@ class DyPEBasePosEmbed(nn.Module):
                 spatial_theta = self.thetas[1] if self.thetas is not None else self.theta
                 square_pos = torch.arange(0, max_current_patches, device=pos.device).float()
                 max_pe_len = torch.tensor(max_current_patches, dtype=freqs_dtype, device=pos.device)
-                
+
                 common_kwargs_spatial = {'dim': spatial_axis_dim, 'theta': spatial_theta, 'use_real': True, 'repeat_interleave_real': True, 'freqs_dtype': freqs_dtype}
                 dype_kwargs = {'dype': self.dype, 'current_timestep': self.current_timestep, 'dype_scale': self.dype_scale, 'dype_exponent': self.dype_exponent}
 
@@ -175,12 +187,12 @@ class DyPEBasePosEmbed(nn.Module):
                 axis_pos = pos[..., i]
                 axis_dim = self.axes_dim[i]
                 axis_theta = self.thetas[i] if self.thetas is not None else self.theta
-                
+
                 if i > 0 and needs_extrapolation:
                     offset_indices = axis_pos.long() - axis_pos.long().min()
                     pos_indices = offset_indices.view(-1)
                     pos_indices = torch.clamp(pos_indices, max=cos_full_spatial.shape[0]-1)
-                    
+
                     cos = cos_full_spatial[pos_indices].view(*axis_pos.shape, -1)
                     sin = sin_full_spatial[pos_indices].view(*axis_pos.shape, -1)
                 else:
@@ -188,13 +200,13 @@ class DyPEBasePosEmbed(nn.Module):
                     cos, sin = get_1d_ntk_pos_embed(**common_kwargs, ntk_factor=1.0)
 
                 components.append((cos, sin))
-            
+
         return components
 
     def _calc_ntk_components(self, pos: torch.Tensor, freqs_dtype: torch.dtype) -> list[tuple[torch.Tensor, torch.Tensor]]:
         n_axes = pos.shape[-1]
         components = []
-        
+
         if n_axes >= 3:
             h_span = self._axis_token_span(pos[..., 1])
             w_span = self._axis_token_span(pos[..., 2])
@@ -208,7 +220,7 @@ class DyPEBasePosEmbed(nn.Module):
             axis_dim = self.axes_dim[i]
             axis_theta = self.thetas[i] if self.thetas is not None else self.theta
             common_kwargs = {'dim': axis_dim, 'pos': axis_pos, 'theta': axis_theta, 'use_real': True, 'repeat_interleave_real': True, 'freqs_dtype': freqs_dtype}
-            
+
             ntk_factor = 1.0
             if i > 0 and scale_global > 1.0:
                 base_ntk = scale_global ** (axis_dim / (axis_dim - 2))
@@ -218,7 +230,7 @@ class DyPEBasePosEmbed(nn.Module):
                 else:
                     ntk_factor = base_ntk
                 ntk_factor = max(1.0, ntk_factor)
-            
+
             cos, sin = get_1d_ntk_pos_embed(**common_kwargs, ntk_factor=ntk_factor)
             components.append((cos, sin))
         return components

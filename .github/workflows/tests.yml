@@ -1,0 +1,70 @@
+name: tests
+
+on:
+  push:
+    branches: [dev, main]
+  pull_request:
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  # W3.2 (CRIT-003): version drift fails FAST — before the ~20s suite runs.
+  meta:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Version-sync guard (pyproject == README changelog)
+        run: |
+          python -m pip install --quiet pytest
+          python -m pytest -q tests/test_version_sync.py
+
+  test:
+    needs: meta
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest]
+        python-version: ["3.10", "3.12"]
+    runs-on: ${{ matrix.os }}
+    env:
+      COMFYUI_ROOT: ""   # comfyui_integration tests self-skip without it
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Python ${{ matrix.python-version }}
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+
+      - name: Cache pip (CPU torch wheel)
+        uses: actions/cache@v4
+        with:
+          path: ~/.cache/pip
+          key: pip-cpu-torch-${{ runner.os }}-${{ matrix.python-version }}-v1
+          restore-keys: |
+            pip-cpu-torch-${{ runner.os }}-${{ matrix.python-version }}-
+
+      - name: Install CPU-only torch + test deps
+        run: |
+          python -m pip install --upgrade pip
+          # CPU wheel keeps the download ~200 MB instead of the CUDA one (~2.5 GB).
+          python -m pip install torch --index-url https://download.pytorch.org/whl/cpu
+          python -m pip install pytest pytest-cov ruff
+
+      - name: Lint (ruff — correctness rules)
+        # W3 scope decision (2026-08-25): CI gates the CORRECTNESS rule set
+        # (pyflakes F + syntax-error E9xx).  The remaining ~74 stylistic
+        # findings (E402 script-header imports, E701/E731, E741, W293, and
+        # test-side F841) are pre-existing debt tracked under plan W7/W9;
+        # tighten to the full `ruff check .` once they are cleared.
+        run: python -m ruff check . --select F,E9 --extend-ignore F401
+
+      - name: Run unit + mock_integration tests
+        # comfyui_integration tests require a real ComfyUI checkout and are
+        # excluded by marker expression (W3.1).
+        run: python -m pytest -q -m "unit or mock_integration" --cov=src --cov-report=term-missing

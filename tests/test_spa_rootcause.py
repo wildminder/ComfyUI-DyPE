@@ -6,11 +6,12 @@ outputs is correct.  This is the permanent regression anchor for the fix.
 
 Markers: @pytest.mark.unit
 """
-import torch
 import pytest
+import torch
 
-from src.spa import build_bundle_id_variants, SPA_MAX_PASSES
+from src.spa import SPA_MAX_PASSES, build_bundle_id_variants
 from src.spa_attn import apply_rope_matrix
+
 try:
     from tests._spa_math_helpers import random_variants
 except ImportError:  # namespace-package import fallback

@@ -1,6 +1,7 @@
 """Tests for FreeScale node schema (Tier 2: node schema tests)."""
-import pytest
 import pathlib
+
+import pytest
 import torch
 
 
@@ -66,8 +67,14 @@ class TestFreeScaleAttentionPatching:
         assert "stored" in content
 
     def test_uses_scale_fusion(self):
+        """The node implements scale fusion via its own 3D Gaussian filter
+        (``_gaussian_filter_3d``) rather than importing ``scale_fusion`` /
+        ``gaussian_blur_2d`` from src/freescale.py — pin the actual symbols.
+        (W3 ruff auto-fix removed a stale unused import this check relied on;
+        the check now targets the real implementation, 2026-08-25.)"""
         content = self._read_source()
-        assert "scale_fusion" in content or "gaussian_blur" in content
+        assert ("scale_fusion" in content or "gaussian_blur" in content
+                or "_gaussian_filter_3d" in content)
 
     def test_has_vae_adapters(self):
         content = self._read_source()

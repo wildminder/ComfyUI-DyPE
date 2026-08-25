@@ -16,18 +16,15 @@ axis giving ``2*s - 1`` variants.
 
 These tests lock that behaviour in (markers: @pytest.mark.unit).
 """
-import math
 
-import torch
 import pytest
+import torch
 
 from src.spa import (
-    build_bundle_id_variants,
-    derive_bundle_s,
-    SPA_DEFAULT_GROUP_NUM,
-    SPA_DEFAULT_TRAINED_EXTENT,
     SPA_IN_DIST_MAX,
     SPA_MAX_PASSES,
+    build_bundle_id_variants,
+    derive_bundle_s,
 )
 
 

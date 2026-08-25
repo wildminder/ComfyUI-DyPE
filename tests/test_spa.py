@@ -2,14 +2,14 @@
 
 These are pure unit tests (marker: unit) and need no ComfyUI runtime.
 """
-import torch
 import pytest
+import torch
 
 from src.spa import (
-    _phi,
-    bundle_ids_1d,
-    build_bundle_id_variants,
     SPABasePosEmbed,
+    _phi,
+    build_bundle_id_variants,
+    bundle_ids_1d,
 )
 
 
@@ -429,13 +429,32 @@ class TestSPADeltaCache:
             f"{n_variants} (once per variant, composed once per grid)")
 
     def test_cache_invalidated_on_grid_change(self):
-        """T3.2a: a different grid recomposes the deltas (no stale deltas)."""
+        """T3.2a: a different grid recomposes the deltas (no stale deltas).
+
+        W2.6 fix (plan 2026-08-25): shapes are legitimately EQUAL here (fixed
+        axes_dim -> same PE layout); the deltas differ in VALUES.  The old
+        shape-inequality assertion was the stale-mock-era bug.
+        """
         emb = self._make(enable_spa=True, bundle_size=3)
 
         d_small = emb._cached_variant_deltas(self._ids(96, 96))
         d_big = emb._cached_variant_deltas(self._ids(128, 128))
-        # Different grids -> different sequence lengths -> distinct delta tensors.
-        assert d_small[0].shape != d_big[0].shape
+        # Shapes are legitimately equal (fixed axes_dim).
+        assert d_small[0].shape == d_big[0].shape
+        # Different grids MUST produce different delta VALUES.
+        diff = (d_small[0] - d_big[0]).abs().max()
+        assert diff > 0, "different grids must produce different delta VALUES"
+
+    def test_cache_reused_on_same_grid_returns_identical_deltas(self):
+        """W2.6 companion: the SAME grid returns bit-identical cached deltas."""
+        emb = self._make(enable_spa=True, bundle_size=3)
+
+        ids = self._ids(96, 96)
+        first = emb._cached_variant_deltas(ids)
+        second = emb._cached_variant_deltas(ids)
+        assert first is second or all(
+            torch.equal(a, b) for a, b in zip(first, second)
+        )
 
     def test_register_variants_populates_context_deltas(self):
         """T3.2b: ``_register_variants`` stores the cached deltas on the context."""

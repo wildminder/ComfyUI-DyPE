@@ -35,7 +35,6 @@ import torch
 
 from src import hap_calib_node as hcn
 
-
 # ---------------------------------------------------------------------------
 # Toy block-structured DiT (real nn.Module blocks so checkpointing activates)
 # ---------------------------------------------------------------------------

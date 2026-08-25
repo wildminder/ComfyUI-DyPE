@@ -1,6 +1,7 @@
 """Tests for Qwen2D VAE architecture and patching."""
-import pytest
 import pathlib
+
+import pytest
 
 
 @pytest.mark.unit

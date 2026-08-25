@@ -10,13 +10,11 @@ Source: https://huggingface.co/Anzhc/Qwen2D-VAE
 Original project: https://github.com/anzhc/qwen2d-comfyui
 """
 
+import comfy.ops
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-
 from comfy.ldm.modules.diffusionmodules.model import vae_attention
-
-import comfy.ops
 
 ops = comfy.ops.disable_weight_init
 

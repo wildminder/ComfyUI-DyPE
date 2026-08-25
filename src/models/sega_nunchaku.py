@@ -1,4 +1,5 @@
 import torch
+
 from ..sega_base import SegAPosEmbed
 
 
@@ -46,10 +47,8 @@ class SegAPosEmbedNunchaku(SegAPosEmbed):
         return rope.float()
 
     def forward(self, ids: torch.Tensor) -> torch.Tensor:
-        added_batch = False
         if ids.ndim == 1:
             ids = ids.unsqueeze(0)
-            added_batch = True
 
         pos = ids.float()
         freqs_dtype = torch.float32

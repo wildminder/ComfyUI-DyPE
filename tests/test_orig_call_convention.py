@@ -108,6 +108,23 @@ def _rand_qkv(B=1, H=2, S=64, D=16, seed=0):
 
 @pytest.mark.unit
 class TestMockSignatureTripwire:
+    def test_canonical_fixture_signature_locked(self):
+        """W2.1 (CRIT-002/IMP-108): the shared ``make_recording_orig`` fixture
+        must carry the canonical real signature, and the lock helper must
+        reject any drift."""
+        from _hrdit_fixtures import assert_real_signature, make_recording_orig
+
+        orig = make_recording_orig()
+        assert_real_signature(orig)  # must not raise
+
+        # A deliberately wrong mock (pre-fix inverted order) MUST be rejected.
+        def bad_orig(q, k, v, heads, skip_reshape=False, mask=None,
+                     transformer_options=None, **kw):
+            return F.scaled_dot_product_attention(q, k, v)
+
+        with pytest.raises(AssertionError, match="signature drifted"):
+            assert_real_signature(bad_orig)
+
     def test_conftest_mock_matches_real_signature(self, mock_attn):
         """The conftest mock's first-8 params MUST equal the canonical order.
 

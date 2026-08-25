@@ -4,11 +4,12 @@ Pure torch, no ComfyUI.  Verifies ``inv_rope`` / ``compose_rope`` / ``apply_rope
 for the FLUX / Anima / Nunchaku formats and that ``spa_averaged_attention`` equals
 HRDiT's ``reference_spa_attention`` (the equivalence required by the brief).
 """
+import pytest
 import torch
 import torch.nn.functional as F
-import pytest
 
-from src.spa_attn import apply_rope_matrix, inv_rope, compose_rope, spa_averaged_attention
+from src.spa_attn import apply_rope_matrix, compose_rope, inv_rope, spa_averaged_attention
+
 try:
     from tests._spa_math_helpers import (
         angles_to_blocks,
@@ -125,7 +126,6 @@ class TestP1AveragedAttention:
 
                         base_R = angles_to_blocks(base_angles)[None, None]  # (1,1,L,P,2,2)
                         variant_Rs = [angles_to_blocks(a)[None, None] for a in variant_angles]
-                        base_cos_sin = angles_to_cos_sin(base_angles)
                         variant_cos_sins = [angles_to_cos_sin(a) for a in variant_angles]
 
                         q_base = apply_rope_matrix(q, base_R, "flux")
@@ -154,7 +154,6 @@ class TestP1AveragedAttention:
         variant_angles = [_angles(L, P, seed * 10 + n + 1) for n in range(N)]
         base_R = angles_to_blocks(base_angles)[None, None]
         variant_Rs = [angles_to_blocks(a)[None, None] for a in variant_angles]
-        base_cos_sin = angles_to_cos_sin(base_angles)
         variant_cos_sins = [angles_to_cos_sin(a) for a in variant_angles]
 
         q_base = apply_rope_matrix(q, base_R, "flux")

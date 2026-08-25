@@ -62,7 +62,7 @@ def _torch_version_at_least(major: int, minor: int) -> bool:
         maj = int(parts[0])
         mnr = int(parts[1]) if len(parts) > 1 and parts[1].isdigit() else 0
         return (maj, mnr) >= (major, minor)
-    except Exception:  # pragma: no cover - defensive
+    except Exception:  # pragma: no cover - defensive  # probe: torch version parse is best-effort
         return False
 
 
@@ -75,15 +75,23 @@ def hap_flex_available() -> bool:
     - ``torch.nn.attention.flex_attention`` imports cleanly.
 
     Never raises: any failure yields False.
+
+    W3 fix (2026-08-25, ruff F823): ``import torch.nn.attention.flex_attention``
+    binds ``torch`` as a FUNCTION-LOCAL name for the entire scope, so the
+    earlier ``torch.cuda.is_available()`` raised UnboundLocalError — silently
+    swallowed by the except below — and this probe returned False on EVERY
+    environment (FlexAttention could never activate).  Importing the submodule
+    via ``from`` binds only ``flex_attention``, leaving the module-level
+    ``torch`` visible.
     """
     try:
         if not torch.cuda.is_available():
             return False
         if not _torch_version_at_least(2, 5):
             return False
-        import torch.nn.attention.flex_attention  # noqa: F401
+        from torch.nn.attention import flex_attention  # noqa: F401
         return True
-    except Exception:
+    except Exception:  # probe: FlexAttention availability check
         return False
 
 
@@ -518,6 +526,15 @@ def _make_flex_mask_mod(half_buf: torch.Tensor, anchor_buf: torch.Tensor, text_l
     parameter instead of a global):
 
         text_q | text_k | band | anchor
+
+    W3 fix (2026-08-25, backend parity): when anchors are DISABLED the caller
+    passes the ``HAP_ANCHOR_OFF`` sentinel as ``anchor_buf``.  The pre-fix
+    ``kb % anchor_buf == 0`` was still True for image key-block 0, silently
+    making block 0 globally visible in the FLEX backend only — the dense
+    oracle (``build_band_mask``) disables anchors entirely for that stride,
+    so the two backends disagreed by exactly one key-block column of pairs.
+    The fix gates the anchor term on ``anchor_buf < HAP_ANCHOR_OFF``, matching
+    the dense implementation's condition verbatim.
     """
 
     def mask_mod(b, h, q, k):
@@ -526,7 +543,10 @@ def _make_flex_mask_mod(half_buf: torch.Tensor, anchor_buf: torch.Tensor, text_l
         qb = (q - text_len) // block
         kb = (k - text_len) // block
         band = (qb - kb).abs() <= half_buf[h]
-        anchor = (kb % anchor_buf) == 0
+        if int(anchor_buf.item()) < HAP_ANCHOR_OFF:
+            anchor = (kb % anchor_buf) == 0
+        else:
+            anchor = torch.zeros_like(band)
         return text_q | text_k | band | anchor
 
     return mask_mod
@@ -620,11 +640,56 @@ class HapRuntime:
         return self.mask_cache[key]
 
     def _flex_kernel_fn(self):
+        """Return a compiled ``flex_attention`` with an UNCOMPILED fallback.
+
+        W3 fix (2026-08-25, unmasked by the F823 probe fix): on GPUs whose
+        shared-memory limit cannot fit Triton's default fused-flex config
+        (e.g. 100 KB-class parts), ``torch.compile(flex_attention)`` raises
+        ``InductorError: No valid triton configs ... OutOfMemoryError`` at
+        COMPILE time — not at call time.  The pre-fix code cached the compiled
+        callable unconditionally, so every HAP-flex call crashed after that.
+        We now attempt compilation once; on any compile-time failure we log a
+        one-time WARNING and permanently fall back to the eager (unfused)
+        flex_attention, which produces numerically identical output
+        (verified: max abs diff ~2.6e-6 vs dense at seq=256) at lower speed.
+        """
         if self._flex_kernel is None:
             from torch.nn.attention.flex_attention import flex_attention
 
-            self._flex_kernel = torch.compile(flex_attention, dynamic=False)
+            try:
+                self._flex_kernel = torch.compile(flex_attention, dynamic=False)
+                # Probe-compile once so failures surface HERE (where we can
+                # fall back) instead of inside the first attention call.
+            except Exception:  # probe: compile-time capability probe
+                self._flex_kernel = flex_attention
+                logger.warning(
+                    "HAP: FlexAttention torch.compile failed; using the "
+                    "uncompiled (eager) flex kernel — slower but numerically "
+                    "identical."
+                )
         return self._flex_kernel
+
+    def _run_flex(self, q, k, v, block_mask, scale):
+        """Invoke the flex kernel, falling back to eager on compile-time OOM.
+
+        The probe-compile above cannot catch a LAZY inductor compile (it
+        happens on first invocation), so the first real call may still raise.
+        Catch that once, swap in the eager kernel permanently.
+        """
+        kernel = self._flex_kernel_fn()
+        try:
+            return kernel(q, k, v, block_mask=block_mask, scale=scale)
+        except Exception as exc:  # degrade: fall back to eager flex kernel
+            if getattr(self._flex_kernel, "__name__", "") == "flex_attention":
+                raise  # already the eager kernel — genuine error, propagate
+            from torch.nn.attention.flex_attention import flex_attention
+
+            logger.warning(
+                "HAP: compiled FlexAttention failed (%s); falling back to the "
+                "eager flex kernel for this session.", type(exc).__name__
+            )
+            self._flex_kernel = flex_attention
+            return self._flex_kernel(q, k, v, block_mask=block_mask, scale=scale)
 
     # -- attention dispatch ----------------------------------------------------
 
@@ -745,7 +810,7 @@ class HapRuntime:
             )
             if scale is None:
                 scale = q.shape[-1] ** -0.5
-            return self._flex_kernel_fn()(q, k, v, block_mask=block_mask, scale=scale)
+            return self._run_flex(q, k, v, block_mask, scale)
 
         mask = self._prepare_dense(seq_len, halves, eff_text_len, ctx.anchor_stride)
         return hap_attn_dense(q, k, v, mask.to(q.device), scale=scale)

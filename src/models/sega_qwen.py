@@ -1,4 +1,5 @@
 import torch
+
 from ..sega_base import SegAPosEmbed
 
 

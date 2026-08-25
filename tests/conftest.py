@@ -3,12 +3,13 @@ Shared fixtures for ComfyUI-DyPE tests.
 Provides mock objects that simulate ComfyUI's model structure
 without requiring a full ComfyUI installation.
 """
-import sys
-import os
-import types
 import copy
-import torch
+import os
+import sys
+import types
+
 import pytest
+import torch
 
 # Make the tests/ directory importable so shared helpers such as
 # ``_spa_math_helpers`` can be imported as a flat module.
@@ -76,9 +77,11 @@ def _create_mock_comfy_modules():
     return MockModelPatcher
 
 
-# Only mock if comfy is not available (CI/standalone testing)
+# Only mock if comfy is not available (CI/standalone testing).  The import
+# itself is the availability probe — hence the noqa on F401.
 try:
-    import comfy
+    import comfy  # noqa: F401
+
     MockModelPatcher = None
 except ImportError:
     MockModelPatcher = _create_mock_comfy_modules()
@@ -96,8 +99,11 @@ def _install_mock_attention_module():
     """
     import torch.nn.functional as F
 
-    comfy_ldm = sys.modules.setdefault("comfy.ldm", types.ModuleType("comfy.ldm"))
-    comfy_ldm_modules = sys.modules.setdefault(
+    # The parent modules are registered only so the dotted import of
+    # ``comfy.ldm.modules.attention`` resolves; the attention module itself is
+    # what tests patch/read.
+    sys.modules.setdefault("comfy.ldm", types.ModuleType("comfy.ldm"))
+    sys.modules.setdefault(
         "comfy.ldm.modules", types.ModuleType("comfy.ldm.modules")
     )
     attn_mod = sys.modules.setdefault(

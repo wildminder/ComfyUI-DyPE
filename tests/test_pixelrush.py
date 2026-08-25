@@ -1,20 +1,20 @@
 """Tests for src/pixelrush.py — PixelRush core algorithm (Tier 1: pure unit tests)."""
 import math
-import torch
+
 import pytest
+import torch
 
 from src.pixelrush import (
     PixelRushConfig,
-    spherical_lerp,
-    gaussian_kernel_2d,
-    gaussian_feather_mask,
-    patch_positions,
     ddim_forward_one_step,
     ddim_reverse_one_step_to_zero,
-    refine_latent_once,
+    gaussian_feather_mask,
+    gaussian_kernel_2d,
+    patch_positions,
     pixelrush_cascade,
+    refine_latent_once,
+    spherical_lerp,
 )
-
 
 # ---------------------------------------------------------------------------
 # spherical_lerp
@@ -695,7 +695,6 @@ class TestPixelRushCompressionDiagnostics:
         """
         torch.manual_seed(0)
         z0 = torch.randn(1, 4, 32, 32)
-        cfg = self._make_cfg()
         # Run a single patch through the forward step manually.
         patch_0 = z0[:, :, :32, :32]
         eps_inv = self._structured_predict_eps()(patch_0, 0)
@@ -725,7 +724,6 @@ class TestPixelRushCompressionDiagnostics:
         # Seam at y=32 (patch boundary for patch_h=32, full latent 64x64 after 2x)
         # Use a 64x64 latent so a seam exists at the midpoint.
         # Measure gradient magnitude at seam vs interior.
-        import torch.nn.functional as F
         grad = torch.abs(out[:, :, 1:, :] - out[:, :, :-1, :]).mean(dim=(0, 1))
         h = grad.shape[0]
         seam = grad[h // 2].mean()

@@ -1,7 +1,7 @@
 """Tests for the SEGA ComfyUI node definition (Tier 2: node schema tests)."""
-import pytest
-import inspect
 import pathlib
+
+import pytest
 
 
 @pytest.mark.unit

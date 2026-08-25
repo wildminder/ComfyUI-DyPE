@@ -13,9 +13,7 @@ the ComfyUI wrapper before each forward pass via :meth:`set_spectral_data`.
 
 from __future__ import annotations
 
-import math
 import torch
-import torch.nn as nn
 
 from .base import DyPEBasePosEmbed
 from .rope import get_1d_ntk_pos_embed
@@ -186,7 +184,6 @@ class SegAPosEmbed(DyPEBasePosEmbed):
 
         # Compute inverse frequencies for this axis
         axis_theta = self.thetas[axis_idx] if self.thetas is not None else self.theta
-        dim_half = axis_dim // 2
         dim_indices = torch.arange(0, axis_dim, 2, dtype=torch.float32, device=device)
         # NTK-scaled theta
         scaled_theta = axis_theta * ntk_factor

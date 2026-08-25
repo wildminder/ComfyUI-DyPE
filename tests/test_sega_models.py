@@ -1,12 +1,12 @@
 """Tests for SEGA model-specific embedders (Tier 1: pure unit tests)."""
-import torch
 import pytest
+import torch
 
-from src.models.sega_flux import SegAPosEmbedFlux
-from src.models.sega_qwen import SegAPosEmbedQwen
-from src.models.sega_nunchaku import SegAPosEmbedNunchaku
-from src.models.sega_zimage import SegAPosEmbedZImage
 from src.models.sega_anima import SegAPosEmbedAnima
+from src.models.sega_flux import SegAPosEmbedFlux
+from src.models.sega_nunchaku import SegAPosEmbedNunchaku
+from src.models.sega_qwen import SegAPosEmbedQwen
+from src.models.sega_zimage import SegAPosEmbedZImage
 
 
 def _make_flux_ids(H=64, W=64):

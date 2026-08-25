@@ -1,27 +1,21 @@
 import logging
 import math
-import types
-import torch
-import torch.nn.functional as F
-import comfy
 
 logger = logging.getLogger("ComfyUI-DyPE")
-from comfy.model_patcher import ModelPatcher
 from comfy import model_sampling
+from comfy.model_patcher import ModelPatcher
 
+from .models.anima import PosEmbedAnima
 from .models.flux import PosEmbedFlux
 from .models.nunchaku import PosEmbedNunchaku
 from .models.qwen import PosEmbedQwen
-from .models.zimage import PosEmbedZImage
-from .models.anima import PosEmbedAnima
-
+from .models.sega_anima import SegAPosEmbedAnima
 from .models.sega_flux import SegAPosEmbedFlux
 from .models.sega_nunchaku import SegAPosEmbedNunchaku
 from .models.sega_qwen import SegAPosEmbedQwen
 from .models.sega_zimage import SegAPosEmbedZImage
-from .models.sega_anima import SegAPosEmbedAnima
-
-from .sega import compute_axis_spectral_profiles, compute_spectral_energy_profile, compute_dynamic_spread
+from .models.zimage import PosEmbedZImage
+from .sega import compute_axis_spectral_profiles, compute_dynamic_spread, compute_spectral_energy_profile
 
 # Namespaced attribute for cache invalidation (stored on ModelPatcher, not raw model)
 _DYPE_PARAMS_ATTR = "_comfyui_dype_params"
@@ -46,71 +40,58 @@ def _dype_sega_reject_spa(orig_embedder) -> None:
         )
 
 
-def apply_dype_to_model(model: ModelPatcher, model_type: str, width: int, height: int, method: str, yarn_alt_scaling: bool, enable_dype: bool, dype_scale: float, dype_exponent: float, base_shift: float, max_shift: float, base_resolution: int = 1024, dype_start_sigma: float = 1.0) -> ModelPatcher:
-    # Snap resolution to nearest multiple of 16 for latent space compatibility
-    width = _snap_to_multiple(width, 16)
-    height = _snap_to_multiple(height, 16)
+# ---------------------------------------------------------------------------
+# W4.4 (IMP-007) — shared model-geometry resolution
+# ---------------------------------------------------------------------------
 
-    m = model.clone()
+from dataclasses import dataclass  # noqa: E402  (kept beside its only users)
 
-    is_nunchaku = False
-    is_qwen = False
-    is_z_image = False
-    is_anima = False
 
-    if model_type == "nunchaku":
-        is_nunchaku = True
-    elif model_type == "qwen":
-        is_qwen = True
-    elif model_type in ("z_image", "zimage"):
-        is_z_image = True
-    elif model_type == "anima":
-        is_anima = True
-    elif model_type == "flux":
-        pass
-    else: # auto
-        if hasattr(m.model, "diffusion_model"):
-            dm = m.model.diffusion_model
-            model_class_name = dm.__class__.__name__
-            if "QwenImage" in model_class_name:
-                is_qwen = True
-            elif "Anima" in model_class_name or "MiniTrainDIT" in model_class_name:
-                is_anima = True
-            elif hasattr(dm, "rope_embedder"):
-                is_z_image = True
-            elif hasattr(dm, "model") and hasattr(dm.model, "pos_embed"):
-                is_nunchaku = True
-            elif hasattr(dm, "pos_embedder") and hasattr(dm.pos_embedder, "dim_spatial_range"):
-                is_anima = True
-        else:
-            raise ValueError("The provided model is not a compatible model.")
+@dataclass(frozen=True)
+class ModelGeometry:
+    """Resolved per-model geometry shared by the DyPE and SEGA installers.
 
-    detected_type = 'nunchaku' if is_nunchaku else 'qwen' if is_qwen else 'zimage' if is_z_image else 'anima' if is_anima else 'flux'
-    logger.info(f"DyPE: Detected model type: {detected_type}")
+    Attributes mirror the values the two duplicated blocks used to compute
+    inline (verbatim semantics — see tests/test_geometry_resolution.py).
+    """
 
-    new_dype_params = (width, height, base_shift, max_shift, method, yarn_alt_scaling, base_resolution, dype_start_sigma, is_nunchaku, is_qwen, is_z_image, is_anima)
+    patch_size: int                  # token size of one latent patch (default 2)
+    base_patch_h_tokens: int | None  # Z-Image axes_lens[1]
+    base_patch_w_tokens: int | None  # Z-Image axes_lens[2]
+    derived_base_patches: int        # base grid side in patches
+    derived_base_seq_len: int        # base sequence length (patches^2, or h*w)
+    detected: str                    # from resolve_model_type
 
-    should_patch_schedule = True
-    if hasattr(m, _DYPE_PARAMS_ATTR):
-        if getattr(m, _DYPE_PARAMS_ATTR) == new_dype_params:
-            should_patch_schedule = False
+
+def resolve_model_geometry(m: ModelPatcher, model_type: str,
+                           base_resolution: int = 1024) -> ModelGeometry:
+    """Single source for detection + patch-size + base-grid resolution.
+
+    Both :func:`apply_dype_to_model` and :func:`apply_sega_to_model` consumed
+    byte-identical copies of this logic; they now call this once.
+    """
+    from .model_detect import resolve_model_type  # late-bound: test-seam friendly
+
+    dm = m.model.diffusion_model
+    detected = resolve_model_type(dm, model_type)
+    logger.info(f"Detected model type: {detected}")
 
     base_patch_h_tokens = None
     base_patch_w_tokens = None
-    if is_z_image:
-        axes_lens = getattr(m.model.diffusion_model, "axes_lens", None)
+    if detected == "zimage":
+        axes_lens = getattr(dm, "axes_lens", None)
         if isinstance(axes_lens, (list, tuple)) and len(axes_lens) >= 3:
             base_patch_h_tokens = int(axes_lens[1])
             base_patch_w_tokens = int(axes_lens[2])
 
     patch_size = 2
     try:
-        if is_nunchaku:
-            patch_size = m.model.diffusion_model.model.config.patch_size
-        elif is_anima:
-            patch_size = m.model.diffusion_model.patch_spatial
+        if detected == "nunchaku":
+            patch_size = dm.model.config.patch_size
+        elif detected == "anima":
+            patch_size = dm.patch_spatial
         else:
-            patch_size = m.model.diffusion_model.patch_size
+            patch_size = dm.patch_size
     except (AttributeError, TypeError) as e:
         logger.warning(f"Could not read patch_size from model (defaulting to 2): {e}")
 
@@ -120,6 +101,45 @@ def apply_dype_to_model(model: ModelPatcher, model_type: str, width: int, height
     else:
         derived_base_patches = (base_resolution // 8) // 2
         derived_base_seq_len = derived_base_patches * derived_base_patches
+
+    return ModelGeometry(
+        patch_size=patch_size,
+        base_patch_h_tokens=base_patch_h_tokens,
+        base_patch_w_tokens=base_patch_w_tokens,
+        derived_base_patches=derived_base_patches,
+        derived_base_seq_len=derived_base_seq_len,
+        detected=detected,
+    )
+
+
+def apply_dype_to_model(model: ModelPatcher, model_type: str, width: int, height: int, method: str, yarn_alt_scaling: bool, enable_dype: bool, dype_scale: float, dype_exponent: float, base_shift: float, max_shift: float, base_resolution: int = 1024, dype_start_sigma: float = 1.0) -> ModelPatcher:
+    # Snap resolution to nearest multiple of 16 for latent space compatibility
+    width = _snap_to_multiple(width, 16)
+    height = _snap_to_multiple(height, 16)
+
+    m = model.clone()
+
+    # W4.4 (IMP-007): detection + geometry via the shared resolver — the two
+    # duplicated inline blocks (here and in apply_sega_to_model) are gone.
+    geo = resolve_model_geometry(m, model_type, base_resolution)
+    detected_type = geo.detected
+    logger.info(f"DyPE: Detected model type: {detected_type}")
+
+    is_nunchaku = detected_type == "nunchaku"
+    is_qwen = detected_type == "qwen"
+    is_z_image = detected_type == "zimage"
+    is_anima = detected_type == "anima"
+
+    new_dype_params = (width, height, base_shift, max_shift, method, yarn_alt_scaling, base_resolution, dype_start_sigma, is_nunchaku, is_qwen, is_z_image, is_anima)
+
+    should_patch_schedule = True
+    if hasattr(m, _DYPE_PARAMS_ATTR):
+        if getattr(m, _DYPE_PARAMS_ATTR) == new_dype_params:
+            should_patch_schedule = False
+
+    patch_size = geo.patch_size
+    derived_base_patches = geo.derived_base_patches
+    derived_base_seq_len = geo.derived_base_seq_len
 
     if enable_dype and should_patch_schedule and not is_anima:
         try:
@@ -217,18 +237,14 @@ def apply_dype_to_model(model: ModelPatcher, model_type: str, width: int, height
         theta, axes_dim, method, yarn_alt_scaling, enable_dype,
         dype_scale, dype_exponent, base_resolution, dype_start_sigma, embedder_base_patches
     )
-        
+
     m.add_object_patch(target_patch_path, new_pe_embedder)
 
     if is_z_image:
-        base_hw_override = None
-        if base_patch_h_tokens is not None and base_patch_w_tokens is not None:
-            base_hw_override = (base_patch_h_tokens, base_patch_w_tokens)
-        elif derived_base_patches is not None:
-            base_hw_override = (derived_base_patches, derived_base_patches)
-
-        if base_hw_override is not None:
-            m.model.diffusion_model._dype_base_hw = base_hw_override
+        # W6.2a (IMP-003): the ``_dype_base_hw`` write was REMOVED — the attr
+        # was write-only (no reader anywhere in src/); the embedders receive
+        # their base grid via constructor args instead.  The shared
+        # diffusion_model no longer carries DyPE-private state.
 
         # Compute isotropic scale hint for Z-Image RoPE.
         # This is set on the embedder before each forward pass via the wrapper.
@@ -242,16 +258,16 @@ def apply_dype_to_model(model: ModelPatcher, model_type: str, width: int, height
         logger.debug(f"DyPE Z-Image: scale hint = {zimage_freq_scale_factor:.4f} (iso_scale={iso_scale:.4f})")
 
     sigma_max = m.model.model_sampling.sigma_max.item()
-    
+
     def dype_wrapper_function(model_function, args_dict):
         timestep_tensor = args_dict.get("timestep")
         if timestep_tensor is not None and timestep_tensor.numel() > 0:
             current_sigma = timestep_tensor.flatten()[0].item()
-            
+
             if sigma_max > 0:
                 normalized_timestep = min(max(current_sigma / sigma_max, 0.0), 1.0)
                 new_pe_embedder.set_timestep(normalized_timestep)
-        
+
         # Set Z-Image scale hint before each forward pass
         if is_z_image:
             new_pe_embedder.set_scale_hint(zimage_freq_scale_factor)
@@ -302,66 +318,18 @@ def apply_sega_to_model(
 
     m = model.clone()
 
-    # --- Detect model type (same logic as apply_dype_to_model) ---
-    is_nunchaku = False
-    is_qwen = False
-    is_z_image = False
-    is_anima = False
-
-    if model_type == "nunchaku":
-        is_nunchaku = True
-    elif model_type == "qwen":
-        is_qwen = True
-    elif model_type in ("z_image", "zimage"):
-        is_z_image = True
-    elif model_type == "anima":
-        is_anima = True
-    elif model_type == "flux":
-        pass
-    else:  # auto
-        if hasattr(m.model, "diffusion_model"):
-            dm = m.model.diffusion_model
-            model_class_name = dm.__class__.__name__
-            if "QwenImage" in model_class_name:
-                is_qwen = True
-            elif "Anima" in model_class_name or "MiniTrainDIT" in model_class_name:
-                is_anima = True
-            elif hasattr(dm, "rope_embedder"):
-                is_z_image = True
-            elif hasattr(dm, "model") and hasattr(dm.model, "pos_embed"):
-                is_nunchaku = True
-            elif hasattr(dm, "pos_embedder") and hasattr(dm.pos_embedder, "dim_spatial_range"):
-                is_anima = True
-        else:
-            raise ValueError("The provided model is not a compatible model.")
-
-    detected_type = 'nunchaku' if is_nunchaku else 'qwen' if is_qwen else 'zimage' if is_z_image else 'anima' if is_anima else 'flux'
+    # --- W4.4 (IMP-007): detection + geometry via the shared resolver ---
+    geo = resolve_model_geometry(m, model_type, base_resolution)
+    detected_type = geo.detected
     logger.info(f"SEGA: Detected model type: {detected_type}")
 
-    # --- Determine patch_size and base patches ---
-    base_patch_h_tokens = None
-    base_patch_w_tokens = None
-    if is_z_image:
-        axes_lens = getattr(m.model.diffusion_model, "axes_lens", None)
-        if isinstance(axes_lens, (list, tuple)) and len(axes_lens) >= 3:
-            base_patch_h_tokens = int(axes_lens[1])
-            base_patch_w_tokens = int(axes_lens[2])
+    is_nunchaku = detected_type == "nunchaku"
+    is_qwen = detected_type == "qwen"
+    is_z_image = detected_type == "zimage"
+    is_anima = detected_type == "anima"
 
-    patch_size = 2
-    try:
-        if is_nunchaku:
-            patch_size = m.model.diffusion_model.model.config.patch_size
-        elif is_anima:
-            patch_size = m.model.diffusion_model.patch_spatial
-        else:
-            patch_size = m.model.diffusion_model.patch_size
-    except (AttributeError, TypeError) as e:
-        logger.warning(f"Could not read patch_size from model (defaulting to 2): {e}")
-
-    if base_patch_h_tokens is not None and base_patch_w_tokens is not None:
-        derived_base_patches = max(base_patch_h_tokens, base_patch_w_tokens)
-    else:
-        derived_base_patches = (base_resolution // 8) // 2
+    patch_size = geo.patch_size
+    derived_base_patches = geo.derived_base_patches
 
     # --- Noise schedule patching (same as DyPE, except Anima) ---
     if not is_anima:
@@ -454,7 +422,7 @@ def apply_sega_to_model(
             if max_img_h is not None:
                 native_patches = max_img_h // patch_spatial
                 embedder_base_patches = native_patches
-        except Exception as e:
+        except Exception as e:  # degrade: optional Anima grid read
             logger.debug(f"Could not read Anima native patch grid: {e}")
 
     new_pe_embedder = sega_embedder_cls(
@@ -479,15 +447,7 @@ def apply_sega_to_model(
 
     # --- Z-Image scale hint ---
     if is_z_image:
-        base_hw_override = None
-        if base_patch_h_tokens is not None and base_patch_w_tokens is not None:
-            base_hw_override = (base_patch_h_tokens, base_patch_w_tokens)
-        elif derived_base_patches is not None:
-            base_hw_override = (derived_base_patches, derived_base_patches)
-
-        if base_hw_override is not None:
-            m.model.diffusion_model._dype_base_hw = base_hw_override
-
+        # W6.2a (IMP-003): ``_dype_base_hw`` write removed (write-only attr).
         raw_scale_y = float(base_resolution) / max(1.0, float(height))
         raw_scale_x = float(base_resolution) / max(1.0, float(width))
         iso_scale = min(raw_scale_y, raw_scale_x)
@@ -547,7 +507,7 @@ def apply_sega_to_model(
                     energy_h, energy_w, dynamic_spread,
                     target_res_h=height, target_res_w=width,
                 )
-            except Exception as e:
+            except Exception as e:  # degrade: spectral enhancement skipped
                 logger.debug(f"SEGA spectral computation skipped: {e}")
 
         input_x, c = args_dict.get("input"), args_dict.get("c", {})

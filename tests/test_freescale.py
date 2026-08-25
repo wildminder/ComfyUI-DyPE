@@ -1,18 +1,18 @@
 """Tests for FreeScale core algorithm (Tier 1: pure math tests)."""
 import math
+
 import pytest
 import torch
 
 from src.freescale import (
-    gaussian_kernel_2d,
-    gaussian_blur_2d,
-    scale_fusion,
-    cosine_detail_weight,
-    blend_detail_latents,
-    forward_noise,
     FreeScaleConfig,
+    blend_detail_latents,
+    cosine_detail_weight,
+    forward_noise,
+    gaussian_blur_2d,
+    gaussian_kernel_2d,
+    scale_fusion,
 )
-
 
 # ---------------------------------------------------------------------------
 # Gaussian kernel

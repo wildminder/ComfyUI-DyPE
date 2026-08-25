@@ -1,7 +1,6 @@
 """Tests for src/sega_base.py — SegAPosEmbed base class (Tier 1: pure unit tests)."""
-import math
-import torch
 import pytest
+import torch
 
 from src.sega_base import SegAPosEmbed
 

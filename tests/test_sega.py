@@ -1,16 +1,16 @@
 """Tests for src/sega.py — SEGA core math functions (Tier 1: pure unit tests)."""
 import math
-import torch
+
 import pytest
+import torch
 
 from src.sega import (
-    compute_base_mscale,
-    compute_spectral_energy_profile,
     compute_axis_spectral_profiles,
+    compute_base_mscale,
     compute_dynamic_spread,
     compute_sega_allocation,
+    compute_spectral_energy_profile,
 )
-
 
 # ---------------------------------------------------------------------------
 # compute_base_mscale
@@ -90,8 +90,7 @@ class TestComputeSpectralEnergyProfile:
         """A structured signal (low-frequency sine) should concentrate energy."""
         H, W = 16, 16
         y = torch.arange(H).float().unsqueeze(1).expand(H, W)
-        x = torch.arange(W).float().unsqueeze(0).expand(H, W)
-        # Low-frequency sine wave
+        # Low-frequency sine wave (varies along y only)
         spatial = torch.sin(2 * math.pi * y / H).unsqueeze(0).unsqueeze(-1)  # (1, H, W, 1)
         profile = compute_spectral_energy_profile(spatial, height=H, width=W, n_bins=8)
         # Energy should be concentrated in low-frequency bins

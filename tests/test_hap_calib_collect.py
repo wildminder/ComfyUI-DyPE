@@ -313,7 +313,15 @@ class TestCollector:
 
     def test_collector_memory_chunking_invariant(self):
         """chunk=3 vs chunk=4096 (> seq) give IDENTICAL scores — chunking is a
-        pure memory knob and never changes the result."""
+        pure memory knob and never changes the result.
+
+        W2.7 re-baseline (2026-08-25): asserted as fp64 ``allclose`` at
+        1e-12 instead of bitwise ``torch.equal``.  Each query row's softmax
+        spans the full key dimension regardless of chunking (the math IS
+        chunk-invariant), but the logits matmul runs through differently
+        SHAPED BLAS calls per chunk size, whose summation order may differ in
+        the last ulp — a bitwise comparison over-asserts the guarantee.
+        """
         num_scopes, text_len = 5, 8
         q_small, _ = collect_scope_scores(
             self._toy().forward, _make_loss_fn(self._toy()),
@@ -323,7 +331,7 @@ class TestCollector:
             self._toy().forward, _make_loss_fn(self._toy()),
             num_scopes, text_len=text_len, chunk=4096, scale=1.0,
         )
-        assert torch.equal(q_small, q_big)
+        assert torch.allclose(q_small, q_big, rtol=0.0, atol=1e-12)
 
     def test_collector_restores_original_attention(self):
         """After collection the module's ``optimized_attention`` is the

@@ -9,7 +9,6 @@ Covers:
 Markers: @pytest.mark.unit / @pytest.mark.mock_integration
 """
 
-import types
 
 import pytest
 import torch
@@ -537,17 +536,35 @@ class TestTextLenDerivation:
         assert _hrdit_resolve_text_len(hctx, seq_len=256) == 256
 
     def test_no_stale_mask_on_resolution_change(self, mock_attn):
-        """A resolution change mid-session builds a fresh mask (no stale reuse)."""
+        """A resolution change mid-session builds a fresh mask (no stale reuse).
+
+        W2.5 re-baseline (2026-08-25): the runtime singleton is reset FIRST so
+        the count reflects only THIS test's two prepares (a polluted singleton
+        shared across tests made the absolute counts order-dependent).
+        W2.7 note: the HAP plan-layer ordinal is a per-forward contextvar that
+        the UNET wrapper resets — calling ``optimized_attention`` directly
+        twice leaves the ordinal at 1 after the first call, which exceeds the
+        1-layer plan and declines call 2 before any mask work.  Reset BOTH
+        counters before each call to emulate fresh forwards.
+        """
+        from src.spa_context import set_hap_layer_idx, set_hrdit_layer_idx
+
+        hap.HapRuntime.reset()
         m = _MockModel()
         _hrdit_install_hook(m, "flux", consumer="hap")
         set_hap_context(_hap_ctx(num_layers=1, text_len=0))
         runtime = hap.HapRuntime.get()
         q1, k1, v1 = _rand_qkv(S=128, seed=7)
+        n_before = runtime.prepare_count
+        set_hrdit_layer_idx(0)
+        set_hap_layer_idx(0)
         mock_attn.optimized_attention(q1, k1, v1, 2)
-        assert runtime.prepare_count == 1
+        assert runtime.prepare_count == n_before + 1
         q2, k2, v2 = _rand_qkv(S=192, seed=8)
+        set_hrdit_layer_idx(0)
+        set_hap_layer_idx(0)
         mock_attn.optimized_attention(q2, k2, v2, 2)
-        assert runtime.prepare_count == 2
+        assert runtime.prepare_count == n_before + 2
 
 
 # ---------------------------------------------------------------------------

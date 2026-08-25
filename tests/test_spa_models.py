@@ -6,15 +6,14 @@ variant RoPE — the root-cause bug is removed), and that it registers the ``N``
 bundled variant RoPEs in the process-scoped :class:`SPAContext` for the attention
 hook.  Pure unit tests — no ComfyUI runtime required.
 """
-import torch
 import pytest
+import torch
 
-from src.spa import build_bundle_id_variants, get_spa_context
-from src.spa_context import set_spa_context
 from src.models.spa_flux import PosEmbedSPAFlux
+from src.models.spa_nunchaku import PosEmbedSPANunchaku
 from src.models.spa_qwen import PosEmbedSPAQwen
 from src.models.spa_zimage import PosEmbedSPAZImage
-from src.models.spa_nunchaku import PosEmbedSPANunchaku
+from src.spa import build_bundle_id_variants, get_spa_context
 
 _ADAPTERS = [PosEmbedSPAFlux, PosEmbedSPAQwen, PosEmbedSPAZImage, PosEmbedSPANunchaku]
 _ADAPTER_NAMES = ["flux", "qwen", "zimage", "nunchaku"]
@@ -101,7 +100,7 @@ class TestPosEmbedSPAAdapters:
     def test_bundle_size_one_inactive(self, emb_cls, name):
         emb = _make_emb(emb_cls, enable_spa=True, bundle_size=1)
         ids = _make_flux_ids(16, 16)
-        out = emb(ids)
+        emb(ids)  # output unused; the assertion targets the CONTEXT state
         ctx = get_spa_context()
         assert ctx is None or ctx.active is False
 
@@ -116,7 +115,7 @@ class TestPosEmbedSPAAdapters:
     def test_variant_pes_differ_from_base(self, emb_cls, name):
         emb = _make_emb(emb_cls, enable_spa=True, bundle_size=5)
         ids = _make_flux_ids(128, 128)
-        out = emb(ids)  # base
+        emb(ids)  # registers the context; the returned base PE is unused here
         ctx = get_spa_context()
         # at least one variant pe differs from the base pe (bundling changed coords)
         diff = torch.stack([(vp - ctx.base_pe).abs().max() for vp in ctx.variant_pes])

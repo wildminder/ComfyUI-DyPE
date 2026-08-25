@@ -8,14 +8,77 @@ and deterministic.
 The toy model mirrors the FLUX-family call pattern: one attention call per
 transformer block, double blocks first then single blocks (our flat layer
 counter order == reference ``iter_blocks`` order).
+
+Plan 2026-08-25 W2.1 (tracker CRIT-002 / IMP-108): this module is now ALSO
+the single source of truth for hand-rolled ``orig`` attention mocks.
+``make_recording_orig`` builds a fake with the EXACT real ComfyUI signature
+(locked by ``assert_real_signature`` at construction time) — per-test local
+mocks with ad-hoc signatures caused three rounds of stale-mock rot (the
+v2.7.1 Anima crash class). New tests MUST use this factory instead of
+defining their own fakes.
 """
 
 from __future__ import annotations
 
+import inspect
 import sys
 from typing import List, Optional
 
 import torch
+import torch.nn.functional as F
+
+# Canonical REAL signature of comfy/ldm/modules/attention.py::attention_pytorch
+# (positional slots 1-8, locked by tests/test_orig_call_convention.py).
+CANONICAL_ATTN_PARAMS = (
+    "q", "k", "v", "heads", "mask", "attn_precision",
+    "skip_reshape", "skip_output_reshape",
+)
+
+
+def assert_real_signature(fn) -> None:
+    """Raise AssertionError unless ``fn``'s first 8 params match the canonical
+    real ``optimized_attention`` order exactly.
+
+    Called inside :func:`make_recording_orig` so signature drift fails at
+    FIXTURE CONSTRUCTION, not mid-test with a confusing TypeError.
+    """
+    sig = inspect.signature(fn)
+    names = tuple(sig.parameters)[0:8]
+    if names != CANONICAL_ATTN_PARAMS:
+        raise AssertionError(
+            "Mock attention signature drifted from the real ComfyUI "
+            f"convention.\n  expected: {CANONICAL_ATTN_PARAMS}\n"
+            f"  got     : {names}\nUse make_recording_orig() from "
+            "_hrdit_fixtures instead of hand-rolled fakes."
+        )
+
+
+def make_recording_orig(scale: float = 1.0, record: Optional[List[tuple]] = None):
+    """Build an ``orig`` attention fake with the EXACT real signature.
+
+    Mirrors ``attention_pytorch``: touches ``mask.ndim`` when a mask is given,
+    runs plain SDPA at ``scale``, and optionally records every call's first 8
+    positional slots into ``record`` for wrapper-forwarding assertions.
+
+    Usage::
+
+        calls = []
+        orig = make_recording_orig(record=calls)
+        ... drive the wrapper ...
+        assert calls[0][4] is my_mask          # slot 5 == mask
+        assert calls[0][7] is False            # slot 8 == skip_output_reshape
+    """
+    def recording_orig(q, k, v, heads, mask=None, attn_precision=None,
+                       skip_reshape=False, skip_output_reshape=False, **kwargs):
+        if mask is not None:
+            _ = mask.ndim  # the real fn reads mask.ndim; keep parity
+        if record is not None:
+            record.append((q, k, v, heads, mask, attn_precision,
+                           skip_reshape, skip_output_reshape))
+        return F.scaled_dot_product_attention(q, k, v, scale=scale)
+
+    assert_real_signature(recording_orig)
+    return recording_orig
 
 
 def _attention_module():

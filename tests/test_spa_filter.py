@@ -189,8 +189,8 @@ class TestFilterWrapper:
         """Filter {1,2}: layers 1,2 run SPA (3 passes), layers 0,3 plain (1 pass)."""
         calls_per_layer = []
 
-        def recording_orig(q, k, v, heads, skip_reshape=False, mask=None,
-                           transformer_options=None, **kw):
+        def recording_orig(q, k, v, heads, mask=None, attn_precision=None,
+                           skip_reshape=False, skip_output_reshape=False, **kw):
             calls_per_layer[-1] += 1
             return q
 
@@ -210,8 +210,12 @@ class TestFilterWrapper:
         set_spa_context(_identity_spa_ctx())
         set_spa_layer_filter(frozenset({1}))
 
-        wrapper = _make_hrdit_wrapper(lambda q, k, v, heads, **kw: q,
-                                      is_masked=False)
+        # W2.1 canonical signature: the wrapper forwards all 8 positional
+        # slots to orig, so a bare 4-arg lambda breaks (W2 rot fix).
+        wrapper = _make_hrdit_wrapper(
+            lambda q, k, v, heads, mask=None, attn_precision=None,
+            skip_reshape=False, skip_output_reshape=False, **kw: q,
+            is_masked=False)
         q, k, v = _rand_qkv()
         for i in range(4):
             wrapper(q, k, v, 2)
@@ -221,8 +225,8 @@ class TestFilterWrapper:
         """No filter (None): every layer runs SPA (regression)."""
         calls_per_layer = []
 
-        def recording_orig(q, k, v, heads, skip_reshape=False, mask=None,
-                           transformer_options=None, **kw):
+        def recording_orig(q, k, v, heads, mask=None, attn_precision=None,
+                           skip_reshape=False, skip_output_reshape=False, **kw):
             calls_per_layer[-1] += 1
             return q
 
@@ -274,8 +278,8 @@ class TestFilterWrapper:
         """An empty frozenset filter skips SPA on every layer (all plain)."""
         calls_per_layer = []
 
-        def recording_orig(q, k, v, heads, skip_reshape=False, mask=None,
-                           transformer_options=None, **kw):
+        def recording_orig(q, k, v, heads, mask=None, attn_precision=None,
+                           skip_reshape=False, skip_output_reshape=False, **kw):
             calls_per_layer[-1] += 1
             return q
 

@@ -45,11 +45,14 @@ if _PROJECT_ROOT not in sys.path:
 
 import torch
 
-from src.hap import ScopePlan, band_blocks, band_compute_cost, flops_ratio, half_blocks
+from src.hap import ScopePlan, flops_ratio
 from src.hap_calib import calibrate_scope_plan, collect_scope_scores
+
 # Single source for default prompts (plan 2026-08-16 P6.1): the node module
 # owns the list; the CLI re-imports it so the two never drift.
-from src.hap_calib_node import DEFAULT_CALIBRATION_PROMPTS as DEFAULT_PROMPTS
+# Re-exported on purpose — tests/test_hap_calib_spec.py::TestCliSingleSource
+# asserts ``mod.DEFAULT_PROMPTS is DEFAULT_CALIBRATION_PROMPTS``.
+from src.hap_calib_node import DEFAULT_CALIBRATION_PROMPTS as DEFAULT_PROMPTS  # noqa: F401
 
 
 def _ensure_mock_attention_module():

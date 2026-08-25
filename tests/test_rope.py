@@ -1,16 +1,15 @@
 """Tests for src/rope.py — RoPE math functions (Tier 1: pure unit tests)."""
-import math
-import torch
 import pytest
+import torch
 
 from src.rope import (
     find_correction_factor,
     find_correction_range,
-    linear_ramp_mask,
     find_newbase_ntk,
+    get_1d_dype_yarn_pos_embed,
     get_1d_ntk_pos_embed,
     get_1d_yarn_pos_embed,
-    get_1d_dype_yarn_pos_embed,
+    linear_ramp_mask,
 )
 
 

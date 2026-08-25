@@ -11,7 +11,6 @@ import sys
 
 import pytest
 
-import src.hap_calib_node as hcn
 from src.hap import ScopePlan
 from src.hap_calib_node import resolve_output_dir, write_scope_plan
 
