@@ -112,9 +112,15 @@ class DyPE_FLUX(io.ComfyNode):
         )
 
     @classmethod
-    def validate_inputs(cls, **kwargs):
-        """W5.2 (IMP-002): reject bad resolutions at graph-build time."""
-        return validate_resolution(kwargs.get("width", 0), kwargs.get("height", 0))
+    def validate_inputs(cls, width, height):
+        """W5.2 (IMP-002): reject bad resolutions at graph-build time.
+
+        NOTE: named parameters (NOT ``**kwargs``) — ComfyUI inspects this
+        signature and, with ``**kwargs``, re-reports one failing result once
+        per node input (execution.py maps the return value over every input
+        name).  Named params scope the error to width/height only.
+        """
+        return validate_resolution(width, height)
 
     @classmethod
     def execute(cls, model, width: int, height: int, model_type: str, method: str, yarn_alt_scaling: bool, enable_dype: bool, base_resolution: int = 1024, dype_start_sigma: float = 1.0, dype_scale: float = 2.0, dype_exponent: float = 2.0, base_shift: float = 0.5, max_shift: float = 1.15) -> io.NodeOutput:
@@ -231,9 +237,12 @@ class SEGA(io.ComfyNode):
         )
 
     @classmethod
-    def validate_inputs(cls, **kwargs):
-        """W5.2 (IMP-002): reject bad resolutions at graph-build time."""
-        return validate_resolution(kwargs.get("width", 0), kwargs.get("height", 0))
+    def validate_inputs(cls, width, height):
+        """W5.2 (IMP-002): reject bad resolutions at graph-build time.
+
+        Named parameters (NOT ``**kwargs``) — see DyPE_FLUX.validate_inputs.
+        """
+        return validate_resolution(width, height)
 
     @classmethod
     def execute(cls, model, width: int, height: int, model_type: str, method: str, mscale_alpha: float, mscale_beta: float, mscale_min: float, spread_min: float, spread_max: float, spread_alpha: float, base_mscale_formula: str, base_mscale_coefficient: float, base_resolution: int = 1024, base_shift: float = 0.5, max_shift: float = 1.15) -> io.NodeOutput:
@@ -338,9 +347,12 @@ class SPA(io.ComfyNode):
         )
 
     @classmethod
-    def validate_inputs(cls, **kwargs):
-        """W5.2 (IMP-002): reject bad resolutions at graph-build time."""
-        return validate_resolution(kwargs.get("width", 0), kwargs.get("height", 0))
+    def validate_inputs(cls, width, height):
+        """W5.2 (IMP-002): reject bad resolutions at graph-build time.
+
+        Named parameters (NOT ``**kwargs``) — see DyPE_FLUX.validate_inputs.
+        """
+        return validate_resolution(width, height)
 
     @classmethod
     def execute(cls, model, width: int, height: int, model_type: str, enable_spa: bool, bundle_size: int = 0, spa_start_sigma: float = 1.0, spa_steps: int = 3, spa_layer_filter: str = "", proportional_attention: bool = False) -> io.NodeOutput:

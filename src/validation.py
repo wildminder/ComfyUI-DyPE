@@ -16,8 +16,10 @@ def validate_resolution(width, height, *, min_px=16, max_px=8192):
     """Validate a resolution pair for the latent-aligned pipeline.
 
     Rules:
-    * both axes must be multiples of 16 (latent alignment: 8x VAE downscale
-      x 2x patch),
+    * both axes must be multiples of 8 (VAE 8x downscale — the hard
+      requirement; the runtime additionally snaps to /16 via
+      ``_snap_to_multiple``, so widget values like 504 are accepted here and
+      snapped at apply time),
     * both axes must lie within ``[min_px, max_px]``.
 
     Returns:
@@ -31,9 +33,9 @@ def validate_resolution(width, height, *, min_px=16, max_px=8192):
     except (TypeError, ValueError):
         return f"width/height must be integers; got {width!r}x{height!r}"
 
-    if w % 16 or h % 16:
+    if w % 8 or h % 8:
         return (
-            f"width/height must be multiples of 16 (latent alignment); "
+            f"width/height must be multiples of 8 (VAE alignment); "
             f"got {w}x{h}"
         )
     if not (min_px <= w <= max_px and min_px <= h <= max_px):

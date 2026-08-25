@@ -89,28 +89,36 @@ class TestValidateResolution:
         assert validate_resolution(w, h) is True
 
     @pytest.mark.parametrize("w,h", [
-        (1000, 1000),   # not multiples of 16
-        (999, 1024),    # asymmetric misaligned
+        (504, 2000),    # REGRESSION (2026-08-25): /8-aligned but not /16 —
+                        # runtime snaps to /16 via _snap_to_multiple; the
+                        # graph validator must NOT reject these.
+        (1000, 1000),   # /8-aligned (1000 % 8 == 0) → accepted
+        (999, 1024),    # 999 not /8 → rejected
         (1023, 16),
     ])
-    def test_non_multiple_of_16_rejected(self, w, h):
+    def test_alignment_rules(self, w, h):
+        """/8 is the hard VAE requirement; /16-only values are accepted and
+        snapped at apply time. Only non-/8 values are rejected."""
         from src.validation import validate_resolution
 
         result = validate_resolution(w, h)
-        assert isinstance(result, str)
-        assert "multiples of 16" in result
+        if w % 8 or h % 8:
+            assert isinstance(result, str)
+            assert "multiples of 8" in result
+        else:
+            assert result is True
 
     @pytest.mark.parametrize("w,h", [
-        (0, 1024),       # below min (alignment error takes precedence)
-        (8208, 1024),    # above max, multiple of 16
+        (0, 1024),       # below min
+        (8208, 1024),    # above max (/8-aligned)
         (16384, 16384),  # way above max
     ])
     def test_out_of_range_rejected(self, w, h):
         from src.validation import validate_resolution
 
         result = validate_resolution(w, h)
-        if w % 16:
-            assert "multiples of 16" in result
+        if w % 8 or h % 8:
+            assert "multiples of 8" in result
         else:
             assert isinstance(result, str)
             assert "[16, 8192]" in result
@@ -121,7 +129,7 @@ class TestValidateResolution:
         assert validate_resolution(16, 16) is True
         assert validate_resolution(8192, 8192) is True
         # One step outside.
-        assert isinstance(validate_resolution(8208, 1024), str)
+        assert isinstance(validate_resolution(8200, 1024), str)
 
     def test_custom_bounds(self):
         from src.validation import validate_resolution
@@ -175,6 +183,23 @@ class TestNodeValidateInputsWiring:
             assert result == validate_resolution(1000, 1000), (
                 f"{node_name}.validate_inputs did not delegate to the shared "
                 f"validator")
+
+    def test_validate_inputs_signature_has_no_kwargs(self, init_mod):
+        """REGRESSION (2026-08-25): a ``**kwargs`` validate_inputs signature
+        makes ComfyUI route EVERY input through validation and re-report one
+        failing string once per input name (16x duplicate errors on SEGA).
+        The validator must declare named width/height params so failures are
+        attributed to width/height only."""
+        import inspect
+
+        for node_name in self._NODES:
+            node_cls = getattr(init_mod, node_name)
+            sig = inspect.getfullargspec(node_cls.validate_inputs)
+            assert sig.varkw is None, (
+                f"{node_name}.validate_inputs must NOT use **kwargs "
+                f"(ComfyUI duplicates the error per input name)")
+            assert "width" in sig.args and "height" in sig.args, (
+                f"{node_name}.validate_inputs must take named width/height")
 
     def test_hap_has_no_resolution_validation(self):
         """HAP has NO width/height inputs by design — no graph-I/O validation

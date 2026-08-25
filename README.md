@@ -437,6 +437,11 @@ All nodes registered by this pack (V3 schema ids):
 
 ## Changelog
 
+#### v2.8.1 — validate_inputs fix: /8 alignment + per-input error spam (2026-08-25)
+*   **Fixed false graph-validation rejection:** the v2.8.0 `validate_inputs` guard required width/height to be multiples of 16, but the widgets allow `step=8` and the runtime has always *snapped* arbitrary values to /16 (`_snap_to_multiple`) — so resolutions like 504×2000 that previously ran fine were now hard-rejected at graph build. The validator now enforces the actual hard requirement (**multiples of 8**, VAE alignment); /16 snapping remains a runtime concern.
+*   **Fixed 16× duplicated validation errors:** the validators used a `**kwargs` signature, which makes ComfyUI route *every* node input through custom validation and re-report one failing string once per input name (e.g. the same message repeated for `width`, `height`, `model_type`, …). The validators now declare named `width`/`height` parameters, so failures are attributed to those inputs only.
+*   Regression guards added: 504×2000 must pass; validator signatures must not use `**kwargs`.
+
 #### v2.8.0 — HAP Calibrate node (in-graph scope-plan calibration) (2026-08-16)
 *   **New `HAP Calibrate (HRDiT)` node:** runs the full HAP scope-plan calibration pipeline in-graph — one denoising-step forward per calibration prompt, chunked differentiable attention to collect per-head Taylor scores, the multiple-choice knapsack solver, and writes the plan JSON to `<output>/dype_hap/`. Its `scope_plan` output links **directly** into the HAP node's new `scope_plan` input (no file round-trip needed).
 *   **HAP node gained an optional `scope_plan` input** (`SCOPE_PLAN` custom type): when connected, it overrides `scope_plan_path`. The node prefers the linked plan, falling back to the path.
