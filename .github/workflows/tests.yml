@@ -19,9 +19,10 @@ jobs:
         with:
           python-version: "3.12"
       - name: Version-sync guard (pyproject == README changelog)
-        run: |
-          python -m pip install --quiet pytest
-          python -m pytest -q tests/test_version_sync.py
+        # Run the guard's standalone runner directly (pure stdlib, no pytest):
+        # pytest would auto-load the root conftest.py, which imports torch —
+        # not installed in this fast-fail job.
+        run: python tests/test_version_sync.py
 
   test:
     needs: meta
