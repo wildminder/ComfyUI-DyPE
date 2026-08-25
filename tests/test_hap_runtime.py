@@ -208,13 +208,18 @@ class TestScopePlan:
         assert plan.num_heads == 2
 
     def test_scopeplan_loads_reference_flux_plan(self):
-        """The REAL reference FLUX plan must load unchanged (format compat)."""
+        """The REAL reference FLUX plan must load unchanged (format compat).
+
+        Uses the SHIPPED plan (configs/scope_plan_flux.json) — version-
+        controlled and present in CI. (An identical copy lives under the
+        gitignored .dev/data research tree; do not reference that path.)"""
         import pathlib
 
         path = (
             pathlib.Path(__file__).parent.parent
-            / ".dev" / "data" / "HRDit" / "HRDiT" / "configs" / "scope_plan_flux.json"
+            / "configs" / "scope_plan_flux.json"
         )
+        assert path.exists(), f"shipped reference plan missing: {path}"
         plan = hap.ScopePlan.load(path)
         assert plan.num_layers == 57
         assert plan.num_heads == 24
