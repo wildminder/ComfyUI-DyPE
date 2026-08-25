@@ -55,7 +55,9 @@ jobs:
           python -m pip install --upgrade pip
           # CPU wheel keeps the download ~200 MB instead of the CUDA one (~2.5 GB).
           python -m pip install torch --index-url https://download.pytorch.org/whl/cpu
-          python -m pip install pytest pytest-cov ruff
+          # numpy is a runtime dependency (src/rope.py) — torch wheels no
+          # longer pull it in automatically.
+          python -m pip install numpy pytest pytest-cov ruff
 
       - name: Lint (ruff — correctness rules)
         # W3 scope decision (2026-08-25): CI gates the CORRECTNESS rule set
