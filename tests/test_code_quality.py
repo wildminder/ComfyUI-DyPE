@@ -5,6 +5,11 @@ import re
 
 import pytest
 
+try:
+    import tomllib  # Python >= 3.11
+except ModuleNotFoundError:  # Python 3.10
+    import tomli as tomllib
+
 PROJECT_ROOT = pathlib.Path(__file__).parent.parent
 SRC_DIR = PROJECT_ROOT / "src"
 
@@ -104,34 +109,26 @@ class TestTypeAnnotations:
 
 @pytest.mark.unit
 class TestPackaging:
+    def _load_pyproject(self):
+        with open(PROJECT_ROOT / "pyproject.toml", "rb") as f:
+            return tomllib.load(f)
+
     def test_pyproject_has_pytest_config(self):
-        import tomllib
-        pyproject = PROJECT_ROOT / "pyproject.toml"
-        with open(pyproject, "rb") as f:
-            data = tomllib.load(f)
+        data = self._load_pyproject()
         assert "pytest" in data.get("tool", {})
 
     def test_pyproject_has_markers(self):
-        import tomllib
-        pyproject = PROJECT_ROOT / "pyproject.toml"
-        with open(pyproject, "rb") as f:
-            data = tomllib.load(f)
+        data = self._load_pyproject()
         markers = data["tool"]["pytest"]["ini_options"]["markers"]
         assert any("comfyui_integration" in m for m in markers)
 
     def test_requires_comfyui_present(self):
-        import tomllib
-        pyproject = PROJECT_ROOT / "pyproject.toml"
-        with open(pyproject, "rb") as f:
-            data = tomllib.load(f)
+        data = self._load_pyproject()
         tool_comfy = data.get("tool", {}).get("comfy", {})
         assert "requires-comfyui" in tool_comfy, "Missing requires-comfyui in [tool.comfy]"
 
     def test_ruff_config_present(self):
-        import tomllib
-        pyproject = PROJECT_ROOT / "pyproject.toml"
-        with open(pyproject, "rb") as f:
-            data = tomllib.load(f)
+        data = self._load_pyproject()
         assert "ruff" in data.get("tool", {}), "Missing [tool.ruff] in pyproject.toml"
 
 
