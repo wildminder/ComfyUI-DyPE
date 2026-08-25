@@ -11,6 +11,7 @@ The node *wiring* (schema, inputs, registration) is covered separately by the
 schema text-checks below, which read ``__init__.py`` directly.
 """
 import pathlib
+import re
 import types
 
 import pytest
@@ -638,7 +639,8 @@ class TestSpaDocs:
         # SPA and DyPE/SEGA are mutually exclusive in v1.
         assert "mutually exclusive" in content
         # Nunchaku is explicitly unsupported for SPA.
-        assert "Nunchaku is not supported" in content
+        assert re.search(r"Nunchaku (is not supported|not supported)", content), (
+            "README must state that Nunchaku is not supported for SPA")
 
 
 # ---------------------------------------------------------------------------

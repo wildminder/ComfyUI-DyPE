@@ -22,7 +22,9 @@ _PYPROJECT = os.path.join(_PROJECT_ROOT, "pyproject.toml")
 _README = os.path.join(_PROJECT_ROOT, "README.md")
 
 _SEMVER_RE = re.compile(r"\d+\.\d+\.\d+")
-_CHANGELOG_ENTRY_RE = re.compile(r"^####\s+v(\d+\.\d+\.\d+)", re.MULTILINE)
+# Accept both changelog heading styles: '#### vX.Y.Z' (legacy) and
+# '### vX.Y.Z' (condensed README format adopted 2026-08-25).
+_CHANGELOG_ENTRY_RE = re.compile(r"^#{3,4}\s+v(\d+\.\d+\.\d+)", re.MULTILINE)
 
 
 def _pyproject_version() -> str:
@@ -61,8 +63,8 @@ def test_pyproject_version_matches_changelog():
     py_version = _pyproject_version()
     entries = _changelog_versions()
     assert entries, (
-        "README.md contains no '#### vX.Y.Z' changelog entries; "
-        "add one matching the pyproject.toml version."
+        "README.md contains no '### vX.Y.Z' / '#### vX.Y.Z' changelog "
+        "entries; add one matching the pyproject.toml version."
     )
     top = entries[0]
     assert py_version == top, (
