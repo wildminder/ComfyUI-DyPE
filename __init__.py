@@ -113,20 +113,25 @@ class DyPE_FLUX(io.ComfyNode):
 
     @classmethod
     def validate_inputs(cls, width, height):
-        """W5.2 (IMP-002): reject bad resolutions at graph-build time.
-
-        NOTE: named parameters (NOT ``**kwargs``) — ComfyUI inspects this
-        signature and, with ``**kwargs``, re-reports one failing result once
-        per node input (execution.py maps the return value over every input
-        name).  Named params scope the error to width/height only.
-        """
+        # 1. Bypass ComfyUI's uninitialized state on load
+        if width is None or height is None:
+            return True
+            
+        # 2. Hard check: Reject if not a multiple of 8
+        if width % 8 != 0 or height % 8 != 0:
+            return f"Width and height must be multiples of 8. Got {width}x{height}."
+            
+        # 3. Pass to your existing validation for any other structural checks
         return validate_resolution(width, height)
 
     @classmethod
     def execute(cls, model, width: int, height: int, model_type: str, method: str, yarn_alt_scaling: bool, enable_dype: bool, base_resolution: int = 1024, dype_start_sigma: float = 1.0, dype_scale: float = 2.0, dype_exponent: float = 2.0, base_shift: float = 0.5, max_shift: float = 1.15) -> io.NodeOutput:
+        # Fallback for unlinked/None inputs
+        width = 1024 if width is None else int(width)
+        height = 1024 if height is None else int(height)
+        
         patched_model = apply_dype_to_model(model, model_type, width, height, method, yarn_alt_scaling, enable_dype, dype_scale, dype_exponent, base_shift, max_shift, base_resolution, dype_start_sigma)
         return io.NodeOutput(patched_model)
-
 
 class SEGA(io.ComfyNode):
     """
@@ -238,14 +243,23 @@ class SEGA(io.ComfyNode):
 
     @classmethod
     def validate_inputs(cls, width, height):
-        """W5.2 (IMP-002): reject bad resolutions at graph-build time.
-
-        Named parameters (NOT ``**kwargs``) — see DyPE_FLUX.validate_inputs.
-        """
+        # 1. Bypass ComfyUI's uninitialized state on load
+        if width is None or height is None:
+            return True
+            
+        # 2. Hard check: Reject if not a multiple of 8
+        if width % 8 != 0 or height % 8 != 0:
+            return f"Width and height must be multiples of 8. Got {width}x{height}."
+            
+        # 3. Pass to your existing validation for any other structural checks
         return validate_resolution(width, height)
 
     @classmethod
     def execute(cls, model, width: int, height: int, model_type: str, method: str, mscale_alpha: float, mscale_beta: float, mscale_min: float, spread_min: float, spread_max: float, spread_alpha: float, base_mscale_formula: str, base_mscale_coefficient: float, base_resolution: int = 1024, base_shift: float = 0.5, max_shift: float = 1.15) -> io.NodeOutput:
+        # Fallback for unlinked/None inputs
+        width = 1024 if width is None else int(width)
+        height = 1024 if height is None else int(height)
+        
         patched_model = apply_sega_to_model(
             model, model_type, width, height, method,
             mscale_alpha, mscale_beta, mscale_min,
@@ -254,7 +268,6 @@ class SEGA(io.ComfyNode):
             base_resolution, base_shift, max_shift,
         )
         return io.NodeOutput(patched_model)
-
 
 class SPA(io.ComfyNode):
     """
@@ -348,29 +361,29 @@ class SPA(io.ComfyNode):
 
     @classmethod
     def validate_inputs(cls, width, height):
-        """W5.2 (IMP-002): reject bad resolutions at graph-build time.
-
-        Named parameters (NOT ``**kwargs``) — see DyPE_FLUX.validate_inputs.
-        """
+        # 1. Bypass ComfyUI's uninitialized state on load
+        if width is None or height is None:
+            return True
+            
+        # 2. Hard check: Reject if not a multiple of 8
+        if width % 8 != 0 or height % 8 != 0:
+            return f"Width and height must be multiples of 8. Got {width}x{height}."
+            
+        # 3. Pass to your existing validation for any other structural checks
         return validate_resolution(width, height)
 
     @classmethod
     def execute(cls, model, width: int, height: int, model_type: str, enable_spa: bool, bundle_size: int = 0, spa_start_sigma: float = 1.0, spa_steps: int = 3, spa_layer_filter: str = "", proportional_attention: bool = False) -> io.NodeOutput:
-        # NOTE: no ``method`` input — SPA always applies the model's native
-        # no-extrapolation RoPE (ntk_factor=1.0) on the bundled coords (HRDiT
-        # "nor" RoPE).  The DyPE extrapolation methods are a no-op for SPA, so
-        # the knob was removed to avoid misleading A/B testing.
+        # Fallback for unlinked/None inputs
+        width = 1024 if width is None else int(width)
+        height = 1024 if height is None else int(height)
+        
         bs = None if (bundle_size is None or bundle_size <= 0) else int(bundle_size)
-        # NOTE (2026-08-24): only FILTER-PARSE failures get the
-        # "invalid spa_layer_filter" prefix.  The pre-fix wrapper re-wrapped
-        # EVERY ValueError from apply_spa_to_model, so the mutual-exclusion
-        # guard surfaced as "SPA: invalid spa_layer_filter '': SPA and DyPE/
-        # SEGA are mutually exclusive ..." — naming an unrelated knob and
-        # sending users to debug the wrong input.
         try:
             parsed_filter = parse_layer_filter(spa_layer_filter)
         except ValueError as exc:
             raise ValueError(f"SPA: invalid spa_layer_filter {spa_layer_filter!r}: {exc}") from exc
+            
         patched_model = apply_spa_to_model(
             model, model_type, width, height,
             enable_spa=enable_spa, bundle_size=bs,
@@ -380,7 +393,6 @@ class SPA(io.ComfyNode):
             proportional_attention=bool(proportional_attention),
         )
         return io.NodeOutput(patched_model)
-
 
 class HAP(io.ComfyNode):
     """
