@@ -452,14 +452,15 @@ def pixelrush_cascade(
         )
         # Pixel-space cascade upsample: latent → RGB → 2× bicubic → latent
         image = vae_decode(z)
-
+        # Cast to float32 because antialiased bicubic is not implemented for Half
+        orig_dtype = image.dtype
         image_up = F.interpolate(
-            image,
+            image.float(),
             scale_factor=2.0,
             mode="bicubic",
             align_corners=False,
             antialias=True,
-        )
+        ).to(orig_dtype)
 
         coarse_latent = vae_encode(image_up)
         # Ensure coarse_latent is on the same device as the model output
