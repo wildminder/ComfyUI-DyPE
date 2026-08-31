@@ -309,6 +309,10 @@ Restart ComfyUI. No further dependency installation is required.
 
 ## ▓ Changelog
 
+### v2.8.2 — 2026-08-31
+- Fixed graph-build and execution crashes when resolution inputs are `None` (validate_inputs now passes through uninitialized state; execute falls back to 1024)
+- Fixed PixelRush crash on float16: antialiased bicubic upsample casts to float32 and restores the original dtype
+
 ### v2.8.1 — 2026-08-25
 - Fixed valid resolutions being rejected at graph build
 - Validation errors are now reported once, for the right input
