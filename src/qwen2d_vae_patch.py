@@ -9,9 +9,18 @@ Krea2/Qwen/Anima models by providing a VAE that accepts 16-channel latents
 (matching the model's latent format) without the temporal dimension overhead.
 
 Source: https://github.com/anzhc/qwen2d-comfyui
+
+DISABLED BY DEFAULT since v2.8.3 (2026-08-31): user reports showed that with
+this patch installed, loading certain NON-Qwen2D (video-style, 5D conv) VAE
+checkpoints raised a size-mismatch RuntimeError whose traceback passes
+through our delegation frame (``patched_init`` -> original ``VAE.__init__``),
+breaking workflows that do not use the Qwen2D VAE at all. Until the
+interception is made fully transparent, the patch only installs when the
+environment variable ``DYPE_ENABLE_QWEN2D_VAE=1`` is set.
 """
 
 import logging
+import os
 import types
 
 import comfy.model_management as model_management
@@ -25,7 +34,15 @@ from .qwen2d_vae import Qwen2DVAE
 _PATCH_INSTALLED_ATTR = "_anzhc_qwen2d_patch_installed"
 _ORIGINAL_INIT_ATTR = "_anzhc_qwen2d_original_init"
 
+# Opt-in switch (v2.8.3): the Qwen2D VAE interception is disabled by default.
+_ENABLE_ENV_VAR = "DYPE_ENABLE_QWEN2D_VAE"
+
 logger = logging.getLogger("ComfyUI-DyPE")
+
+
+def _qwen2d_patch_enabled():
+    """True only when the user explicitly opted in via the env var."""
+    return os.environ.get(_ENABLE_ENV_VAR, "").strip().lower() in ("1", "true", "yes")
 
 
 def _is_qwen2d_state_dict(sd):
@@ -331,7 +348,16 @@ def install_qwen2d_patch():
     and initialize them with the 2D Qwen2DVAE architecture instead of the
     3D WanVAE. This enables FreeScale/PixelRush to work with Krea2/Qwen/Anima
     models by providing a VAE that accepts 16-channel latents.
+
+    DISABLED BY DEFAULT (v2.8.3): see the module docstring. Set
+    ``DYPE_ENABLE_QWEN2D_VAE=1`` in the ComfyUI environment to re-enable.
     """
+    if not _qwen2d_patch_enabled():
+        logger.info(
+            "Qwen2D VAE patch is disabled by default (v2.8.3). "
+            "Set %s=1 to enable it.", _ENABLE_ENV_VAR,
+        )
+        return
     if getattr(comfy_sd.VAE, _PATCH_INSTALLED_ATTR, False):
         return
 

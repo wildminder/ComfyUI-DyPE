@@ -309,6 +309,9 @@ Restart ComfyUI. No further dependency installation is required.
 
 ## ▓ Changelog
 
+### v2.8.3 — 2026-08-31
+- **Qwen2D VAE support disabled by default.** User reports showed that with the Qwen2D VAE interception installed, loading certain non-Qwen2D (video-style) VAE checkpoints crashed with a size-mismatch error whose traceback passed through this pack's delegation frame — breaking workflows that never used the Qwen2D VAE. The patch now installs only when the environment variable `DYPE_ENABLE_QWEN2D_VAE=1` is set. If you relied on the Qwen2D VAE (Anzhc/Qwen2D-VAE checkpoint with FreeScale/PixelRush on Krea-2/Qwen/Anima), set that variable in your ComfyUI environment to restore the previous behavior.
+
 ### v2.8.2 — 2026-08-31
 - Fixed graph-build and execution crashes when resolution inputs are `None` (validate_inputs now passes through uninitialized state; execute falls back to 1024)
 - Fixed PixelRush crash on float16: antialiased bicubic upsample casts to float32 and restores the original dtype
