@@ -1426,3 +1426,120 @@ class TestPrepareInitialLatent:
         latent = torch.randn(1, 4, 1, 32, 32)
         out = helper(latent, latent_dimensions=3)
         assert torch.equal(out, latent)
+
+
+@pytest.mark.unit
+class TestEmptyConditioningCFG:
+    """Plan 2026-09-02 Step 8: empty-negative CFG fix + empty-positive error.
+
+    Previously run_cond("negative") returned zeros for an empty negative
+    list, so CFG degenerated to eps = cfg_scale * eps_cond (7x amplification
+    at the default). Now an empty negative returns the conditional eps
+    unchanged, and an empty positive raises ValueError.
+    """
+
+    def _build_predict_eps(self, positive, negative, cfg_scale=7.0):
+        """Build a real _make_predict_eps against the conftest comfy stubs.
+
+        The stubbed process_conds returns the conditioning dict verbatim and
+        get_area_and_mult returns a minimal object; the mocked
+        diffusion_model returns a fixed eps per prompt so CFG is observable.
+        """
+        import sys
+        import types
+        sys.path.insert(0, str(pathlib.Path(__file__).parent.parent))
+
+        import torch as _torch
+        import comfy.samplers  # noqa: F401  (conftest stubs)
+
+        # --- model mock with per-prompt eps ---
+        POS_EPS = 0.5
+        NEG_EPS = 1.5
+
+        class _Diffusion:
+            def __call__(self, xc, t, context=None, control=None,
+                         transformer_options=None, **kw):
+                # context carries which prompt this run is for via extra_conds;
+                # simpler: the stub passes c_crossattn=marker tensor
+                marker = kw.get("marker", context)
+                if marker is not None and float(marker.flatten()[0]) == -1.0:
+                    return _torch.full_like(xc, NEG_EPS)
+                return _torch.full_like(xc, POS_EPS)
+
+        model = types.SimpleNamespace()
+        model.load_device = _torch.device("cpu")
+        model.pre_run = lambda: None
+        model.apply_hooks = lambda hooks=None: {}
+        model.model = types.SimpleNamespace()
+
+        def process_latent_in(t):
+            return t
+
+        model.model.process_latent_in = process_latent_in
+
+        ms = types.SimpleNamespace()
+        EpsClass = type("EPS", (), {})
+        MS = type("ModelSampling", (EpsClass,), {})
+        ms_instance = MS()
+        ms_instance.sigma = lambda ts: ts
+        ms_instance.timestep = lambda sigma: sigma * 999.0
+        ms_instance.sigma_data = 1.0
+
+        def calculate_input(sigma, x):
+            return x
+
+        ms_instance.calculate_input = calculate_input
+        model.model.model_sampling = ms_instance
+        model.model.get_dtype_inference = lambda: _torch.float32
+        model.model.current_patcher = None
+        model.model.process_timestep = lambda t, **kw: t
+        model.model.diffusion_model = _Diffusion()
+
+        # Conditioning: list entries are dicts whose c_crossattn marker
+        # selects the prompt (1.0 pos, -1.0 neg); empty list = empty cond.
+        def mk(marker):
+            return {"c_crossattn": _torch.tensor([[marker]])}
+
+        from src.pixelrush_node import _make_predict_eps
+        return _make_predict_eps(
+            model,
+            [mk(1.0)] if positive else [],
+            [mk(-1.0)] if negative else [],
+            cfg_scale,
+            latent_dimensions=2,
+        ), POS_EPS, NEG_EPS
+
+    def test_empty_negative_returns_cond_eps(self):
+        """Empty negative + cfg=7.0: returned eps must equal eps_cond
+        EXACTLY (before the fix it was 7x eps_cond)."""
+        import torch.nn.functional as F
+        predict_eps, pos_eps, _ = self._build_predict_eps(
+            positive=True, negative=False, cfg_scale=7.0)
+        latent = torch.zeros(1, 4, 8, 8)
+        eps = predict_eps(latent, timestep=0)
+        # diffusion returned constant POS_EPS everywhere -> eps == pos_eps
+        assert torch.allclose(eps, torch.full_like(eps, pos_eps), atol=1e-5), (
+            f"Empty negative must return eps_cond unchanged; got mean "
+            f"{eps.mean().item():.3f}, expected {pos_eps} (pre-fix bug gave "
+            f"cfg_scale*eps_cond = {7.0 * pos_eps:.3f})"
+        )
+
+    def test_cfg_applied_when_negative_present(self):
+        """Non-empty negative + cfg=2.0: eps == eps_uncond + 2*(eps_cond - eps_uncond)."""
+        predict_eps, pos_eps, neg_eps = self._build_predict_eps(
+            positive=True, negative=True, cfg_scale=2.0)
+        latent = torch.zeros(1, 4, 8, 8)
+        eps = predict_eps(latent, timestep=0)
+        expected = neg_eps + 2.0 * (pos_eps - neg_eps)
+        assert torch.allclose(eps, torch.full_like(eps, expected), atol=1e-5), (
+            f"CFG must apply when negative is present; got mean {eps.mean().item():.3f}, "
+            f"expected {expected:.3f}"
+        )
+
+    def test_empty_positive_raises(self):
+        """Empty positive must raise ValueError with a clear message."""
+        predict_eps, _, _ = self._build_predict_eps(
+            positive=False, negative=True, cfg_scale=7.0)
+        latent = torch.zeros(1, 4, 8, 8)
+        with pytest.raises(ValueError, match="positive conditioning"):
+            predict_eps(latent, timestep=0)

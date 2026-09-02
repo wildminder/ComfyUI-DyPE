@@ -297,11 +297,21 @@ def _make_predict_eps(model, positive, negative, cfg_scale, latent_dimensions=2)
             eps = model_output_to_eps(model_output.float(), p.input_x, sigma)
             return eps
 
+        if len(processed.get("positive", [])) == 0:
+            raise ValueError(
+                "PixelRush requires positive conditioning"
+            )
         eps_cond = run_cond("positive")
-        eps_uncond = run_cond("negative")
 
-        # CFG
-        eps = eps_uncond + cfg_scale * (eps_cond - eps_uncond)
+        has_negative = len(processed.get("negative", [])) > 0
+        if not has_negative:
+            # Empty negative conditioning: CFG is undefined (no unconditional
+            # branch). Using zeros here would silently amplify eps_cond by
+            # cfg_scale (7x at the default), so return the conditional eps.
+            eps = eps_cond
+        else:
+            eps_uncond = run_cond("negative")
+            eps = eps_uncond + cfg_scale * (eps_cond - eps_uncond)
 
         # For 3D latent models, squeeze 5D eps back to 4D for the core algorithm
         if is_3d and eps.ndim == 5 and was_4d:
