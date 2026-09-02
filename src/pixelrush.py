@@ -39,22 +39,24 @@ class PixelRushConfig:
         in the model's schedule.  Paper default: 249.
     noise_lambda : float
         Noise injection strength for slerp between predicted and random
-        noise.  Paper default: 0.95.
+        noise.  Paper default: 0.95. Note the paper's stated convention:
+        lambda=0.95 places the slerp result close to the RANDOM vector.
+    noise_injection : str
+        Injection mode.  ``"slerp"`` (paper / corrected theory, default):
+        ``slerp(eps_refined, eps_random, noise_lambda)``.  ``"additive"``:
+        the 2026-08-13 legacy behavior ``eps_refined + noise_lambda *
+        eps_random``, kept as an opt-in for workflows tuned against it.
     gaussian_sigma : float
-        Gaussian feathering sigma.  Paper default: 8.0.
-    gaussian_kernel_size : int
-        Gaussian blur kernel size (must be odd).  Paper default: 41.
+        Gaussian feathering sigma for the analytic patch weight mask.
+        Paper default: 24.0. Rule of thumb: sigma ~ patch_size / 5.
     eps : float
         Numerical stability epsilon.
-    operate_in_vae_space : bool
-        When True (default), the algorithm runs in VAE latent space (std ≈ 1)
-        and the injected adapters convert to model space internally. This is
-        required for models whose ``process_latent_in`` scales the latent
-        (e.g. SDXL ``scale_factor=0.13025``): without it, the fixed-magnitude
-        noise injection (std ≈ 0.95) would dominate the scaled-down signal
-        (std ≈ 0.13) and produce a noisy output. When False, the legacy path
-        is used (``execute`` applies ``process_latent_in`` and the adapters
-        operate in model space).
+
+    Notes
+    -----
+    The core algorithm runs in VAE latent space (the ComfyUI LATENT
+    convention); adapters injected by the node own the VAE<->model
+    conversions internally (plan 2026-09-02).
     """
 
     patch_h: int
@@ -62,21 +64,23 @@ class PixelRushConfig:
     overlap: float = 0.50
     k_timestep: int = 249
     noise_lambda: float = 0.95
-    gaussian_sigma: float = 8.0
-    gaussian_kernel_size: int = 41
+    noise_injection: str = "slerp"
+    gaussian_sigma: float = 24.0
     eps: float = 1e-8
-    operate_in_vae_space: bool = True
 
 
 # ---------------------------------------------------------------------------
 # Spherical interpolation
 # ---------------------------------------------------------------------------
 
-def spherical_lerp(a: Tensor, b: Tensor, t: float, eps: float = 1e-7) -> Tensor:
-    """Spherical interpolation (SLERP) between tensors ``a`` and ``b``.
+def slerp(a: Tensor, b: Tensor, t: float, eps: float = 1e-7) -> Tensor:
+    """Standard vector SLERP between tensors ``a`` and ``b`` (t=0 → a, t=1 → b).
 
-    Treats each sample's complete latent tensor as one vector.
-    Falls back to linear interpolation when vectors are nearly parallel.
+    Treats each sample's complete latent tensor as one vector. Raw-vector
+    form (paper/corrected-theory convention): the magnitudes are carried by
+    the slerp coefficients themselves, not interpolated separately. Falls
+    back to linear interpolation when the vectors are nearly collinear
+    (sin(omega) < 1e-4), where SLERP is numerically unstable.
 
     Parameters
     ----------
@@ -91,79 +95,64 @@ def spherical_lerp(a: Tensor, b: Tensor, t: float, eps: float = 1e-7) -> Tensor:
     Tensor
         Same shape as ``a``.
     """
-    a_flat = a.flatten(1)
-    b_flat = b.flatten(1)
+    assert a.shape == b.shape
+
+    a_flat = a.flatten(start_dim=1)
+    b_flat = b.flatten(start_dim=1)
 
     a_norm = a_flat.norm(dim=1, keepdim=True).clamp_min(eps)
     b_norm = b_flat.norm(dim=1, keepdim=True).clamp_min(eps)
 
-    a_unit = a_flat / a_norm
-    b_unit = b_flat / b_norm
+    cos_omega = (a_flat * b_flat).sum(dim=1, keepdim=True) / (a_norm * b_norm)
+    cos_omega = cos_omega.clamp(-1.0 + eps, 1.0 - eps)
 
-    cosine = (a_unit * b_unit).sum(dim=1, keepdim=True).clamp(-1 + eps, 1 - eps)
-    omega = torch.acos(cosine)
-    sin_omega = torch.sin(omega).clamp_min(eps)
+    omega = torch.acos(cos_omega)
+    sin_omega = torch.sin(omega)
 
-    t_tensor = torch.full_like(omega, t)
+    t_tensor = torch.full_like(omega, float(t))
 
-    # Spherical direction uses UNIT vectors. Using raw vectors (a_flat/b_flat)
-    # would square the norm whenever |a| != |b| (always true here: eps_pred≈0,
-    # eps_rand≈1), making eps_inj ~60x too large and the output pure noise.
-    direction = (
-        torch.sin((1.0 - t_tensor) * omega) / sin_omega * a_unit
-        + torch.sin(t_tensor * omega) / sin_omega * b_unit
+    # Standard vector SLERP. No separate magnitude multiplication.
+    slerp_flat = (
+        torch.sin((1.0 - t_tensor) * omega) / sin_omega * a_flat
+        + torch.sin(t_tensor * omega) / sin_omega * b_flat
     )
 
-    # Interpolate magnitudes separately (linear)
-    magnitude = (1.0 - t_tensor) * a_norm + t_tensor * b_norm
-    return (direction * magnitude).view_as(a)
+    # If vectors are almost collinear, SLERP becomes unstable.
+    lerp_flat = (1.0 - t_tensor) * a_flat + t_tensor * b_flat
+    use_lerp = sin_omega.abs() < 1e-4
+
+    return torch.where(use_lerp, lerp_flat, slerp_flat).view_as(a)
+
+
+# Backward-compatibility alias (previous name).
+spherical_lerp = slerp
 
 
 # ---------------------------------------------------------------------------
 # Gaussian feathering
 # ---------------------------------------------------------------------------
 
-def gaussian_kernel_2d(
-    kernel_size: int,
-    sigma: float,
-    device: torch.device,
-    dtype: torch.dtype,
-) -> Tensor:
-    """Returns a normalized ``[1, 1, K, K]`` Gaussian convolution kernel."""
-    assert kernel_size % 2 == 1, "Use an odd kernel size."
-
-    coords = torch.arange(kernel_size, device=device, dtype=dtype)
-    coords = coords - kernel_size // 2
-
-    g = torch.exp(-(coords ** 2) / (2.0 * sigma ** 2))
-    g = g / g.sum()
-
-    kernel = torch.outer(g, g)
-    return kernel[None, None]  # [1, 1, K, K]
-
-
 def gaussian_feather_mask(
     height: int,
     width: int,
     sigma: float,
-    kernel_size: int,
     device: torch.device,
     dtype: torch.dtype,
 ) -> Tensor:
-    """Create a ``[1, 1, H, W]`` smooth feather mask.
+    """Create a ``[1, 1, H, W]`` analytic Gaussian weight mask, peak = 1.
 
-    Blurs an all-one patch with zero padding.  The center remains near one,
-    and the boundaries smoothly decay — ideal for overlap-add blending.
+    Corrected-theory form: ``exp(-(xx^2 + yy^2) / (2 sigma^2))`` centered on
+    the patch and normalized so the peak is exactly 1 — an explicit encoding
+    of the paper's Gaussian-filtered patch mask, not a blurred all-ones
+    approximation. The mask is highest at the patch center and smoothly
+    decreases toward the boundaries.
     """
-    hard_mask = torch.ones((1, 1, height, width), device=device, dtype=dtype)
-    kernel = gaussian_kernel_2d(kernel_size, sigma, device, dtype)
+    y = torch.arange(height, device=device, dtype=dtype) - (height - 1) / 2.0
+    x = torch.arange(width, device=device, dtype=dtype) - (width - 1) / 2.0
+    yy, xx = torch.meshgrid(y, x, indexing="ij")
 
-    pad = kernel_size // 2
-    blurred = F.conv2d(hard_mask, kernel, padding=pad)
-
-    # Normalize peak to 1
-    blurred = blurred / blurred.amax().clamp_min(1e-8)
-    return blurred
+    mask = torch.exp(-(xx.square() + yy.square()) / (2.0 * sigma ** 2))
+    return (mask / mask.max().clamp_min(1e-8))[None, None]
 
 
 # ---------------------------------------------------------------------------
@@ -207,6 +196,60 @@ def patch_positions(
 # DDIM inversion / denoising
 # ---------------------------------------------------------------------------
 
+def predict_x0_from_epsilon(
+    x_t: Tensor,
+    epsilon: Tensor,
+    alpha_bar_t: Tensor | float,
+    eps: float = 1e-8,
+) -> Tensor:
+    """Recover x_0 from a noised latent and its epsilon.
+
+    x_t = sqrt(alpha_bar_t) * x_0 + sqrt(1 - alpha_bar_t) * epsilon, so:
+        x_0 = (x_t - sqrt(1 - alpha_bar_t) * epsilon) / sqrt(alpha_bar_t)
+    """
+    alpha_bar_t = torch.as_tensor(
+        alpha_bar_t, device=x_t.device, dtype=x_t.dtype
+    )
+
+    sqrt_alpha = alpha_bar_t.sqrt().clamp_min(eps)
+    sqrt_one_minus_alpha = (1.0 - alpha_bar_t).clamp_min(0.0).sqrt()
+
+    return (x_t - sqrt_one_minus_alpha * epsilon) / sqrt_alpha
+
+
+def ddim_deterministic_step(
+    x_from: Tensor,
+    epsilon_from: Tensor,
+    alpha_bar_from: Tensor | float,
+    alpha_bar_to: Tensor | float,
+) -> Tensor:
+    """Deterministic DDIM (eta=0) transition between ARBITRARY timesteps.
+
+    Recovers x_hat_0 from the source timestep via ``predict_x0_from_epsilon``,
+    then re-noises it to the destination timestep, keeping the SAME epsilon:
+
+        x_to = sqrt(alpha_bar_to) * x_hat_0 + sqrt(1 - alpha_bar_to) * epsilon
+
+    Works in either direction:
+      - inversion: source 0 -> destination K
+      - denoising: source K -> destination 0
+    """
+    x0_pred = predict_x0_from_epsilon(
+        x_t=x_from,
+        epsilon=epsilon_from,
+        alpha_bar_t=alpha_bar_from,
+    )
+
+    alpha_bar_to = torch.as_tensor(
+        alpha_bar_to, device=x_from.device, dtype=x_from.dtype
+    )
+
+    return (
+        alpha_bar_to.sqrt() * x0_pred
+        + (1.0 - alpha_bar_to).clamp_min(0.0).sqrt() * epsilon_from
+    )
+
+
 def ddim_forward_one_step(
     z0: Tensor,
     eps0: Tensor,
@@ -219,11 +262,7 @@ def ddim_forward_one_step(
         z_K = sqrt(alpha_bar_K) * z_0
               + sqrt(1 - alpha_bar_K) * eps(z_0, 0)
     """
-    if not torch.is_tensor(alpha_bar_k):
-        alpha_bar_k = torch.tensor(alpha_bar_k, device=z0.device, dtype=z0.dtype)
-
-    a = alpha_bar_k.to(device=z0.device, dtype=z0.dtype)
-    return a.sqrt() * z0 + (1.0 - a).sqrt() * eps0
+    return ddim_deterministic_step(z0, eps0, 1.0, alpha_bar_k)
 
 
 def ddim_reverse_one_step_to_zero(
@@ -237,11 +276,7 @@ def ddim_reverse_one_step_to_zero(
 
         z_0_hat = (z_K - sqrt(1-alpha_bar_K) * eps_K) / sqrt(alpha_bar_K)
     """
-    if not torch.is_tensor(alpha_bar_k):
-        alpha_bar_k = torch.tensor(alpha_bar_k, device=z_k.device, dtype=z_k.dtype)
-
-    a = alpha_bar_k.to(device=z_k.device, dtype=z_k.dtype)
-    return (z_k - (1.0 - a).sqrt() * eps_k) / a.sqrt().clamp_min(1e-8)
+    return ddim_deterministic_step(z_k, eps_k, alpha_bar_k, 1.0)
 
 
 # ---------------------------------------------------------------------------
@@ -251,7 +286,8 @@ def ddim_reverse_one_step_to_zero(
 @torch.no_grad()
 def refine_latent_once(
     coarse_latent: Tensor,
-    predict_eps: Callable[[Tensor, int], Tensor],
+    inversion_eps: Callable[[Tensor, int], Tensor],
+    refiner_eps: Callable[[Tensor, int], Tensor],
     alpha_bar_at: Callable[[int], Tensor | float],
     cfg: PixelRushConfig,
     progress_callback: Callable[[int, int], None] | None = None,
@@ -266,9 +302,16 @@ def refine_latent_once(
     coarse_latent : Tensor
         ``[B, C, H, W]`` latent obtained by pixel-space upsampling and
         VAE encoding.
-    predict_eps : callable
-        ``predict_eps(latent, timestep) -> [B, C, H, W]`` epsilon prediction
-        (should already include CFG).
+    inversion_eps : callable
+        ``inversion_eps(latent, timestep) -> [B, C, H, W]`` epsilon
+        prediction from the BASE generator, used to drive the partial
+        DDIM inversion (should already include CFG). Distinct from
+        ``refiner_eps`` per the corrected theory — the paper uses a
+        different (distilled one-step) model for refinement.
+    refiner_eps : callable
+        ``refiner_eps(latent, timestep) -> [B, C, H, W]`` epsilon
+        prediction from the REFINER model at timestep K (should already
+        include CFG).
     alpha_bar_at : callable
         ``alpha_bar_at(K) -> alpha_cumprod[K]``.  Used only when ``forward_step``
         / ``reverse_step`` are not provided (EPS-only fallback).
@@ -299,8 +342,11 @@ def refine_latent_once(
         "Patch dimensions must not exceed the latent."
     )
 
-    # Sigma at timestep K (used by forward_step/reverse_step adapters).
-    # Falls back to alpha_bar for the EPS-only DDIM path.
+    # Schedule values at timestep K. sigma_k feeds the forward/reverse
+    # adapters; alpha_k feeds the EPS-only DDIM fallback transitions. alpha_k
+    # is computed whenever ANY fallback branch can execute (either adapter
+    # missing), so partially-provided adapters can never hit an undefined
+    # name — and alpha_bar_at is never called when both adapters are given.
     if sigma_at is not None:
         sigma_k = sigma_at(cfg.k_timestep)
         sigma_k_tensor = torch.tensor(
@@ -309,6 +355,8 @@ def refine_latent_once(
     else:
         sigma_k = None
         sigma_k_tensor = None
+    alpha_k = None
+    if forward_step is None or reverse_step is None:
         alpha_k = alpha_bar_at(cfg.k_timestep)
 
     # Overlap-add buffers
@@ -319,7 +367,6 @@ def refine_latent_once(
         cfg.patch_h,
         cfg.patch_w,
         sigma=cfg.gaussian_sigma,
-        kernel_size=cfg.gaussian_kernel_size,
         device=coarse_latent.device,
         dtype=coarse_latent.dtype,
     )  # [1, 1, patch_h, patch_w]
@@ -343,33 +390,34 @@ def refine_latent_once(
             logger.info("PixelRush: patch %d/%d", idx + 1, total_patches)
         patch_0 = coarse_latent[:, :, y:y + cfg.patch_h, x:x + cfg.patch_w]
 
-        # 1. Partial inversion: 0 -> K
-        eps_inv = predict_eps(patch_0, timestep=0)
+        # 1. Partial inversion: 0 -> K (driven by the BASE model's eps)
+        eps_for_inversion = inversion_eps(patch_0, timestep=0)
         # Ensure eps is on the same device as the patch
-        eps_inv = eps_inv.to(patch_0.device)
+        eps_for_inversion = eps_for_inversion.to(patch_0.device)
         if forward_step is not None:
-            patch_k = forward_step(patch_0, eps_inv, sigma_k_tensor)
+            patch_k = forward_step(patch_0, eps_for_inversion, sigma_k_tensor)
         else:
-            patch_k = ddim_forward_one_step(patch_0, eps_inv, alpha_k)
+            patch_k = ddim_forward_one_step(patch_0, eps_for_inversion, alpha_k)
 
-        # 2. One-step denoise: K -> 0
-        eps_pred = predict_eps(patch_k, timestep=cfg.k_timestep)
-        eps_pred = eps_pred.to(patch_k.device)
+        # 2. One-step denoise: K -> 0 (driven by the REFINER model's eps)
+        eps_refined = refiner_eps(patch_k, timestep=cfg.k_timestep)
+        eps_refined = eps_refined.to(patch_k.device)
 
-        # 3. Noise injection
-        # The model's own prediction (eps_pred) carries the high-frequency detail
-        # of the image. The original PixelRush paper injects a slerp between
-        # eps_pred and a random vector with noise_lambda=0.95, i.e. 95% RANDOM
-        # noise. Because each patch's random component is independent, it averages
-        # out across overlapping patches (overlap 0.5 -> ~4 patches/pixel), leaving
-        # the smoothed bicubic upscale dominant and producing a "compressed" look.
-        #
-        # Fix: keep eps_pred as the PRIMARY denoising signal and add only a
-        # controlled random perturbation scaled by noise_lambda. This preserves
-        # the model's detail prediction (which drives sharpness) while still
-        # injecting stochasticity for patch-to-patch diversity.
-        eps_rand = torch.randn_like(eps_pred)
-        eps_injected = eps_pred + cfg.noise_lambda * eps_rand
+        # 3. PixelRush noise injection (corrected theory: SLERP between the
+        # refiner's eps prediction and fresh random noise). Note the paper's
+        # stated convention: noise_lambda=0.95 places the result close to
+        # eps_random. The "additive" mode preserves the 2026-08-13 legacy
+        # behavior (eps_pred + lambda * eps_rand) as an opt-in.
+        eps_random = torch.randn_like(eps_refined)
+        if cfg.noise_injection == "additive":
+            eps_injected = eps_refined + cfg.noise_lambda * eps_random
+        elif cfg.noise_injection == "slerp":
+            eps_injected = slerp(eps_refined, eps_random, cfg.noise_lambda)
+        else:
+            raise ValueError(
+                f"Unknown noise_injection mode: {cfg.noise_injection!r} "
+                "(expected 'slerp' or 'additive')"
+            )
 
         # 4. Reverse step: K -> 0
         if reverse_step is not None:
@@ -400,7 +448,8 @@ def pixelrush_cascade(
     num_cascade_stages: int,
     vae_decode: Callable[[Tensor], Tensor],
     vae_encode: Callable[[Tensor], Tensor],
-    predict_eps: Callable[[Tensor, int], Tensor],
+    inversion_eps: Callable[[Tensor, int], Tensor],
+    refiner_eps: Callable[[Tensor, int], Tensor],
     alpha_bar_at: Callable[[int], Tensor | float],
     cfg: PixelRushConfig,
     progress_callback: Callable[[int, int, int, int], None] | None = None,
@@ -420,8 +469,12 @@ def pixelrush_cascade(
         ``vae_decode(latent) -> image`` (B, C_img, H_img, W_img).
     vae_encode : callable
         ``vae_encode(image) -> latent`` (B, C, H, W).
-    predict_eps : callable
-        ``predict_eps(latent, timestep) -> eps`` (with CFG).
+    inversion_eps : callable
+        ``inversion_eps(latent, timestep) -> eps`` from the BASE generator
+        (with CFG). Drives the partial DDIM inversion.
+    refiner_eps : callable
+        ``refiner_eps(latent, timestep) -> eps`` from the REFINER model
+        (with CFG). Drives the one-step refinement at timestep K.
     alpha_bar_at : callable
         ``alpha_bar_at(timestep) -> alpha_bar``.  Used only when the
         forward/reverse adapters are not provided (EPS-only fallback).
@@ -485,7 +538,8 @@ def pixelrush_cascade(
 
         z = refine_latent_once(
             coarse_latent=coarse_latent,
-            predict_eps=predict_eps,
+            inversion_eps=inversion_eps,
+            refiner_eps=refiner_eps,
             alpha_bar_at=alpha_bar_at,
             cfg=cfg,
             progress_callback=stage_callback,

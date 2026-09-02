@@ -25,13 +25,60 @@ class TestPixelRushNodeSchema:
         content = (pathlib.Path(__file__).parent.parent / "src" / "pixelrush_node.py").read_text(encoding="utf-8")
         assert "image/upscaling" in content
 
+    def test_noise_injection_default_slerp(self):
+        """Node must expose the noise_injection mode with slerp default."""
+        content = (pathlib.Path(__file__).parent.parent / "src" / "pixelrush_node.py").read_text(encoding="utf-8")
+        assert "noise_injection" in content, (
+            "Node must pass noise_injection into PixelRushConfig"
+        )
+        assert 'default="slerp"' in content, (
+            "noise_injection combo default must be 'slerp' (paper default)"
+        )
+
     def test_node_defaults_match_paper(self):
         content = (pathlib.Path(__file__).parent.parent / "src" / "pixelrush_node.py").read_text(encoding="utf-8")
         assert "default=0.95" in content  # noise_lambda
         assert "default=0.50" in content  # overlap
         assert "default=249" in content  # k_timestep
-        assert "default=8.0" in content  # gaussian_sigma
-        assert "default=41" in content  # gaussian_kernel_size
+        assert "default=24.0" in content  # gaussian_sigma
+        # gaussian_kernel_size input must be gone (analytic mask has no kernel)
+        assert "gaussian_kernel_size" not in content, (
+            "gaussian_kernel_size must be removed from the node (analytic mask)"
+        )
+
+    def test_sigma_max_allows_paper_default(self):
+        """The corrected default sigma=24 must be reachable from the UI."""
+        content = (pathlib.Path(__file__).parent.parent / "src" / "pixelrush_node.py").read_text(encoding="utf-8")
+        assert "max=128.0" in content, (
+            "gaussian_sigma max must be 128 (old max=20 blocked the paper default 24)"
+        )
+
+    def test_execute_signature_matches_schema(self):
+        """Every schema input name must be an execute() parameter and vice
+        versa (no drift; catches removed inputs like gaussian_kernel_size)."""
+        import re
+        content = (pathlib.Path(__file__).parent.parent / "src" / "pixelrush_node.py").read_text(encoding="utf-8")
+        # Schema input names — match calls across line breaks:
+        # io.<Type>.Input(\s*"<name>"
+        pattern = re.compile(r'io\.\w+\.Input\(\s*"([^"]+)"')
+        schema_inputs = set(pattern.findall(content))
+        assert schema_inputs, "failed to parse schema inputs"
+        assert "refiner_model" in schema_inputs
+        sig_start = content.index("def execute(cls,")
+        sig_start += len("def execute(cls,")
+        sig = content[sig_start:content.index(") -> io.NodeOutput:", sig_start)]
+        params = set()
+        for chunk in sig.split(","):
+            chunk = chunk.strip()
+            if "=" in chunk:
+                chunk = chunk.split("=")[0].strip()
+            if chunk and chunk != "cls":
+                params.add(chunk)
+        missing = (schema_inputs - params) | (params - schema_inputs)
+        assert not missing, (
+            f"Schema inputs and execute() params must match exactly; "
+            f"schema-only={schema_inputs - params}, exec-only={params - schema_inputs}"
+        )
 
     def test_node_registered_in_extension(self):
         content = (pathlib.Path(__file__).parent.parent / "__init__.py").read_text(encoding="utf-8")
@@ -433,7 +480,7 @@ class TestPixelRushVAEAdaptersFunctional:
         cfg = PixelRushConfig(
             patch_h=32, patch_w=32, overlap=0.5,
             k_timestep=249, noise_lambda=0.95,
-            gaussian_sigma=8.0, gaussian_kernel_size=41,
+            gaussian_sigma=24.0,
         )
 
         initial_latent = torch.randn(1, 16, 32, 32)
@@ -442,7 +489,8 @@ class TestPixelRushVAEAdaptersFunctional:
             num_cascade_stages=1,
             vae_decode=vae_decode,
             vae_encode=vae_encode,
-            predict_eps=predict_eps,
+            inversion_eps=predict_eps,
+            refiner_eps=predict_eps,
             alpha_bar_at=alpha_bar_at,
             cfg=cfg,
         )
@@ -528,12 +576,13 @@ class TestPixelRushProgressBar:
         cfg = PixelRushConfig(
             patch_h=32, patch_w=32, overlap=0.5,
             k_timestep=249, noise_lambda=0.95,
-            gaussian_sigma=8.0, gaussian_kernel_size=41,
+            gaussian_sigma=24.0,
         )
 
         refine_latent_once(
             coarse_latent=coarse_latent,
-            predict_eps=predict_eps,
+            inversion_eps=predict_eps,
+            refiner_eps=predict_eps,
             alpha_bar_at=alpha_bar_at,
             cfg=cfg,
             progress_callback=progress_callback,
@@ -578,7 +627,7 @@ class TestPixelRushProgressBar:
         cfg = PixelRushConfig(
             patch_h=32, patch_w=32, overlap=0.5,
             k_timestep=249, noise_lambda=0.95,
-            gaussian_sigma=8.0, gaussian_kernel_size=41,
+            gaussian_sigma=24.0,
         )
 
         initial_latent = torch.randn(1, 4, 32, 32)
@@ -587,7 +636,8 @@ class TestPixelRushProgressBar:
             num_cascade_stages=2,
             vae_decode=vae_decode,
             vae_encode=vae_encode,
-            predict_eps=predict_eps,
+            inversion_eps=predict_eps,
+            refiner_eps=predict_eps,
             alpha_bar_at=alpha_bar_at,
             cfg=cfg,
             progress_callback=progress_callback,
@@ -700,26 +750,32 @@ class TestPixelRushInferenceBugFix:
             "is needed when getting raw epsilon directly"
         )
 
-    # --- Bug 3: spherical_lerp must use UNIT vectors (not raw) ---
+    # --- Bug 3 fixed per corrected theory: slerp uses RAW vectors ---
 
-    def test_spherical_lerp_uses_unit_vectors(self):
-        """spherical_lerp must use a_unit/b_unit in the direction, not raw a_flat/b_flat.
+    def test_slerp_uses_raw_vectors_and_lerp_fallback(self):
+        """slerp must use the corrected standard raw-vector form.
 
-        Using raw vectors squares the norm whenever |a| != |b| (always true for
-        eps_pred≈0 vs eps_rand≈1), making eps_inj ~60x too large -> pure noise.
+        The corrected-theory reference (pixelrush-correct.txt) uses raw
+        a_flat/b_flat in the slerp coefficients with a lerp fallback for
+        nearly-collinear vectors — NOT the unit-vector x separate-magnitude
+        form the 2026-08-12 fix introduced.
         """
         content = (pathlib.Path(__file__).parent.parent / "src" / "pixelrush.py").read_text(encoding="utf-8")
-        assert "a_unit" in content, "spherical_lerp should define a_unit"
-        assert "b_unit" in content, "spherical_lerp should define b_unit"
-        # The direction term must use a_unit/b_unit, NOT a_flat/b_flat.
-        assert "sin_omega * a_flat" not in content, (
-            "spherical_lerp direction must use a_unit (unit vector), not a_flat (raw)"
+        assert "sin_omega * a_flat" in content, (
+            "slerp direction must use a_flat (raw vector), the corrected-theory form"
         )
-        assert "sin_omega * b_flat" not in content, (
-            "spherical_lerp direction must use b_unit (unit vector), not b_flat (raw)"
+        assert "sin_omega * b_flat" in content, (
+            "slerp direction must use b_flat (raw vector), the corrected-theory form"
+        )
+        assert "use_lerp" in content, (
+            "slerp must define the collinear lerp fallback (sin_omega < 1e-4)"
+        )
+        assert "a_unit" not in content, (
+            "slerp must not use unit vectors with separate magnitude "
+            "interpolation (superseded 2026-08-12 form)"
         )
 
-    def test_spherical_lerp_does_not_explode_norm(self):
+    def test_slerp_does_not_explode_norm(self):
         """Regression: slerp of two different-magnitude vectors must not square the norm.
 
         slerp(eps_pred (norm~6), eps_rand (norm~64), 0.95) must yield a result
@@ -729,11 +785,11 @@ class TestPixelRushInferenceBugFix:
         sys.path.insert(0, str(pathlib.Path(__file__).parent.parent))
         import torch
 
-        from src.pixelrush import spherical_lerp
+        from src.pixelrush import slerp
         torch.manual_seed(0)
         a = 0.1 * torch.randn(1, 4, 32, 32)   # eps_pred-like (small norm)
         b = torch.randn(1, 4, 32, 32)          # eps_rand-like (large norm)
-        out = spherical_lerp(a, b, t=0.95)
+        out = slerp(a, b, t=0.95)
         out_norm = out.flatten(1).norm(dim=1).item()
         # Interpolated magnitude should be ~ (1-0.95)*||a|| + 0.95*||b||
         expected_mag = 0.05 * a.flatten(1).norm().item() + 0.95 * b.flatten(1).norm().item()
@@ -1195,14 +1251,190 @@ class TestPixelRushKTimestepScaling:
 
 
 @pytest.mark.unit
-class TestPrepareInitialLatent:
-    """Tests for _prepare_initial_latent (regression guard for the SDXL
-    UnboundLocalError: cfg_obj referenced before assignment in execute).
+class TestPipelineSpaceConvention:
+    """Plan 2026-09-02 Step 7: the operate_in_vae_space flag is removed.
 
-    The guard that decides whether to apply process_latent_in to the initial
-    latent was previously inlined in execute and referenced cfg_obj (defined
-    later). Extracting it into this helper makes operate_in_vae_space an
-    explicit parameter, so it can never be undefined.
+    The pipeline is ALWAYS VAE-space at the interfaces (ComfyUI LATENT
+    convention): execute never pre-converts the initial latent, the VAE
+    adapters never apply process_latent_out/in, and predict_eps /
+    forward_step / reverse_step own the VAE<->model conversions.
+    """
+
+    def _read_source(self):
+        return (pathlib.Path(__file__).parent.parent / "src" / "pixelrush_node.py").read_text(encoding="utf-8")
+
+    @staticmethod
+    def _strip_docstrings_and_comments(content):
+        import ast
+        tree = ast.parse(content)
+        lines = content.splitlines()
+        for node in ast.walk(tree):
+            if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef, ast.Module)):
+                doc = ast.get_docstring(node, clean=False)
+                if doc:
+                    # blank out the docstring lines only
+                    for i in range(node.body[0].lineno - 1,
+                                   node.body[0].lineno - 1 + doc.count("\n") + 1):
+                        lines[i] = ""
+        code = "\n".join(lines)
+        code = "\n".join(ln.split("#")[0] for ln in code.splitlines())
+        return code
+
+    def test_no_operate_in_vae_space_flag(self):
+        """The flag must be gone from code (docstrings may mention removal)."""
+        for rel in ("src/pixelrush_node.py", "src/pixelrush.py"):
+            content = (pathlib.Path(__file__).parent.parent / rel).read_text(encoding="utf-8")
+            code = self._strip_docstrings_and_comments(content)
+            assert "operate_in_vae_space" not in code, (
+                f"{rel} must not reference the removed operate_in_vae_space flag in code"
+            )
+
+    def test_execute_never_preconverts_initial_latent(self):
+        """execute must pass the initial latent through _prepare_initial_latent
+        without process_latent_in (core runs in VAE space)."""
+        content = self._read_source()
+        assert "initial_latent = _prepare_initial_latent(" in content
+        call = content[content.index("initial_latent = _prepare_initial_latent("):]
+        call = call[:call.index(")")]
+        assert "process_latent_in" not in call, (
+            "_prepare_initial_latent must not receive process_latent_in"
+        )
+
+    def test_vae_adapters_do_not_convert_space(self):
+        """_make_vae_adapters must not apply process_latent_out/in (VAE space
+        in, VAE space out); conversions live in predict_eps/forward/reverse."""
+        content = self._read_source()
+        start = content.index("def _make_vae_adapters")
+        end = content.index("def _prepare_initial_latent")
+        section = content[start:end]
+        code = self._strip_docstrings_and_comments(section)
+        assert "process_latent_out(" not in code, (
+            "vae_decode must not call process_latent_out (latent is already in VAE space)"
+        )
+        assert "process_latent_in(" not in code, (
+            "vae_encode must not call process_latent_in (latent stays in VAE space)"
+        )
+
+    def test_predict_eps_converts_input_via_process_latent_in(self):
+        """predict_eps must convert the VAE-space latent to model space for
+        the model call (and return model-space eps)."""
+        content = self._read_source()
+        start = content.index("def _make_predict_eps")
+        end = content.index("def _make_forward_step")
+        section = content[start:end]
+        assert "process_latent_in(latent)" in section, (
+            "predict_eps must apply process_latent_in to the input latent"
+        )
+
+    def test_forward_reverse_adapters_own_conversion(self):
+        """forward/reverse adapters must convert via process_latent_in/out."""
+        content = self._read_source()
+        start = content.index("def _make_forward_step")
+        end = content.index("def _make_sigma_at")
+        section = content[start:end]
+        assert section.count("process_latent_in(x_0)") >= 1
+        assert section.count("process_latent_out(x_k_model)") >= 1
+        assert section.count("process_latent_in(x_K)") >= 1
+        assert section.count("process_latent_out(x0_model)") >= 1
+
+
+@pytest.mark.unit
+class TestAdapterSpaceConversion:
+    """The Step 7 exactness tests: forward/reverse must convert spaces such
+    that the MODEL-SPACE view of the noised latent carries eps at full
+    model-space scale (SNR matches the timestep sigma).
+
+    Before the fix, VAE-space x was noised with model-space eps directly:
+    for SDXL (scale_factor 0.13025) the model then saw
+    s*x + s*sigma*eps — noise 7.7x too small for the claimed timestep.
+    """
+
+    def _make_adapters(self, scale=0.13025):
+        """EPS-model mock with a pure-scaling latent format (SDXL-like)."""
+        import sys
+        import types
+        sys.path.insert(0, str(pathlib.Path(__file__).parent.parent))
+
+        def noise_scaling(sigma, noise, latent_image):
+            sigma_r = sigma.reshape(sigma.shape + (1,) * (latent_image.ndim - sigma.ndim))
+            return sigma_r * noise + latent_image
+
+        EpsClass = type("EPS", (), {})
+        ModelSampling = type("ModelSampling", (EpsClass,), {})
+        ms_instance = ModelSampling()
+        ms_instance.noise_scaling = noise_scaling
+        ms_instance.timestep = lambda sigma: sigma * 999.0
+
+        model = types.SimpleNamespace()
+        model.model = types.SimpleNamespace(model_sampling=ms_instance)
+
+        def process_latent_in(t):
+            return t * scale
+
+        def process_latent_out(t):
+            return t / scale
+
+        from src.pixelrush_node import _make_forward_step, _make_reverse_step
+        forward = _make_forward_step(model, process_latent_in, process_latent_out)
+        reverse = _make_reverse_step(model, process_latent_in, process_latent_out)
+        return forward, reverse, process_latent_in, scale
+
+    def test_forward_step_produces_model_space_snr(self):
+        """process_latent_in(forward(x, eps, sigma)) == s*x + sigma*eps.
+
+        This is the core exactness property: the model-space view of the
+        noised latent must carry the eps at full model-space scale.
+        """
+        forward, _, process_latent_in, s = self._make_adapters()
+        x = torch.randn(1, 4, 8, 8)          # VAE space
+        eps = torch.randn(1, 4, 8, 8)       # model space
+        sigma = torch.tensor([0.5])
+        x_k_vae = forward(x, eps, sigma)
+        model_view = process_latent_in(x_k_vae)
+        expected = s * x + 0.5 * eps         # s*x + sigma*eps
+        assert torch.allclose(model_view, expected, atol=1e-5), (
+            "forward_step must produce s*x + sigma*eps in model space "
+            f"(got max err {(model_view - expected).abs().max():.3e}; the "
+            "pre-fix bug gave s*x + s*sigma*eps — noise 7.7x too small)"
+        )
+
+    def test_reverse_step_round_trip_identity(self):
+        """reverse(forward(x, e, sigma), e, sigma) must return x exactly."""
+        forward, reverse, _, _ = self._make_adapters()
+        x = torch.randn(2, 4, 8, 8)
+        eps = torch.randn(2, 4, 8, 8)
+        for sigma_val in (0.1, 0.6, 0.9):
+            sigma = torch.tensor([sigma_val])
+            x_k = forward(x, eps, sigma)
+            x_rec = reverse(x_k, eps, sigma)
+            assert torch.allclose(x_rec, x, atol=1e-4), (
+                f"round trip failed at sigma={sigma_val}"
+            )
+
+    def test_forward_reverse_preserve_vae_space_magnitude(self):
+        """With realistic SDXL magnitudes (VAE std ~7.7, eps std ~1), the
+        model-space noise/signal ratio of forward output must equal sigma."""
+        forward, _, process_latent_in, s = self._make_adapters()
+        x = 7.7 * torch.randn(1, 4, 16, 16)   # VAE space
+        eps = 1.0 * torch.randn(1, 4, 16, 16)  # model space
+        sigma = torch.tensor([0.25])
+        x_k_vae = forward(x, eps, sigma)
+        model_view = process_latent_in(x_k_vae)
+        noise_part = model_view - s * x
+        assert torch.allclose(noise_part, 0.25 * eps, atol=1e-4), (
+            "noise component in model space must be exactly sigma*eps"
+        )
+        ratio = noise_part.std() / (s * x).std()
+        assert abs(ratio.item() - 0.25) < 0.05, (
+            f"noise/signal ratio must match sigma (0.25), got {ratio.item():.3f}"
+        )
+
+
+@pytest.mark.unit
+class TestPrepareInitialLatent:
+    """Tests for _prepare_initial_latent under the always-VAE convention
+    (plan 2026-09-02 Step 7): no space conversion, 3D shape normalization
+    only.
     """
 
     def _import_helper(self):
@@ -1211,65 +1443,265 @@ class TestPrepareInitialLatent:
         from src.pixelrush_node import _prepare_initial_latent
         return _prepare_initial_latent
 
-    def test_vae_space_skips_process_latent_in(self):
-        """operate_in_vae_space=True must NOT call process_latent_in (SDXL fix)."""
+    def test_never_applies_process_latent_in(self):
+        """The helper must never scale the latent (space conversions live in
+        the adapters)."""
         helper = self._import_helper()
         latent = torch.randn(1, 4, 32, 32)
-        calls = []
-        def process_latent_in(x):
-            calls.append(1)
-            return x * 0.13025
-        out = helper(latent, process_latent_in, latent_dimensions=2,
-                     operate_in_vae_space=True)
-        assert len(calls) == 0, "process_latent_in must be skipped in VAE space"
-        assert torch.equal(out, latent), "latent must be unchanged in VAE space"
+        out = helper(latent, latent_dimensions=2)
+        assert torch.equal(out, latent)
 
-    def test_model_space_applies_process_latent_in(self):
-        """operate_in_vae_space=False must call process_latent_in (legacy path)."""
-        helper = self._import_helper()
-        latent = torch.randn(1, 4, 32, 32)
-        calls = []
-        def process_latent_in(x):
-            calls.append(1)
-            return x * 0.13025
-        out = helper(latent, process_latent_in, latent_dimensions=2,
-                     operate_in_vae_space=False)
-        assert len(calls) == 1, "process_latent_in must be called in model space"
-        assert torch.allclose(out, latent * 0.13025)
-
-    def test_none_process_latent_in_is_noop(self):
-        """process_latent_in=None must be a no-op in both modes."""
-        helper = self._import_helper()
-        latent = torch.randn(1, 4, 32, 32)
-        out_vae = helper(latent, None, latent_dimensions=2, operate_in_vae_space=True)
-        out_model = helper(latent, None, latent_dimensions=2, operate_in_vae_space=False)
-        assert torch.equal(out_vae, latent)
-        assert torch.equal(out_model, latent)
-
-    def test_3d_unsqueezes_before_process_latent_in(self):
-        """3D model-space path must unsqueeze 4D -> 5D before process_latent_in."""
+    def test_3d_unsqueezes_4d_to_5d(self):
+        """3D latent models: 4D input is unsqueezed to 5D [B, C, 1, H, W]."""
         helper = self._import_helper()
         latent = torch.randn(1, 4, 32, 32)  # 4D
-        seen_shape = {}
-        def process_latent_in(x):
-            seen_shape["shape"] = tuple(x.shape)
-            return x
-        out = helper(latent, process_latent_in, latent_dimensions=3,
-                     operate_in_vae_space=False)
-        assert seen_shape["shape"] == (1, 4, 1, 32, 32), (
-            f"3D process_latent_in should receive 5D, got {seen_shape['shape']}"
-        )
+        out = helper(latent, latent_dimensions=3)
         assert tuple(out.shape) == (1, 4, 1, 32, 32)
 
-    def test_3d_vae_space_skips_process_latent_in(self):
-        """3D VAE-space path must NOT call process_latent_in and keep 4D."""
+    def test_3d_5d_passthrough(self):
+        """5D input stays 5D unchanged."""
         helper = self._import_helper()
-        latent = torch.randn(1, 4, 32, 32)
-        calls = []
-        def process_latent_in(x):
-            calls.append(1)
+        latent = torch.randn(1, 4, 1, 32, 32)
+        out = helper(latent, latent_dimensions=3)
+        assert torch.equal(out, latent)
+
+
+@pytest.mark.unit
+class TestEmptyConditioningCFG:
+    """Plan 2026-09-02 Step 8: empty-negative CFG fix + empty-positive error.
+
+    Previously run_cond("negative") returned zeros for an empty negative
+    list, so CFG degenerated to eps = cfg_scale * eps_cond (7x amplification
+    at the default). Now an empty negative returns the conditional eps
+    unchanged, and an empty positive raises ValueError.
+    """
+
+    def _build_predict_eps(self, positive, negative, cfg_scale=7.0):
+        """Build a real _make_predict_eps against the conftest comfy stubs.
+
+        The stubbed process_conds returns the conditioning dict verbatim and
+        get_area_and_mult returns a minimal object; the mocked
+        diffusion_model returns a fixed eps per prompt so CFG is observable.
+        """
+        import sys
+        import types
+        sys.path.insert(0, str(pathlib.Path(__file__).parent.parent))
+
+        import torch as _torch
+        import comfy.samplers  # noqa: F401  (conftest stubs)
+
+        # --- model mock with per-prompt eps ---
+        POS_EPS = 0.5
+        NEG_EPS = 1.5
+
+        class _Diffusion:
+            def __call__(self, xc, t, context=None, control=None,
+                         transformer_options=None, **kw):
+                # context carries which prompt this run is for via extra_conds;
+                # simpler: the stub passes c_crossattn=marker tensor
+                marker = kw.get("marker", context)
+                if marker is not None and float(marker.flatten()[0]) == -1.0:
+                    return _torch.full_like(xc, NEG_EPS)
+                return _torch.full_like(xc, POS_EPS)
+
+        model = types.SimpleNamespace()
+        model.load_device = _torch.device("cpu")
+        model.pre_run = lambda: None
+        model.apply_hooks = lambda hooks=None: {}
+        model.model = types.SimpleNamespace()
+
+        def process_latent_in(t):
+            return t
+
+        model.model.process_latent_in = process_latent_in
+
+        ms = types.SimpleNamespace()
+        EpsClass = type("EPS", (), {})
+        MS = type("ModelSampling", (EpsClass,), {})
+        ms_instance = MS()
+        ms_instance.sigma = lambda ts: ts
+        ms_instance.timestep = lambda sigma: sigma * 999.0
+        ms_instance.sigma_data = 1.0
+
+        def calculate_input(sigma, x):
             return x
-        out = helper(latent, process_latent_in, latent_dimensions=3,
-                     operate_in_vae_space=True)
-        assert len(calls) == 0
-        assert tuple(out.shape) == (1, 4, 32, 32)
+
+        ms_instance.calculate_input = calculate_input
+        model.model.model_sampling = ms_instance
+        model.model.get_dtype_inference = lambda: _torch.float32
+        model.model.current_patcher = None
+        model.model.process_timestep = lambda t, **kw: t
+        model.model.diffusion_model = _Diffusion()
+
+        # Conditioning: list entries are dicts whose c_crossattn marker
+        # selects the prompt (1.0 pos, -1.0 neg); empty list = empty cond.
+        def mk(marker):
+            return {"c_crossattn": _torch.tensor([[marker]])}
+
+        from src.pixelrush_node import _make_predict_eps
+        return _make_predict_eps(
+            model,
+            [mk(1.0)] if positive else [],
+            [mk(-1.0)] if negative else [],
+            cfg_scale,
+            latent_dimensions=2,
+        ), POS_EPS, NEG_EPS
+
+    def test_empty_negative_returns_cond_eps(self):
+        """Empty negative + cfg=7.0: returned eps must equal eps_cond
+        EXACTLY (before the fix it was 7x eps_cond)."""
+        import torch.nn.functional as F
+        predict_eps, pos_eps, _ = self._build_predict_eps(
+            positive=True, negative=False, cfg_scale=7.0)
+        latent = torch.zeros(1, 4, 8, 8)
+        eps = predict_eps(latent, timestep=0)
+        # diffusion returned constant POS_EPS everywhere -> eps == pos_eps
+        assert torch.allclose(eps, torch.full_like(eps, pos_eps), atol=1e-5), (
+            f"Empty negative must return eps_cond unchanged; got mean "
+            f"{eps.mean().item():.3f}, expected {pos_eps} (pre-fix bug gave "
+            f"cfg_scale*eps_cond = {7.0 * pos_eps:.3f})"
+        )
+
+    def test_cfg_applied_when_negative_present(self):
+        """Non-empty negative + cfg=2.0: eps == eps_uncond + 2*(eps_cond - eps_uncond)."""
+        predict_eps, pos_eps, neg_eps = self._build_predict_eps(
+            positive=True, negative=True, cfg_scale=2.0)
+        latent = torch.zeros(1, 4, 8, 8)
+        eps = predict_eps(latent, timestep=0)
+        expected = neg_eps + 2.0 * (pos_eps - neg_eps)
+        assert torch.allclose(eps, torch.full_like(eps, expected), atol=1e-5), (
+            f"CFG must apply when negative is present; got mean {eps.mean().item():.3f}, "
+            f"expected {expected:.3f}"
+        )
+
+    def test_empty_positive_raises(self):
+        """Empty positive must raise ValueError with a clear message."""
+        predict_eps, _, _ = self._build_predict_eps(
+            positive=False, negative=True, cfg_scale=7.0)
+        latent = torch.zeros(1, 4, 8, 8)
+        with pytest.raises(ValueError, match="positive conditioning"):
+            predict_eps(latent, timestep=0)
+
+
+@pytest.mark.unit
+class TestRefinerModelInput:
+    """Plan 2026-09-02 Step 9: optional separate refiner model (G4).
+
+    Paper setup: SDXL base generator + SDXL-Turbo (ADD-distilled) refiner.
+    When refiner_model is provided it drives the K-timestep refinement; the
+    base model drives the 0-timestep inversion. When absent, the base model
+    is reused for both (an intentional choice the corrected theory allows).
+    """
+
+    def _read_source(self):
+        return (pathlib.Path(__file__).parent.parent / "src" / "pixelrush_node.py").read_text(encoding="utf-8")
+
+    def test_schema_has_optional_refiner_model(self):
+        content = self._read_source()
+        assert 'io.Model.Input(' in content
+        assert '"refiner_model"' in content
+        assert "optional=True" in content, (
+            "refiner_model input must be optional (base model reused by default)"
+        )
+
+    def test_execute_buys_distinct_adapters(self):
+        """execute must build inversion_eps from the base model and
+        refiner_eps from refiner_model when provided (or reuse inversion_eps
+        when not)."""
+        content = self._read_source()
+        assert "inversion_eps = _make_predict_eps(" in content
+        assert "refiner_eps = _make_predict_eps(" in content, (
+            "execute must build a separate refiner_eps from refiner_model"
+        )
+        assert "refiner_model is not None and refiner_model is not model" in content, (
+            "refiner eps must only be rebuilt when a distinct refiner model is given"
+        )
+        # The cascade must receive both adapters
+        assert "inversion_eps=inversion_eps" in content
+        assert "refiner_eps=refiner_eps" in content
+
+    def test_refiner_model_none_uses_base_for_both(self):
+        """No refiner_model: all model calls hit the base model object."""
+        import sys
+        import types
+        sys.path.insert(0, str(pathlib.Path(__file__).parent.parent))
+        from src.pixelrush import PixelRushConfig, pixelrush_cascade
+
+        calls = []
+
+        def make_eps(tag):
+            def eps_fn(latent, timestep):
+                calls.append((tag, timestep))
+                return torch.zeros_like(latent)
+            return eps_fn
+
+        # Simulate the execute() wiring with refiner_model=None
+        base_eps = make_eps("base")
+        refiner_model = None
+        if refiner_model is not None and refiner_model is not object():
+            refiner_eps = make_eps("refiner")
+        else:
+            refiner_eps = base_eps
+
+        def vae_decode(z):
+            return z[:, :3] if z.shape[1] >= 3 else z
+
+        def vae_encode(x):
+            return x[:, :4] if x.shape[1] >= 4 else x
+
+        cfg = PixelRushConfig(patch_h=32, patch_w=32, overlap=0.5,
+                              k_timestep=249, noise_lambda=0.95,
+                              noise_injection="additive")
+        pixelrush_cascade(
+            torch.randn(1, 4, 32, 32), num_cascade_stages=1,
+            vae_decode=vae_decode, vae_encode=vae_encode,
+            inversion_eps=base_eps, refiner_eps=refiner_eps,
+            alpha_bar_at=lambda t: 0.8, cfg=cfg,
+        )
+        tags = {c[0] for c in calls}
+        assert tags == {"base"}, (
+            f"Without refiner_model only the base adapter may run; got {tags}"
+        )
+
+    def test_refiner_model_provided_uses_refiner_at_k(self):
+        """Distinct refiner: base model called once (t=0) and refiner once
+        (t=K) per patch — the G4 acceptance test."""
+        import sys
+        sys.path.insert(0, str(pathlib.Path(__file__).parent.parent))
+        from src.pixelrush import PixelRushConfig, refine_latent_once
+
+        base_calls, refiner_calls = [], []
+
+        def base_eps(latent, timestep):
+            base_calls.append(timestep)
+            return torch.zeros_like(latent)
+
+        def refiner_eps_fn(latent, timestep):
+            refiner_calls.append(timestep)
+            return 0.1 * torch.ones_like(latent)
+
+        cfg = PixelRushConfig(patch_h=32, patch_w=32, overlap=0.5,
+                              k_timestep=249, noise_lambda=0.95,
+                              noise_injection="additive")
+        refine_latent_once(
+            torch.randn(1, 4, 32, 32),
+            base_eps, refiner_eps_fn,
+            lambda t: 0.8, cfg,
+        )
+        assert base_calls == [0], (
+            f"Base model must be called exactly once at t=0; got {base_calls}"
+        )
+        assert refiner_calls == [249], (
+            f"Refiner must be called exactly once at t=K=249; got {refiner_calls}"
+        )
+
+    def test_refiner_receives_same_conditioning(self):
+        """execute must pass the same positive/negative to both adapters."""
+        content = self._read_source()
+        start = content.index("inversion_eps = _make_predict_eps(")
+        end = content.index("alpha_bar_at = _make_alpha_bar_at")
+        section = content[start:end]
+        assert section.count("positive, negative, cfg, latent_dimensions") == 2, (
+            "Both inversion and refiner adapters must receive the same "
+            "positive/negative/cfg/latent_dimensions"
+        )

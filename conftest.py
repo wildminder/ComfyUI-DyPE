@@ -174,15 +174,70 @@ def _install_comfyui_mocks():
     mock_model_sampling.CONST = CONST
     mock_model_sampling.ModelSamplingFlux = ModelSamplingFlux
 
+    # --- comfy.model_management / samplers / sampler_helpers / utils ---
+    # Minimal stubs so tests can call _make_predict_eps (conditioning
+    # pipeline, model loading) with injected mock models (plan 2026-09-02).
+    mock_model_management = types.ModuleType("comfy.model_management")
+
+    def _load_models_gpu(models):
+        pass
+
+    def _cast_to_device(t, device, dtype):
+        return t
+
+    mock_model_management.load_models_gpu = _load_models_gpu
+    mock_model_management.cast_to_device = _cast_to_device
+
+    mock_samplers = types.ModuleType("comfy.samplers")
+
+    class _AreaMult:
+        def __init__(self, input_x, conditioning):
+            self.input_x = input_x
+            self.conditioning = conditioning
+
+    def _get_area_and_mult(cond, latent, sigma):
+        return _AreaMult(latent, cond)
+
+    def _cond_cat(conds):
+        merged = {}
+        for d in conds:
+            merged.update(d)
+        return merged
+
+    def _process_conds(model, noise, conds_dict, device):
+        return conds_dict
+
+    mock_samplers.get_area_and_mult = _get_area_and_mult
+    mock_samplers.cond_cat = _cond_cat
+    mock_samplers.process_conds = _process_conds
+
+    mock_sampler_helpers = types.ModuleType("comfy.sampler_helpers")
+
+    def _convert_cond(c):
+        return list(c)
+
+    mock_sampler_helpers.convert_cond = _convert_cond
+
+    mock_comfy_utils = types.ModuleType("comfy.utils")
+    mock_comfy_utils.pack_latents = lambda out: (out, None)
+
     # --- comfy (top-level) ---
     mock_comfy = types.ModuleType("comfy")
     mock_comfy.model_patcher = mock_model_patcher
     mock_comfy.model_sampling = mock_model_sampling
+    mock_comfy.model_management = mock_model_management
+    mock_comfy.samplers = mock_samplers
+    mock_comfy.sampler_helpers = mock_sampler_helpers
+    mock_comfy.utils = mock_comfy_utils
 
     # Register all in sys.modules
     sys.modules["comfy"] = mock_comfy
     sys.modules["comfy.model_patcher"] = mock_model_patcher
     sys.modules["comfy.model_sampling"] = mock_model_sampling
+    sys.modules["comfy.model_management"] = mock_model_management
+    sys.modules["comfy.samplers"] = mock_samplers
+    sys.modules["comfy.sampler_helpers"] = mock_sampler_helpers
+    sys.modules["comfy.utils"] = mock_comfy_utils
     sys.modules["comfy_api"] = mock_comfy_api
     sys.modules["comfy_api.latest"] = mock_comfy_api_latest
 
