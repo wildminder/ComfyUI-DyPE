@@ -745,13 +745,17 @@ class PixelRushNode(io.ComfyNode):
             prev_patches = sum(stage_patch_counts[:stage]) if stage > 0 else 0
             pbar.update_absolute(prev_patches + patch_idx)
 
-        # Run PixelRush cascade (works in 4D spatial)
+        # Run PixelRush cascade (works in 4D spatial). The same base model
+        # drives both the inversion and the refinement for now — an
+        # intentional choice the corrected theory allows; a separate
+        # refiner model input is added in a later step of plan 2026-09-02.
         result_latent_4d = pixelrush_cascade(
             initial_latent=initial_latent_4d,
             num_cascade_stages=num_cascade_stages,
             vae_decode=vae_decode,
             vae_encode=vae_encode,
-            predict_eps=predict_eps,
+            inversion_eps=predict_eps,
+            refiner_eps=predict_eps,
             alpha_bar_at=alpha_bar_at,
             cfg=cfg_obj,
             progress_callback=progress_callback,

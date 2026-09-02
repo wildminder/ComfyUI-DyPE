@@ -394,39 +394,45 @@ class TestRefineLatentOnce:
     def test_output_shape(self):
         cfg = PixelRushConfig(patch_h=32, patch_w=32, overlap=0.5)
         latent = torch.randn(1, 4, 64, 64)
-        result = refine_latent_once(latent, self._mock_predict_eps(), self._mock_alpha_bar(), cfg)
+        result = refine_latent_once(latent, self._mock_predict_eps(), self._mock_predict_eps(),
+            self._mock_alpha_bar(), cfg)
         assert result.shape == latent.shape
 
     def test_no_nan(self):
         cfg = PixelRushConfig(patch_h=32, patch_w=32, overlap=0.5)
         latent = torch.randn(1, 4, 64, 64)
-        result = refine_latent_once(latent, self._mock_predict_eps(), self._mock_alpha_bar(), cfg)
+        result = refine_latent_once(latent, self._mock_predict_eps(), self._mock_predict_eps(),
+            self._mock_alpha_bar(), cfg)
         assert not torch.isnan(result).any()
 
     def test_single_patch(self):
         """When latent == patch size, only one patch."""
         cfg = PixelRushConfig(patch_h=64, patch_w=64, overlap=0.5)
         latent = torch.randn(1, 4, 64, 64)
-        result = refine_latent_once(latent, self._mock_predict_eps(), self._mock_alpha_bar(), cfg)
+        result = refine_latent_once(latent, self._mock_predict_eps(), self._mock_predict_eps(),
+            self._mock_alpha_bar(), cfg)
         assert result.shape == latent.shape
 
     def test_multiple_patches(self):
         cfg = PixelRushConfig(patch_h=32, patch_w=32, overlap=0.5)
         latent = torch.randn(1, 4, 128, 128)
-        result = refine_latent_once(latent, self._mock_predict_eps(), self._mock_alpha_bar(), cfg)
+        result = refine_latent_once(latent, self._mock_predict_eps(), self._mock_predict_eps(),
+            self._mock_alpha_bar(), cfg)
         assert result.shape == latent.shape
 
     def test_non_square(self):
         cfg = PixelRushConfig(patch_h=32, patch_w=32, overlap=0.5)
         latent = torch.randn(1, 4, 64, 128)
-        result = refine_latent_once(latent, self._mock_predict_eps(), self._mock_alpha_bar(), cfg)
+        result = refine_latent_once(latent, self._mock_predict_eps(), self._mock_predict_eps(),
+            self._mock_alpha_bar(), cfg)
         assert result.shape == latent.shape
 
     def test_weight_normalization(self):
         """Output should be properly normalized (weight_sum > 0 everywhere)."""
         cfg = PixelRushConfig(patch_h=32, patch_w=32, overlap=0.5, gaussian_sigma=8.0)
         latent = torch.randn(1, 4, 64, 64)
-        result = refine_latent_once(latent, self._mock_predict_eps(), self._mock_alpha_bar(), cfg)
+        result = refine_latent_once(latent, self._mock_predict_eps(), self._mock_predict_eps(),
+            self._mock_alpha_bar(), cfg)
         # Result should be finite (not inf/nan from division)
         assert torch.isfinite(result).all()
 
@@ -464,10 +470,8 @@ class TestRefineLatentOnceAdapterCombos:
         cfg = PixelRushConfig(patch_h=32, patch_w=32, overlap=0.5)
         latent = torch.randn(1, 4, 64, 64)
         result = refine_latent_once(
-            latent,
-            self._mock_predict_eps(),
-            self._mock_alpha_bar(),
-            cfg,
+            latent, self._mock_predict_eps(), self._mock_predict_eps(),
+            self._mock_alpha_bar(), cfg,
             sigma_at=self._sigma_at(),
         )
         assert torch.isfinite(result).all()
@@ -477,10 +481,8 @@ class TestRefineLatentOnceAdapterCombos:
         cfg = PixelRushConfig(patch_h=32, patch_w=32, overlap=0.5)
         latent = torch.randn(1, 4, 64, 64)
         result = refine_latent_once(
-            latent,
-            self._mock_predict_eps(),
-            self._mock_alpha_bar(),
-            cfg,
+            latent, self._mock_predict_eps(), self._mock_predict_eps(),
+            self._mock_alpha_bar(), cfg,
             forward_step=lambda x_0, eps, sigma: x_0 + sigma * eps,
             sigma_at=self._sigma_at(),
         )
@@ -491,10 +493,8 @@ class TestRefineLatentOnceAdapterCombos:
         cfg = PixelRushConfig(patch_h=32, patch_w=32, overlap=0.5)
         latent = torch.randn(1, 4, 64, 64)
         result = refine_latent_once(
-            latent,
-            self._mock_predict_eps(),
-            self._mock_alpha_bar(),
-            cfg,
+            latent, self._mock_predict_eps(), self._mock_predict_eps(),
+            self._mock_alpha_bar(), cfg,
             reverse_step=lambda x_K, eps_inj, sigma: x_K - sigma * eps_inj,
             sigma_at=self._sigma_at(),
         )
@@ -513,6 +513,7 @@ class TestRefineLatentOnceAdapterCombos:
         result = refine_latent_once(
             latent,
             self._mock_predict_eps(),
+            self._mock_predict_eps(),
             alpha_bar_at,
             cfg,
             forward_step=lambda x_0, eps, sigma: x_0 + sigma * eps,
@@ -520,6 +521,114 @@ class TestRefineLatentOnceAdapterCombos:
             sigma_at=self._sigma_at(),
         )
         assert torch.isfinite(result).all()
+
+
+# ---------------------------------------------------------------------------
+# inversion_eps / refiner_eps separation (corrected theory)
+# ---------------------------------------------------------------------------
+
+@pytest.mark.unit
+class TestAdapterSeparation:
+    """The core must call inversion_eps at t=0 and refiner_eps at t=K,
+    and the two adapters must be independently replaceable (paper uses a
+    separate distilled refiner, e.g. SDXL-Turbo)."""
+
+    def _make_cfg(self):
+        return PixelRushConfig(patch_h=32, patch_w=32, overlap=0.5, k_timestep=249)
+
+    def _recording_eps(self, calls, scale=1.0):
+        def eps_fn(latent, timestep):
+            calls.append((latent.clone(), timestep))
+            return scale * torch.ones_like(latent)
+        return eps_fn
+
+    def test_inversion_eps_called_at_zero_refiner_at_k(self):
+        calls_inv, calls_ref = [], []
+        cfg = self._make_cfg()
+        latent = torch.randn(1, 4, 32, 32)
+        refine_latent_once(
+            latent,
+            self._recording_eps(calls_inv),
+            self._recording_eps(calls_ref),
+            lambda t: 0.8,
+            cfg,
+        )
+        assert len(calls_inv) == 1, (
+            f"inversion_eps must be called exactly once per patch, got {len(calls_inv)}"
+        )
+        assert calls_inv[0][1] == 0, (
+            f"inversion_eps must be called at timestep 0, got {calls_inv[0][1]}"
+        )
+        assert len(calls_ref) == 1, (
+            f"refiner_eps must be called exactly once per patch, got {len(calls_ref)}"
+        )
+        assert calls_ref[0][1] == 249, (
+            f"refiner_eps must be called at timestep K=249, got {calls_ref[0][1]}"
+        )
+
+    def test_distinct_adapters_produce_distinct_output(self):
+        """A refiner returning 2x the base eps must change the refined output.
+
+        Guards against the separation silently re-merging into one adapter.
+        """
+        cfg = self._make_cfg()
+        torch.manual_seed(0)
+        latent = torch.randn(1, 4, 64, 64)
+
+        def base_eps(latent, timestep):
+            return torch.ones_like(latent)
+
+        def double_eps(latent, timestep):
+            return 2.0 * torch.ones_like(latent)
+
+        out_base = refine_latent_once(
+            latent, base_eps, base_eps, lambda t: 0.8, cfg)
+        out_double_refiner = refine_latent_once(
+            latent, base_eps, double_eps, lambda t: 0.8, cfg)
+        assert not torch.allclose(out_base, out_double_refiner), (
+            "A distinct refiner eps must change the refined output"
+        )
+
+    def test_cascade_forwards_both_adapters(self):
+        """pixelrush_cascade must pass each adapter to every stage."""
+        calls_inv, calls_ref = [], []
+        cfg = self._make_cfg()
+
+        def vae_decode(z):
+            return z[:, :3] if z.shape[1] >= 3 else z.repeat(1, 1, 1, 1)[:, :, :3]
+
+        def vae_encode(x):
+            b, c, h, w = x.shape
+            if c >= 4:
+                return x[:, :4]
+            return x.repeat(1, 4 // c + 1, 1, 1)[:, :4]
+
+        pixelrush_cascade(
+            torch.randn(1, 4, 32, 32),
+            num_cascade_stages=2,
+            vae_decode=vae_decode,
+            vae_encode=vae_encode,
+            inversion_eps=self._recording_eps(calls_inv),
+            refiner_eps=self._recording_eps(calls_ref),
+            alpha_bar_at=lambda t: 0.8,
+            cfg=cfg,
+        )
+        # Stage 1: 1 patch (64x64 latent == 32x32 patch? No: 32->64 latent,
+        # patch 32x32, overlap 0.5 -> 3x3=9 patches). Stage 2: 128x128 -> 7x7
+        # starts... just require both stages saw both adapters.
+        assert len(calls_inv) == len(calls_ref) > 0
+        # Inversion at t=0 only, refiner at t=K only, across all stages
+        assert all(c[1] == 0 for c in calls_inv)
+        assert all(c[1] == 249 for c in calls_ref)
+
+    def test_no_predict_eps_kwarg_in_source(self):
+        """Guard: the core source must not keep the merged predict_eps kwarg."""
+        import pathlib
+        content = (pathlib.Path(__file__).parent.parent / "src" / "pixelrush.py").read_text(encoding="utf-8")
+        assert "predict_eps=" not in content, (
+            "src/pixelrush.py still passes the merged predict_eps= kwarg; use "
+            "inversion_eps=/refiner_eps="
+        )
 
 
 # ---------------------------------------------------------------------------
@@ -561,7 +670,8 @@ class TestPixelRushCascade:
             z0, num_cascade_stages=1,
             vae_decode=self._mock_vae_decode(),
             vae_encode=self._mock_vae_encode(),
-            predict_eps=self._mock_predict_eps(),
+            inversion_eps=self._mock_predict_eps(),
+            refiner_eps=self._mock_predict_eps(),
             alpha_bar_at=self._mock_alpha_bar(),
             cfg=cfg,
         )
@@ -576,7 +686,8 @@ class TestPixelRushCascade:
             z0, num_cascade_stages=2,
             vae_decode=self._mock_vae_decode(),
             vae_encode=self._mock_vae_encode(),
-            predict_eps=self._mock_predict_eps(),
+            inversion_eps=self._mock_predict_eps(),
+            refiner_eps=self._mock_predict_eps(),
             alpha_bar_at=self._mock_alpha_bar(),
             cfg=cfg,
         )
@@ -591,7 +702,8 @@ class TestPixelRushCascade:
             z0, num_cascade_stages=1,
             vae_decode=self._mock_vae_decode(),
             vae_encode=self._mock_vae_encode(),
-            predict_eps=self._mock_predict_eps(),
+            inversion_eps=self._mock_predict_eps(),
+            refiner_eps=self._mock_predict_eps(),
             alpha_bar_at=self._mock_alpha_bar(),
             cfg=cfg,
         )
@@ -606,7 +718,8 @@ class TestPixelRushCascade:
                 z0, num_cascade_stages=stages,
                 vae_decode=self._mock_vae_decode(),
                 vae_encode=self._mock_vae_encode(),
-                predict_eps=self._mock_predict_eps(),
+                inversion_eps=self._mock_predict_eps(),
+            refiner_eps=self._mock_predict_eps(),
                 alpha_bar_at=self._mock_alpha_bar(),
                 cfg=cfg,
             )
@@ -692,7 +805,8 @@ class TestPixelRushCascadeVAESpace:
             z0, num_cascade_stages=1,
             vae_decode=self._identity_vae_decode(),
             vae_encode=self._identity_vae_encode(),
-            predict_eps=self._realistic_predict_eps(),
+            inversion_eps=self._realistic_predict_eps(),
+            refiner_eps=self._realistic_predict_eps(),
             alpha_bar_at=self._alpha_bar_at(),
             cfg=cfg,
             forward_step=self._vae_space_forward_step(),
@@ -834,7 +948,8 @@ class TestPixelRushCompressionDiagnostics:
             z0, num_cascade_stages=1,
             vae_decode=self._identity_vae_decode(),
             vae_encode=self._identity_vae_encode(),
-            predict_eps=self._structured_predict_eps(),
+            inversion_eps=self._structured_predict_eps(),
+            refiner_eps=self._structured_predict_eps(),
             alpha_bar_at=self._alpha_bar_at(),
             cfg=cfg,
             forward_step=self._vae_space_forward_step(),
@@ -877,7 +992,8 @@ class TestPixelRushCompressionDiagnostics:
         cfg = self._make_cfg()
         refined = refine_latent_once(
             coarse_latent=coarse,
-            predict_eps=self._structured_predict_eps(),
+            inversion_eps=self._structured_predict_eps(),
+            refiner_eps=self._structured_predict_eps(),
             alpha_bar_at=self._alpha_bar_at(),
             cfg=cfg,
             forward_step=self._vae_space_forward_step(),
@@ -916,7 +1032,8 @@ class TestPixelRushCompressionDiagnostics:
             z0, num_cascade_stages=1,
             vae_decode=self._identity_vae_decode(),
             vae_encode=self._identity_vae_encode(),
-            predict_eps=self._structured_predict_eps(),
+            inversion_eps=self._structured_predict_eps(),
+            refiner_eps=self._structured_predict_eps(),
             alpha_bar_at=self._alpha_bar_at(),
             cfg=cfg,
             forward_step=self._vae_space_forward_step(),
@@ -963,7 +1080,8 @@ class TestPixelRushCompressionDiagnostics:
         cfg = self._make_cfg()
         refined = refine_latent_once(
             coarse_latent=coarse,
-            predict_eps=self._structured_predict_eps(),
+            inversion_eps=self._structured_predict_eps(),
+            refiner_eps=self._structured_predict_eps(),
             alpha_bar_at=self._alpha_bar_at(),
             cfg=cfg,
             forward_step=self._vae_space_forward_step(),

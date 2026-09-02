@@ -283,7 +283,8 @@ def ddim_reverse_one_step_to_zero(
 @torch.no_grad()
 def refine_latent_once(
     coarse_latent: Tensor,
-    predict_eps: Callable[[Tensor, int], Tensor],
+    inversion_eps: Callable[[Tensor, int], Tensor],
+    refiner_eps: Callable[[Tensor, int], Tensor],
     alpha_bar_at: Callable[[int], Tensor | float],
     cfg: PixelRushConfig,
     progress_callback: Callable[[int, int], None] | None = None,
@@ -298,9 +299,16 @@ def refine_latent_once(
     coarse_latent : Tensor
         ``[B, C, H, W]`` latent obtained by pixel-space upsampling and
         VAE encoding.
-    predict_eps : callable
-        ``predict_eps(latent, timestep) -> [B, C, H, W]`` epsilon prediction
-        (should already include CFG).
+    inversion_eps : callable
+        ``inversion_eps(latent, timestep) -> [B, C, H, W]`` epsilon
+        prediction from the BASE generator, used to drive the partial
+        DDIM inversion (should already include CFG). Distinct from
+        ``refiner_eps`` per the corrected theory — the paper uses a
+        different (distilled one-step) model for refinement.
+    refiner_eps : callable
+        ``refiner_eps(latent, timestep) -> [B, C, H, W]`` epsilon
+        prediction from the REFINER model at timestep K (should already
+        include CFG).
     alpha_bar_at : callable
         ``alpha_bar_at(K) -> alpha_cumprod[K]``.  Used only when ``forward_step``
         / ``reverse_step`` are not provided (EPS-only fallback).
@@ -379,33 +387,23 @@ def refine_latent_once(
             logger.info("PixelRush: patch %d/%d", idx + 1, total_patches)
         patch_0 = coarse_latent[:, :, y:y + cfg.patch_h, x:x + cfg.patch_w]
 
-        # 1. Partial inversion: 0 -> K
-        eps_inv = predict_eps(patch_0, timestep=0)
+        # 1. Partial inversion: 0 -> K (driven by the BASE model's eps)
+        eps_for_inversion = inversion_eps(patch_0, timestep=0)
         # Ensure eps is on the same device as the patch
-        eps_inv = eps_inv.to(patch_0.device)
+        eps_for_inversion = eps_for_inversion.to(patch_0.device)
         if forward_step is not None:
-            patch_k = forward_step(patch_0, eps_inv, sigma_k_tensor)
+            patch_k = forward_step(patch_0, eps_for_inversion, sigma_k_tensor)
         else:
-            patch_k = ddim_forward_one_step(patch_0, eps_inv, alpha_k)
+            patch_k = ddim_forward_one_step(patch_0, eps_for_inversion, alpha_k)
 
-        # 2. One-step denoise: K -> 0
-        eps_pred = predict_eps(patch_k, timestep=cfg.k_timestep)
-        eps_pred = eps_pred.to(patch_k.device)
+        # 2. One-step denoise: K -> 0 (driven by the REFINER model's eps)
+        eps_refined = refiner_eps(patch_k, timestep=cfg.k_timestep)
+        eps_refined = eps_refined.to(patch_k.device)
 
-        # 3. Noise injection
-        # The model's own prediction (eps_pred) carries the high-frequency detail
-        # of the image. The original PixelRush paper injects a slerp between
-        # eps_pred and a random vector with noise_lambda=0.95, i.e. 95% RANDOM
-        # noise. Because each patch's random component is independent, it averages
-        # out across overlapping patches (overlap 0.5 -> ~4 patches/pixel), leaving
-        # the smoothed bicubic upscale dominant and producing a "compressed" look.
-        #
-        # Fix: keep eps_pred as the PRIMARY denoising signal and add only a
-        # controlled random perturbation scaled by noise_lambda. This preserves
-        # the model's detail prediction (which drives sharpness) while still
-        # injecting stochasticity for patch-to-patch diversity.
-        eps_rand = torch.randn_like(eps_pred)
-        eps_injected = eps_pred + cfg.noise_lambda * eps_rand
+        # 3. Noise injection (still additive — slerp restored in the
+        # noise-injection step of plan 2026-09-02)
+        eps_rand = torch.randn_like(eps_refined)
+        eps_injected = eps_refined + cfg.noise_lambda * eps_rand
 
         # 4. Reverse step: K -> 0
         if reverse_step is not None:
@@ -436,7 +434,8 @@ def pixelrush_cascade(
     num_cascade_stages: int,
     vae_decode: Callable[[Tensor], Tensor],
     vae_encode: Callable[[Tensor], Tensor],
-    predict_eps: Callable[[Tensor, int], Tensor],
+    inversion_eps: Callable[[Tensor, int], Tensor],
+    refiner_eps: Callable[[Tensor, int], Tensor],
     alpha_bar_at: Callable[[int], Tensor | float],
     cfg: PixelRushConfig,
     progress_callback: Callable[[int, int, int, int], None] | None = None,
@@ -456,8 +455,12 @@ def pixelrush_cascade(
         ``vae_decode(latent) -> image`` (B, C_img, H_img, W_img).
     vae_encode : callable
         ``vae_encode(image) -> latent`` (B, C, H, W).
-    predict_eps : callable
-        ``predict_eps(latent, timestep) -> eps`` (with CFG).
+    inversion_eps : callable
+        ``inversion_eps(latent, timestep) -> eps`` from the BASE generator
+        (with CFG). Drives the partial DDIM inversion.
+    refiner_eps : callable
+        ``refiner_eps(latent, timestep) -> eps`` from the REFINER model
+        (with CFG). Drives the one-step refinement at timestep K.
     alpha_bar_at : callable
         ``alpha_bar_at(timestep) -> alpha_bar``.  Used only when the
         forward/reverse adapters are not provided (EPS-only fallback).
@@ -521,7 +524,8 @@ def pixelrush_cascade(
 
         z = refine_latent_once(
             coarse_latent=coarse_latent,
-            predict_eps=predict_eps,
+            inversion_eps=inversion_eps,
+            refiner_eps=refiner_eps,
             alpha_bar_at=alpha_bar_at,
             cfg=cfg,
             progress_callback=stage_callback,

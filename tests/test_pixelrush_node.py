@@ -441,7 +441,8 @@ class TestPixelRushVAEAdaptersFunctional:
             num_cascade_stages=1,
             vae_decode=vae_decode,
             vae_encode=vae_encode,
-            predict_eps=predict_eps,
+            inversion_eps=predict_eps,
+            refiner_eps=predict_eps,
             alpha_bar_at=alpha_bar_at,
             cfg=cfg,
         )
@@ -532,7 +533,8 @@ class TestPixelRushProgressBar:
 
         refine_latent_once(
             coarse_latent=coarse_latent,
-            predict_eps=predict_eps,
+            inversion_eps=predict_eps,
+            refiner_eps=predict_eps,
             alpha_bar_at=alpha_bar_at,
             cfg=cfg,
             progress_callback=progress_callback,
@@ -586,7 +588,8 @@ class TestPixelRushProgressBar:
             num_cascade_stages=2,
             vae_decode=vae_decode,
             vae_encode=vae_encode,
-            predict_eps=predict_eps,
+            inversion_eps=predict_eps,
+            refiner_eps=predict_eps,
             alpha_bar_at=alpha_bar_at,
             cfg=cfg,
             progress_callback=progress_callback,
