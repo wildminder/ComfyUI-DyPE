@@ -51,15 +51,12 @@ class PixelRushConfig:
         Paper default: 24.0. Rule of thumb: sigma ~ patch_size / 5.
     eps : float
         Numerical stability epsilon.
-    operate_in_vae_space : bool
-        When True (default), the algorithm runs in VAE latent space (std ≈ 1)
-        and the injected adapters convert to model space internally. This is
-        required for models whose ``process_latent_in`` scales the latent
-        (e.g. SDXL ``scale_factor=0.13025``): without it, the fixed-magnitude
-        noise injection (std ≈ 0.95) would dominate the scaled-down signal
-        (std ≈ 0.13) and produce a noisy output. When False, the legacy path
-        is used (``execute`` applies ``process_latent_in`` and the adapters
-        operate in model space).
+
+    Notes
+    -----
+    The core algorithm runs in VAE latent space (the ComfyUI LATENT
+    convention); adapters injected by the node own the VAE<->model
+    conversions internally (plan 2026-09-02).
     """
 
     patch_h: int
@@ -70,7 +67,6 @@ class PixelRushConfig:
     noise_injection: str = "slerp"
     gaussian_sigma: float = 24.0
     eps: float = 1e-8
-    operate_in_vae_space: bool = True
 
 
 # ---------------------------------------------------------------------------

@@ -1213,14 +1213,190 @@ class TestPixelRushKTimestepScaling:
 
 
 @pytest.mark.unit
-class TestPrepareInitialLatent:
-    """Tests for _prepare_initial_latent (regression guard for the SDXL
-    UnboundLocalError: cfg_obj referenced before assignment in execute).
+class TestPipelineSpaceConvention:
+    """Plan 2026-09-02 Step 7: the operate_in_vae_space flag is removed.
 
-    The guard that decides whether to apply process_latent_in to the initial
-    latent was previously inlined in execute and referenced cfg_obj (defined
-    later). Extracting it into this helper makes operate_in_vae_space an
-    explicit parameter, so it can never be undefined.
+    The pipeline is ALWAYS VAE-space at the interfaces (ComfyUI LATENT
+    convention): execute never pre-converts the initial latent, the VAE
+    adapters never apply process_latent_out/in, and predict_eps /
+    forward_step / reverse_step own the VAE<->model conversions.
+    """
+
+    def _read_source(self):
+        return (pathlib.Path(__file__).parent.parent / "src" / "pixelrush_node.py").read_text(encoding="utf-8")
+
+    @staticmethod
+    def _strip_docstrings_and_comments(content):
+        import ast
+        tree = ast.parse(content)
+        lines = content.splitlines()
+        for node in ast.walk(tree):
+            if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef, ast.Module)):
+                doc = ast.get_docstring(node, clean=False)
+                if doc:
+                    # blank out the docstring lines only
+                    for i in range(node.body[0].lineno - 1,
+                                   node.body[0].lineno - 1 + doc.count("\n") + 1):
+                        lines[i] = ""
+        code = "\n".join(lines)
+        code = "\n".join(ln.split("#")[0] for ln in code.splitlines())
+        return code
+
+    def test_no_operate_in_vae_space_flag(self):
+        """The flag must be gone from code (docstrings may mention removal)."""
+        for rel in ("src/pixelrush_node.py", "src/pixelrush.py"):
+            content = (pathlib.Path(__file__).parent.parent / rel).read_text(encoding="utf-8")
+            code = self._strip_docstrings_and_comments(content)
+            assert "operate_in_vae_space" not in code, (
+                f"{rel} must not reference the removed operate_in_vae_space flag in code"
+            )
+
+    def test_execute_never_preconverts_initial_latent(self):
+        """execute must pass the initial latent through _prepare_initial_latent
+        without process_latent_in (core runs in VAE space)."""
+        content = self._read_source()
+        assert "initial_latent = _prepare_initial_latent(" in content
+        call = content[content.index("initial_latent = _prepare_initial_latent("):]
+        call = call[:call.index(")")]
+        assert "process_latent_in" not in call, (
+            "_prepare_initial_latent must not receive process_latent_in"
+        )
+
+    def test_vae_adapters_do_not_convert_space(self):
+        """_make_vae_adapters must not apply process_latent_out/in (VAE space
+        in, VAE space out); conversions live in predict_eps/forward/reverse."""
+        content = self._read_source()
+        start = content.index("def _make_vae_adapters")
+        end = content.index("def _prepare_initial_latent")
+        section = content[start:end]
+        code = self._strip_docstrings_and_comments(section)
+        assert "process_latent_out(" not in code, (
+            "vae_decode must not call process_latent_out (latent is already in VAE space)"
+        )
+        assert "process_latent_in(" not in code, (
+            "vae_encode must not call process_latent_in (latent stays in VAE space)"
+        )
+
+    def test_predict_eps_converts_input_via_process_latent_in(self):
+        """predict_eps must convert the VAE-space latent to model space for
+        the model call (and return model-space eps)."""
+        content = self._read_source()
+        start = content.index("def _make_predict_eps")
+        end = content.index("def _make_forward_step")
+        section = content[start:end]
+        assert "process_latent_in(latent)" in section, (
+            "predict_eps must apply process_latent_in to the input latent"
+        )
+
+    def test_forward_reverse_adapters_own_conversion(self):
+        """forward/reverse adapters must convert via process_latent_in/out."""
+        content = self._read_source()
+        start = content.index("def _make_forward_step")
+        end = content.index("def _make_sigma_at")
+        section = content[start:end]
+        assert section.count("process_latent_in(x_0)") >= 1
+        assert section.count("process_latent_out(x_k_model)") >= 1
+        assert section.count("process_latent_in(x_K)") >= 1
+        assert section.count("process_latent_out(x0_model)") >= 1
+
+
+@pytest.mark.unit
+class TestAdapterSpaceConversion:
+    """The Step 7 exactness tests: forward/reverse must convert spaces such
+    that the MODEL-SPACE view of the noised latent carries eps at full
+    model-space scale (SNR matches the timestep sigma).
+
+    Before the fix, VAE-space x was noised with model-space eps directly:
+    for SDXL (scale_factor 0.13025) the model then saw
+    s*x + s*sigma*eps — noise 7.7x too small for the claimed timestep.
+    """
+
+    def _make_adapters(self, scale=0.13025):
+        """EPS-model mock with a pure-scaling latent format (SDXL-like)."""
+        import sys
+        import types
+        sys.path.insert(0, str(pathlib.Path(__file__).parent.parent))
+
+        def noise_scaling(sigma, noise, latent_image):
+            sigma_r = sigma.reshape(sigma.shape + (1,) * (latent_image.ndim - sigma.ndim))
+            return sigma_r * noise + latent_image
+
+        EpsClass = type("EPS", (), {})
+        ModelSampling = type("ModelSampling", (EpsClass,), {})
+        ms_instance = ModelSampling()
+        ms_instance.noise_scaling = noise_scaling
+        ms_instance.timestep = lambda sigma: sigma * 999.0
+
+        model = types.SimpleNamespace()
+        model.model = types.SimpleNamespace(model_sampling=ms_instance)
+
+        def process_latent_in(t):
+            return t * scale
+
+        def process_latent_out(t):
+            return t / scale
+
+        from src.pixelrush_node import _make_forward_step, _make_reverse_step
+        forward = _make_forward_step(model, process_latent_in, process_latent_out)
+        reverse = _make_reverse_step(model, process_latent_in, process_latent_out)
+        return forward, reverse, process_latent_in, scale
+
+    def test_forward_step_produces_model_space_snr(self):
+        """process_latent_in(forward(x, eps, sigma)) == s*x + sigma*eps.
+
+        This is the core exactness property: the model-space view of the
+        noised latent must carry the eps at full model-space scale.
+        """
+        forward, _, process_latent_in, s = self._make_adapters()
+        x = torch.randn(1, 4, 8, 8)          # VAE space
+        eps = torch.randn(1, 4, 8, 8)       # model space
+        sigma = torch.tensor([0.5])
+        x_k_vae = forward(x, eps, sigma)
+        model_view = process_latent_in(x_k_vae)
+        expected = s * x + 0.5 * eps         # s*x + sigma*eps
+        assert torch.allclose(model_view, expected, atol=1e-5), (
+            "forward_step must produce s*x + sigma*eps in model space "
+            f"(got max err {(model_view - expected).abs().max():.3e}; the "
+            "pre-fix bug gave s*x + s*sigma*eps — noise 7.7x too small)"
+        )
+
+    def test_reverse_step_round_trip_identity(self):
+        """reverse(forward(x, e, sigma), e, sigma) must return x exactly."""
+        forward, reverse, _, _ = self._make_adapters()
+        x = torch.randn(2, 4, 8, 8)
+        eps = torch.randn(2, 4, 8, 8)
+        for sigma_val in (0.1, 0.6, 0.9):
+            sigma = torch.tensor([sigma_val])
+            x_k = forward(x, eps, sigma)
+            x_rec = reverse(x_k, eps, sigma)
+            assert torch.allclose(x_rec, x, atol=1e-4), (
+                f"round trip failed at sigma={sigma_val}"
+            )
+
+    def test_forward_reverse_preserve_vae_space_magnitude(self):
+        """With realistic SDXL magnitudes (VAE std ~7.7, eps std ~1), the
+        model-space noise/signal ratio of forward output must equal sigma."""
+        forward, _, process_latent_in, s = self._make_adapters()
+        x = 7.7 * torch.randn(1, 4, 16, 16)   # VAE space
+        eps = 1.0 * torch.randn(1, 4, 16, 16)  # model space
+        sigma = torch.tensor([0.25])
+        x_k_vae = forward(x, eps, sigma)
+        model_view = process_latent_in(x_k_vae)
+        noise_part = model_view - s * x
+        assert torch.allclose(noise_part, 0.25 * eps, atol=1e-4), (
+            "noise component in model space must be exactly sigma*eps"
+        )
+        ratio = noise_part.std() / (s * x).std()
+        assert abs(ratio.item() - 0.25) < 0.05, (
+            f"noise/signal ratio must match sigma (0.25), got {ratio.item():.3f}"
+        )
+
+
+@pytest.mark.unit
+class TestPrepareInitialLatent:
+    """Tests for _prepare_initial_latent under the always-VAE convention
+    (plan 2026-09-02 Step 7): no space conversion, 3D shape normalization
+    only.
     """
 
     def _import_helper(self):
@@ -1229,65 +1405,24 @@ class TestPrepareInitialLatent:
         from src.pixelrush_node import _prepare_initial_latent
         return _prepare_initial_latent
 
-    def test_vae_space_skips_process_latent_in(self):
-        """operate_in_vae_space=True must NOT call process_latent_in (SDXL fix)."""
+    def test_never_applies_process_latent_in(self):
+        """The helper must never scale the latent (space conversions live in
+        the adapters)."""
         helper = self._import_helper()
         latent = torch.randn(1, 4, 32, 32)
-        calls = []
-        def process_latent_in(x):
-            calls.append(1)
-            return x * 0.13025
-        out = helper(latent, process_latent_in, latent_dimensions=2,
-                     operate_in_vae_space=True)
-        assert len(calls) == 0, "process_latent_in must be skipped in VAE space"
-        assert torch.equal(out, latent), "latent must be unchanged in VAE space"
+        out = helper(latent, latent_dimensions=2)
+        assert torch.equal(out, latent)
 
-    def test_model_space_applies_process_latent_in(self):
-        """operate_in_vae_space=False must call process_latent_in (legacy path)."""
-        helper = self._import_helper()
-        latent = torch.randn(1, 4, 32, 32)
-        calls = []
-        def process_latent_in(x):
-            calls.append(1)
-            return x * 0.13025
-        out = helper(latent, process_latent_in, latent_dimensions=2,
-                     operate_in_vae_space=False)
-        assert len(calls) == 1, "process_latent_in must be called in model space"
-        assert torch.allclose(out, latent * 0.13025)
-
-    def test_none_process_latent_in_is_noop(self):
-        """process_latent_in=None must be a no-op in both modes."""
-        helper = self._import_helper()
-        latent = torch.randn(1, 4, 32, 32)
-        out_vae = helper(latent, None, latent_dimensions=2, operate_in_vae_space=True)
-        out_model = helper(latent, None, latent_dimensions=2, operate_in_vae_space=False)
-        assert torch.equal(out_vae, latent)
-        assert torch.equal(out_model, latent)
-
-    def test_3d_unsqueezes_before_process_latent_in(self):
-        """3D model-space path must unsqueeze 4D -> 5D before process_latent_in."""
+    def test_3d_unsqueezes_4d_to_5d(self):
+        """3D latent models: 4D input is unsqueezed to 5D [B, C, 1, H, W]."""
         helper = self._import_helper()
         latent = torch.randn(1, 4, 32, 32)  # 4D
-        seen_shape = {}
-        def process_latent_in(x):
-            seen_shape["shape"] = tuple(x.shape)
-            return x
-        out = helper(latent, process_latent_in, latent_dimensions=3,
-                     operate_in_vae_space=False)
-        assert seen_shape["shape"] == (1, 4, 1, 32, 32), (
-            f"3D process_latent_in should receive 5D, got {seen_shape['shape']}"
-        )
+        out = helper(latent, latent_dimensions=3)
         assert tuple(out.shape) == (1, 4, 1, 32, 32)
 
-    def test_3d_vae_space_skips_process_latent_in(self):
-        """3D VAE-space path must NOT call process_latent_in and keep 4D."""
+    def test_3d_5d_passthrough(self):
+        """5D input stays 5D unchanged."""
         helper = self._import_helper()
-        latent = torch.randn(1, 4, 32, 32)
-        calls = []
-        def process_latent_in(x):
-            calls.append(1)
-            return x
-        out = helper(latent, process_latent_in, latent_dimensions=3,
-                     operate_in_vae_space=True)
-        assert len(calls) == 0
-        assert tuple(out.shape) == (1, 4, 32, 32)
+        latent = torch.randn(1, 4, 1, 32, 32)
+        out = helper(latent, latent_dimensions=3)
+        assert torch.equal(out, latent)

@@ -729,23 +729,6 @@ class TestPixelRushCascade:
 
 
 # ---------------------------------------------------------------------------
-# PixelRushConfig: operate_in_vae_space flag (plan 2026-08-12)
-# ---------------------------------------------------------------------------
-
-@pytest.mark.unit
-class TestPixelRushConfigVAESpace:
-    def test_default_operate_in_vae_space_true(self):
-        """Default must be True (algorithm runs in VAE space)."""
-        cfg = PixelRushConfig(patch_h=32, patch_w=32)
-        assert cfg.operate_in_vae_space is True
-
-    def test_override_operate_in_vae_space_false(self):
-        """Can be set to False (legacy model-space path)."""
-        cfg = PixelRushConfig(patch_h=32, patch_w=32, operate_in_vae_space=False)
-        assert cfg.operate_in_vae_space is False
-
-
-# ---------------------------------------------------------------------------
 # Regression: SDXL noise-dominance fix (plan 2026-08-12)
 # ---------------------------------------------------------------------------
 
@@ -818,17 +801,43 @@ class TestPixelRushCascadeVAESpace:
     def test_vae_space_cascade_signal_dominated(self):
         """Full cascade on a realistic SDXL mock must be signal-dominated.
 
-        Regression guard for the 'totally noisy' bug: out.std / z0.std < 2.0.
-        (Before the VAE-space fix this ratio was > 6.)
+        Regression guard for the 'totally noisy' bug: 0.5 < out.std/z0.std < 2.0.
+        (Before the VAE-space fix this ratio was > 6; the lower bound guards
+        against an inert/no-op refinement.)
         """
         cfg = PixelRushConfig(
             patch_h=32, patch_w=32, overlap=0.5, k_timestep=249,
-            noise_lambda=0.95, operate_in_vae_space=True,
+            noise_lambda=0.95,
         )
         z0, result = self._run_cascade(cfg)
         ratio = result.std() / z0.std()
         assert ratio < 2.0, (
             f"Output noise dominates signal (ratio={ratio:.2f}); expected < 2.0"
+        )
+        assert ratio > 0.5, (
+            f"Output is inert vs input (ratio={ratio:.2f}); refinement is a no-op?"
+        )
+
+    def test_refinement_changes_latent(self):
+        """Refinement must actually change the latent (> 1% relative delta).
+
+        Guards against the refinement collapsing to a no-op under any
+        future refactor (space-conversion or injection changes).
+        """
+        cfg = PixelRushConfig(
+            patch_h=32, patch_w=32, overlap=0.5, k_timestep=249,
+            noise_lambda=0.95,
+        )
+        z0, result = self._run_cascade(cfg)
+        # The cascade's first-stage input is the bicubic-upscaled z0; the
+        # refined result must differ from a pure passthrough meaningfully.
+        import torch.nn.functional as F
+        z0_up = F.interpolate(z0, size=result.shape[2:], mode="bicubic",
+                              align_corners=False, antialias=True)
+        rel = (result - z0_up).norm() / z0_up.norm()
+        assert rel > 0.01, (
+            f"Refinement barely changed the latent (rel={rel:.4f}); "
+            "suspect a no-op pipeline"
         )
 
     def test_vae_space_cascade_correlates_with_input(self):
@@ -836,7 +845,7 @@ class TestPixelRushCascadeVAESpace:
         import torch.nn.functional as F
         cfg = PixelRushConfig(
             patch_h=32, patch_w=32, overlap=0.5, k_timestep=249,
-            noise_lambda=0.95, operate_in_vae_space=True,
+            noise_lambda=0.95,
         )
         z0, result = self._run_cascade(cfg)
         res_down = F.interpolate(
@@ -930,8 +939,7 @@ class TestPixelRushCompressionDiagnostics:
 
     def _make_cfg(self, **overrides):
         base = dict(patch_h=32, patch_w=32, overlap=0.5, k_timestep=249,
-                    noise_lambda=0.95, noise_injection="additive",
-                    operate_in_vae_space=True)
+                    noise_lambda=0.95, noise_injection="additive")
         base.update(overrides)
         return PixelRushConfig(**base)
 
