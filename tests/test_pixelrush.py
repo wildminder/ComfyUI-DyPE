@@ -1251,8 +1251,11 @@ class TestPixelRushSlerpHF:
             sigma_at=lambda t: 0.867,
         )
         ratio = _hf_energy(refined) / _hf_energy(coarse)
-        # Provisional bound; tightened from measurements in Step 11 of the plan.
-        assert ratio >= 0.5, (
+        # Calibrated in Step 11 of plan 2026-09-02: measured 0.748 on this
+        # mock (additive companion: 0.955). Bound set to 0.6 (20% below
+        # measured) — robust to RNG stream variation while catching the
+        # space-mixing symptom (pre-fix behavior removes 25%+ HF).
+        assert ratio >= 0.6, (
             f"slerp-mode refinement removed too much HF (ratio={ratio:.3f}); "
-            "expected >= 0.5 — re-indicates the space-mixing symptom"
+            "expected >= 0.6 (calibrated; measured 0.748)"
         )
