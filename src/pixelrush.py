@@ -41,9 +41,8 @@ class PixelRushConfig:
         Noise injection strength for slerp between predicted and random
         noise.  Paper default: 0.95.
     gaussian_sigma : float
-        Gaussian feathering sigma.  Paper default: 8.0.
-    gaussian_kernel_size : int
-        Gaussian blur kernel size (must be odd).  Paper default: 41.
+        Gaussian feathering sigma for the analytic patch weight mask.
+        Paper default: 24.0. Rule of thumb: sigma ~ patch_size / 5.
     eps : float
         Numerical stability epsilon.
     operate_in_vae_space : bool
@@ -62,8 +61,7 @@ class PixelRushConfig:
     overlap: float = 0.50
     k_timestep: int = 249
     noise_lambda: float = 0.95
-    gaussian_sigma: float = 8.0
-    gaussian_kernel_size: int = 41
+    gaussian_sigma: float = 24.0
     eps: float = 1e-8
     operate_in_vae_space: bool = True
 
@@ -131,47 +129,27 @@ spherical_lerp = slerp
 # Gaussian feathering
 # ---------------------------------------------------------------------------
 
-def gaussian_kernel_2d(
-    kernel_size: int,
-    sigma: float,
-    device: torch.device,
-    dtype: torch.dtype,
-) -> Tensor:
-    """Returns a normalized ``[1, 1, K, K]`` Gaussian convolution kernel."""
-    assert kernel_size % 2 == 1, "Use an odd kernel size."
-
-    coords = torch.arange(kernel_size, device=device, dtype=dtype)
-    coords = coords - kernel_size // 2
-
-    g = torch.exp(-(coords ** 2) / (2.0 * sigma ** 2))
-    g = g / g.sum()
-
-    kernel = torch.outer(g, g)
-    return kernel[None, None]  # [1, 1, K, K]
-
-
 def gaussian_feather_mask(
     height: int,
     width: int,
     sigma: float,
-    kernel_size: int,
     device: torch.device,
     dtype: torch.dtype,
 ) -> Tensor:
-    """Create a ``[1, 1, H, W]`` smooth feather mask.
+    """Create a ``[1, 1, H, W]`` analytic Gaussian weight mask, peak = 1.
 
-    Blurs an all-one patch with zero padding.  The center remains near one,
-    and the boundaries smoothly decay — ideal for overlap-add blending.
+    Corrected-theory form: ``exp(-(xx^2 + yy^2) / (2 sigma^2))`` centered on
+    the patch and normalized so the peak is exactly 1 — an explicit encoding
+    of the paper's Gaussian-filtered patch mask, not a blurred all-ones
+    approximation. The mask is highest at the patch center and smoothly
+    decreases toward the boundaries.
     """
-    hard_mask = torch.ones((1, 1, height, width), device=device, dtype=dtype)
-    kernel = gaussian_kernel_2d(kernel_size, sigma, device, dtype)
+    y = torch.arange(height, device=device, dtype=dtype) - (height - 1) / 2.0
+    x = torch.arange(width, device=device, dtype=dtype) - (width - 1) / 2.0
+    yy, xx = torch.meshgrid(y, x, indexing="ij")
 
-    pad = kernel_size // 2
-    blurred = F.conv2d(hard_mask, kernel, padding=pad)
-
-    # Normalize peak to 1
-    blurred = blurred / blurred.amax().clamp_min(1e-8)
-    return blurred
+    mask = torch.exp(-(xx.square() + yy.square()) / (2.0 * sigma ** 2))
+    return (mask / mask.max().clamp_min(1e-8))[None, None]
 
 
 # ---------------------------------------------------------------------------
@@ -378,7 +356,6 @@ def refine_latent_once(
         cfg.patch_h,
         cfg.patch_w,
         sigma=cfg.gaussian_sigma,
-        kernel_size=cfg.gaussian_kernel_size,
         device=coarse_latent.device,
         dtype=coarse_latent.dtype,
     )  # [1, 1, patch_h, patch_w]

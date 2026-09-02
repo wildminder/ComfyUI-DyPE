@@ -10,7 +10,6 @@ from src.pixelrush import (
     ddim_forward_one_step,
     ddim_reverse_one_step_to_zero,
     gaussian_feather_mask,
-    gaussian_kernel_2d,
     patch_positions,
     pixelrush_cascade,
     predict_x0_from_epsilon,
@@ -95,62 +94,87 @@ class TestSlerp:
 
 
 # ---------------------------------------------------------------------------
-# gaussian_kernel_2d
-# ---------------------------------------------------------------------------
-
-@pytest.mark.unit
-class TestGaussianKernel2D:
-    def test_shape(self):
-        k = gaussian_kernel_2d(41, 8.0, torch.device("cpu"), torch.float32)
-        assert k.shape == (1, 1, 41, 41)
-
-    def test_normalized(self):
-        k = gaussian_kernel_2d(11, 3.0, torch.device("cpu"), torch.float32)
-        assert abs(k.sum().item() - 1.0) < 1e-5
-
-    def test_symmetric(self):
-        k = gaussian_kernel_2d(11, 3.0, torch.device("cpu"), torch.float32)
-        assert torch.allclose(k, k.flip(-1), atol=1e-6)
-        assert torch.allclose(k, k.flip(-2), atol=1e-6)
-
-    def test_center_peak(self):
-        k = gaussian_kernel_2d(11, 3.0, torch.device("cpu"), torch.float32)
-        center = k[0, 0, 5, 5]
-        assert center == k.max()
-
-    def test_odd_kernel_required(self):
-        with pytest.raises(AssertionError):
-            gaussian_kernel_2d(10, 3.0, torch.device("cpu"), torch.float32)
-
-
-# ---------------------------------------------------------------------------
-# gaussian_feather_mask
+# gaussian_feather_mask (analytic form, corrected theory)
 # ---------------------------------------------------------------------------
 
 @pytest.mark.unit
 class TestGaussianFeatherMask:
     def test_shape(self):
-        mask = gaussian_feather_mask(64, 64, 8.0, 41, torch.device("cpu"), torch.float32)
+        mask = gaussian_feather_mask(64, 64, 24.0, torch.device("cpu"), torch.float32)
         assert mask.shape == (1, 1, 64, 64)
 
-    def test_center_near_one(self):
-        mask = gaussian_feather_mask(64, 64, 8.0, 41, torch.device("cpu"), torch.float32)
-        center = mask[0, 0, 32, 32]
+    def test_center_is_exactly_one(self):
+        """Peak normalization: the center pixel must be exactly 1.0."""
+        mask = gaussian_feather_mask(64, 64, 24.0, torch.device("cpu"), torch.float32)
+        center = mask[0, 0, 32, 32]  # (height-1)/2 rounded up for even sizes
+        # For even sizes the analytic max is at (31.5, 31.5); the discrete
+        # peak is at (31,31) or (32,32) with value > 1 - tiny epsilon, then
+        # normalized. Just require the discrete max == 1 exactly and center
+        # close to 1.
+        assert mask.max().item() == pytest.approx(1.0, abs=1e-6)
         assert abs(center.item() - 1.0) < 0.01
 
-    def test_boundary_decay(self):
-        mask = gaussian_feather_mask(64, 64, 8.0, 41, torch.device("cpu"), torch.float32)
-        center = mask[0, 0, 32, 32]
-        corner = mask[0, 0, 0, 0]
-        assert corner < center
+    def test_axis_decay_matches_formula(self):
+        """Along the center row, mask[c, c+k] == exp(-k^2 / (2 sigma^2))."""
+        h = w = 65  # odd -> exact center at (32, 32)
+        sigma = 12.0
+        mask = gaussian_feather_mask(h, w, sigma, torch.device("cpu"), torch.float32)
+        c = 32
+        for k in (0, 4, 8, 16):
+            expected = math.exp(-(k ** 2) / (2.0 * sigma ** 2))
+            got = mask[0, 0, c, c + k].item()
+            assert abs(got - expected) < 1e-5, (
+                f"mask decay mismatch at offset {k}: got {got}, expected {expected}"
+            )
+
+    def test_monotonic_decay_from_center(self):
+        """Mask must be strictly decreasing with |offset| from the center."""
+        mask = gaussian_feather_mask(65, 65, 12.0, torch.device("cpu"), torch.float32)
+        row = mask[0, 0, 32, :]
+        left_half = row[:33]  # offsets -32..0
+        # Each step toward the center must increase (or stay equal)
+        assert (left_half[1:] >= left_half[:-1] - 1e-7).all()
+        right_half = row[32:]  # offsets 0..32
+        assert (right_half[1:] <= right_half[:-1] + 1e-7).all()
+
+    def test_corner_matches_formula(self):
+        """Corner value == exp(-(2*((h-1)/2)^2) / (2 sigma^2)) / peak."""
+        h = w = 33
+        sigma = 10.0
+        mask = gaussian_feather_mask(h, w, sigma, torch.device("cpu"), torch.float32)
+        half = (h - 1) / 2.0
+        r2 = 2.0 * half * half
+        expected = math.exp(-r2 / (2.0 * sigma ** 2))
+        got = mask[0, 0, 0, 0].item()
+        assert abs(got - expected) < 1e-5, (
+            f"corner mismatch: got {got}, expected {expected}"
+        )
+
+    def test_symmetry(self):
+        """180-degree rotation must leave the mask unchanged."""
+        mask = gaussian_feather_mask(32, 48, 12.0, torch.device("cpu"), torch.float32)
+        assert torch.allclose(mask, mask.flip(-1), atol=1e-6)
+        assert torch.allclose(mask, mask.flip(-2), atol=1e-6)
 
     def test_non_negative(self):
-        mask = gaussian_feather_mask(32, 32, 5.0, 21, torch.device("cpu"), torch.float32)
+        mask = gaussian_feather_mask(32, 32, 24.0, torch.device("cpu"), torch.float32)
         assert (mask >= 0).all()
 
     def test_no_nan(self):
-        mask = gaussian_feather_mask(16, 16, 3.0, 11, torch.device("cpu"), torch.float32)
+        mask = gaussian_feather_mask(16, 16, 24.0, torch.device("cpu"), torch.float32)
         assert not torch.isnan(mask).any()
+
+    def test_small_sigma_sharp_falloff(self):
+        """sigma=2 on 32x32: corner must be < 1e-5 (sigma must scale with patch).
+
+        Guards the pitfall of using the default sigma=24 on tiny patches (or a
+        tiny sigma on default patches): the analytic form's falloff is
+        exp(-r^2/(2 sigma^2)), which for sigma=2 and r~22 is astronomically
+        small — the mask must actually reach it, not clamp at some floor.
+        """
+        mask = gaussian_feather_mask(32, 32, 2.0, torch.device("cpu"), torch.float32)
+        corner = mask[0, 0, 0, 0].item()
+        assert corner < 1e-5, f"sigma=2 corner should be ~0, got {corner}"
 
 
 # ---------------------------------------------------------------------------
@@ -400,7 +424,7 @@ class TestRefineLatentOnce:
 
     def test_weight_normalization(self):
         """Output should be properly normalized (weight_sum > 0 everywhere)."""
-        cfg = PixelRushConfig(patch_h=32, patch_w=32, overlap=0.5, gaussian_sigma=4.0, gaussian_kernel_size=21)
+        cfg = PixelRushConfig(patch_h=32, patch_w=32, overlap=0.5, gaussian_sigma=8.0)
         latent = torch.randn(1, 4, 64, 64)
         result = refine_latent_once(latent, self._mock_predict_eps(), self._mock_alpha_bar(), cfg)
         # Result should be finite (not inf/nan from division)

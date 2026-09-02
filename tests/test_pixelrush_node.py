@@ -30,8 +30,7 @@ class TestPixelRushNodeSchema:
         assert "default=0.95" in content  # noise_lambda
         assert "default=0.50" in content  # overlap
         assert "default=249" in content  # k_timestep
-        assert "default=8.0" in content  # gaussian_sigma
-        assert "default=41" in content  # gaussian_kernel_size
+        assert "default=24.0" in content  # gaussian_sigma
 
     def test_node_registered_in_extension(self):
         content = (pathlib.Path(__file__).parent.parent / "__init__.py").read_text(encoding="utf-8")
@@ -433,7 +432,7 @@ class TestPixelRushVAEAdaptersFunctional:
         cfg = PixelRushConfig(
             patch_h=32, patch_w=32, overlap=0.5,
             k_timestep=249, noise_lambda=0.95,
-            gaussian_sigma=8.0, gaussian_kernel_size=41,
+            gaussian_sigma=24.0,
         )
 
         initial_latent = torch.randn(1, 16, 32, 32)
@@ -528,7 +527,7 @@ class TestPixelRushProgressBar:
         cfg = PixelRushConfig(
             patch_h=32, patch_w=32, overlap=0.5,
             k_timestep=249, noise_lambda=0.95,
-            gaussian_sigma=8.0, gaussian_kernel_size=41,
+            gaussian_sigma=24.0,
         )
 
         refine_latent_once(
@@ -578,7 +577,7 @@ class TestPixelRushProgressBar:
         cfg = PixelRushConfig(
             patch_h=32, patch_w=32, overlap=0.5,
             k_timestep=249, noise_lambda=0.95,
-            gaussian_sigma=8.0, gaussian_kernel_size=41,
+            gaussian_sigma=24.0,
         )
 
         initial_latent = torch.randn(1, 4, 32, 32)

@@ -587,12 +587,8 @@ class PixelRushNode(io.ComfyNode):
                     tooltip="Patch overlap fraction. 0.5=50% overlap.",
                 ),
                 io.Float.Input(
-                    "gaussian_sigma", default=8.0, min=1.0, max=20.0, step=0.5,
-                    tooltip="Gaussian feathering sigma for patch blending.",
-                ),
-                io.Int.Input(
-                    "gaussian_kernel_size", default=41, min=3, max=101, step=2,
-                    tooltip="Gaussian blur kernel size (must be odd).",
+                    "gaussian_sigma", default=24.0, min=1.0, max=128.0, step=0.5,
+                    tooltip="Gaussian feathering sigma for patch blending (paper default 24; rule of thumb: sigma ~ patch_size / 5).",
                 ),
                 io.Int.Input(
                     "patch_h", default=0, min=0, max=512, step=8,
@@ -611,7 +607,7 @@ class PixelRushNode(io.ComfyNode):
     @classmethod
     def execute(cls, model, vae, positive, negative, latent_image, cfg=7.0,
                 num_cascade_stages=1, k_timestep=249, noise_lambda=0.95,
-                overlap=0.50, gaussian_sigma=8.0, gaussian_kernel_size=41,
+                overlap=0.50, gaussian_sigma=24.0,
                 patch_h=0, patch_w=0) -> io.NodeOutput:
         import comfy.utils
 
@@ -697,7 +693,6 @@ class PixelRushNode(io.ComfyNode):
             k_timestep=k_timestep_scaled,
             noise_lambda=noise_lambda,
             gaussian_sigma=gaussian_sigma,
-            gaussian_kernel_size=gaussian_kernel_size,
             operate_in_vae_space=operate_in_vae_space,
         )
 
