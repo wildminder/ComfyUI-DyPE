@@ -408,6 +408,97 @@ class TestRefineLatentOnce:
 
 
 # ---------------------------------------------------------------------------
+# refine_latent_once: adapter combinations (alpha_k NameError regression)
+# ---------------------------------------------------------------------------
+
+@pytest.mark.unit
+class TestRefineLatentOnceAdapterCombos:
+    """Regression: alpha_k must be defined regardless of which adapters are given.
+
+    Previously alpha_k was only computed when sigma_at was None, so passing
+    sigma_at WITHOUT forward_step/reverse_step (or with only one of them)
+    raised NameError in the DDIM fallback branches.
+    """
+
+    def _mock_predict_eps(self):
+        def predict_eps(latent, timestep):
+            return torch.randn_like(latent)
+        return predict_eps
+
+    def _mock_alpha_bar(self):
+        def alpha_bar_at(t):
+            return 0.8
+        return alpha_bar_at
+
+    def _sigma_at(self):
+        def sigma_at(t):
+            return 0.5
+        return sigma_at
+
+    def test_sigma_at_with_fallback_ddim_no_nameerror(self):
+        """sigma_at given, BOTH adapters None: pure-DDIM fallback must not NameError."""
+        cfg = PixelRushConfig(patch_h=32, patch_w=32, overlap=0.5)
+        latent = torch.randn(1, 4, 64, 64)
+        result = refine_latent_once(
+            latent,
+            self._mock_predict_eps(),
+            self._mock_alpha_bar(),
+            cfg,
+            sigma_at=self._sigma_at(),
+        )
+        assert torch.isfinite(result).all()
+
+    def test_partial_adapters_forward_only(self):
+        """forward_step given, reverse_step None: reverse falls back to DDIM."""
+        cfg = PixelRushConfig(patch_h=32, patch_w=32, overlap=0.5)
+        latent = torch.randn(1, 4, 64, 64)
+        result = refine_latent_once(
+            latent,
+            self._mock_predict_eps(),
+            self._mock_alpha_bar(),
+            cfg,
+            forward_step=lambda x_0, eps, sigma: x_0 + sigma * eps,
+            sigma_at=self._sigma_at(),
+        )
+        assert torch.isfinite(result).all()
+
+    def test_partial_adapters_reverse_only(self):
+        """reverse_step given, forward_step None: forward falls back to DDIM."""
+        cfg = PixelRushConfig(patch_h=32, patch_w=32, overlap=0.5)
+        latent = torch.randn(1, 4, 64, 64)
+        result = refine_latent_once(
+            latent,
+            self._mock_predict_eps(),
+            self._mock_alpha_bar(),
+            cfg,
+            reverse_step=lambda x_K, eps_inj, sigma: x_K - sigma * eps_inj,
+            sigma_at=self._sigma_at(),
+        )
+        assert torch.isfinite(result).all()
+
+    def test_all_adapters_provided_ignores_alpha_bar(self):
+        """Both adapters given: alpha_bar_at must never be called."""
+        cfg = PixelRushConfig(patch_h=32, patch_w=32, overlap=0.5)
+        latent = torch.randn(1, 4, 64, 64)
+
+        def alpha_bar_at(t):
+            raise AssertionError(
+                "alpha_bar_at must not be called when both adapters are provided"
+            )
+
+        result = refine_latent_once(
+            latent,
+            self._mock_predict_eps(),
+            alpha_bar_at,
+            cfg,
+            forward_step=lambda x_0, eps, sigma: x_0 + sigma * eps,
+            reverse_step=lambda x_K, eps_inj, sigma: x_K - sigma * eps_inj,
+            sigma_at=self._sigma_at(),
+        )
+        assert torch.isfinite(result).all()
+
+
+# ---------------------------------------------------------------------------
 # pixelrush_cascade
 # ---------------------------------------------------------------------------
 

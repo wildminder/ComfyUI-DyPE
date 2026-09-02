@@ -353,8 +353,11 @@ def refine_latent_once(
         "Patch dimensions must not exceed the latent."
     )
 
-    # Sigma at timestep K (used by forward_step/reverse_step adapters).
-    # Falls back to alpha_bar for the EPS-only DDIM path.
+    # Schedule values at timestep K. sigma_k feeds the forward/reverse
+    # adapters; alpha_k feeds the EPS-only DDIM fallback transitions. alpha_k
+    # is computed whenever ANY fallback branch can execute (either adapter
+    # missing), so partially-provided adapters can never hit an undefined
+    # name — and alpha_bar_at is never called when both adapters are given.
     if sigma_at is not None:
         sigma_k = sigma_at(cfg.k_timestep)
         sigma_k_tensor = torch.tensor(
@@ -363,6 +366,8 @@ def refine_latent_once(
     else:
         sigma_k = None
         sigma_k_tensor = None
+    alpha_k = None
+    if forward_step is None or reverse_step is None:
         alpha_k = alpha_bar_at(cfg.k_timestep)
 
     # Overlap-add buffers
