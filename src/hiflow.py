@@ -97,3 +97,81 @@ def split_frequency_components_fft(
     masked = x_freq * freq_filter if is_low else x_freq * (1.0 - freq_filter)
     split = fft.ifft2(fft.ifftshift(masked)).real
     return split.to(x.dtype)
+
+
+# ---------------------------------------------------------------------------
+# Stage sigma schedule + alignment scales
+# ---------------------------------------------------------------------------
+
+def build_stage_sigmas(
+    full_sigmas: torch.Tensor,
+    tau: float,
+    steps: int,
+) -> torch.Tensor:
+    """Build the descending sigma schedule a high-res stage walks.
+
+    Mirrors the HiFlow reference ``dlfg_timesteps = timesteps[-n:]`` (R4): the
+    stage runs on the LAST ``steps`` sigmas of the model's full schedule —
+    same spacing as the base run, entered at the sigma nearest ``tau`` from
+    below — plus a trailing 0 so the walk lands on a clean sample.
+
+    Rules:
+      - the entry sigma must satisfy sigma_entry <= tau + 1e-6 (clamped to the
+        largest schedule sigma below tau; if tau exceeds sigma_max the full
+        schedule runs and a warning is logged);
+      - the result is strictly descending except for the trailing 0 and has
+        exactly ``steps`` transitions (len == steps + 1);
+      - ``tau <= 0`` or ``steps < 1`` raises ValueError.
+    """
+    if tau <= 0.0:
+        raise ValueError(f"tau must be positive; got {tau!r}")
+    if steps < 1:
+        raise ValueError(f"steps must be >= 1; got {steps!r}")
+
+    sigmas = full_sigmas.float()
+    if sigmas.numel() < 2:
+        raise ValueError(f"full_sigmas needs >= 2 entries; got {tuple(sigmas)}")
+    if not bool(torch.all(sigmas[:-1] >= sigmas[1:])):
+        raise ValueError("full_sigmas must be non-increasing")
+
+    # Interior (non-zero) sigmas; the schedule convention ends at 0.
+    interior = sigmas[sigmas > 0]
+    if tau > float(interior.max()) + 1e-9:
+        logger.warning(
+            "HiFlow: tau %.4f above schedule max %.4f — clamping the stage "
+            "entry to the full schedule", tau, float(interior.max()),
+        )
+
+    # Entry: the largest schedule sigma <= tau (fall back to the smallest
+    # interior sigma when tau sits below the whole schedule — degenerate but
+    # defined). Everything strictly below the entry is walkable; keep at most
+    # steps-1 of the tail (the LAST ones, matching the reference's [-n:]
+    # slice), then land on 0.
+    below = interior[interior <= tau + 1e-9]
+    entry = float(below.max()) if below.numel() > 0 else float(interior.min())
+
+    tail = interior[interior < entry - 1e-12]
+    if tail.numel() > steps - 1:
+        tail = tail[-(steps - 1):]
+
+    stage = torch.cat([torch.tensor([entry]), tail, torch.zeros(1)])
+    return stage
+
+
+def alignment_scales(
+    stage_sigmas: torch.Tensor,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Per-step direction (alpha) and acceleration (beta) scales.
+
+    Theory form (plan D5): ``alpha_i = beta_i = sigma_i / sigma_entry`` for
+    every entry sigma in the stage schedule — 1.0 at the stage entry,
+    decaying to ~0 at the clean end (the trailing 0 gets an exact 0). The
+    multiplier (cfg.alpha_scale / cfg.beta_scale) is applied by the caller.
+    """
+    sigmas = stage_sigmas.float()
+    entry = float(sigmas[0])
+    if entry <= 0.0:
+        raise ValueError("stage schedule must enter at a positive sigma")
+    scales = sigmas / entry
+    scales = torch.clamp(scales, min=0.0)
+    return scales, scales.clone()
