@@ -41,6 +41,44 @@ class TestPixelRushNodeSchema:
         assert "default=0.50" in content  # overlap
         assert "default=249" in content  # k_timestep
         assert "default=24.0" in content  # gaussian_sigma
+        # gaussian_kernel_size input must be gone (analytic mask has no kernel)
+        assert "gaussian_kernel_size" not in content, (
+            "gaussian_kernel_size must be removed from the node (analytic mask)"
+        )
+
+    def test_sigma_max_allows_paper_default(self):
+        """The corrected default sigma=24 must be reachable from the UI."""
+        content = (pathlib.Path(__file__).parent.parent / "src" / "pixelrush_node.py").read_text(encoding="utf-8")
+        assert "max=128.0" in content, (
+            "gaussian_sigma max must be 128 (old max=20 blocked the paper default 24)"
+        )
+
+    def test_execute_signature_matches_schema(self):
+        """Every schema input name must be an execute() parameter and vice
+        versa (no drift; catches removed inputs like gaussian_kernel_size)."""
+        import re
+        content = (pathlib.Path(__file__).parent.parent / "src" / "pixelrush_node.py").read_text(encoding="utf-8")
+        # Schema input names — match calls across line breaks:
+        # io.<Type>.Input(\s*"<name>"
+        pattern = re.compile(r'io\.\w+\.Input\(\s*"([^"]+)"')
+        schema_inputs = set(pattern.findall(content))
+        assert schema_inputs, "failed to parse schema inputs"
+        assert "refiner_model" in schema_inputs
+        sig_start = content.index("def execute(cls,")
+        sig_start += len("def execute(cls,")
+        sig = content[sig_start:content.index(") -> io.NodeOutput:", sig_start)]
+        params = set()
+        for chunk in sig.split(","):
+            chunk = chunk.strip()
+            if "=" in chunk:
+                chunk = chunk.split("=")[0].strip()
+            if chunk and chunk != "cls":
+                params.add(chunk)
+        missing = (schema_inputs - params) | (params - schema_inputs)
+        assert not missing, (
+            f"Schema inputs and execute() params must match exactly; "
+            f"schema-only={schema_inputs - params}, exec-only={params - schema_inputs}"
+        )
 
     def test_node_registered_in_extension(self):
         content = (pathlib.Path(__file__).parent.parent / "__init__.py").read_text(encoding="utf-8")
