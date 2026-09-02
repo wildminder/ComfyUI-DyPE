@@ -50,7 +50,7 @@ _CORE_NODES = {
     "EmptySD3LatentImage", "KSampler", "KSamplerAdvanced", "VAEDecode",
     "VAEDecodeTiled", "VAEEncode", "SaveImage", "PreviewImage",
     "ModelSamplingFlux", "ModelSamplingAuraFlow", "LoraLoaderModelOnly",
-    "ConditioningZeroOut",
+    "ConditioningZeroOut", "ImageCompare",
     # UI-format-only helper nodes (never in API graphs)
     "Reroute", "PrimitiveNode", "Note", "MarkdownNote",
     # third-party (documented optional dependency)

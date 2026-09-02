@@ -57,7 +57,24 @@ Training-free methods that push pre-trained DiT models far beyond their native r
 | **❖ [PixelRush](#user-content-pixelrush)** | Cascade patch refinement of an existing base image. |
 | **❖ [FreeScale](#user-content-freescale)** | Tuning-free self-cascade upscaling. |
 
+### Which method when?
+
+Two families: **model patches** alter how your own KSampler run attends (no image input) — best for *native* high-res generation; **cascades** consume an existing latent/image and refine it.
+
+| Method | Models | Mechanism | Takes your image | Output character |
+|:---|:---|:---|:---:|:---|
+| **DyPE** | FLUX, Nunchaku, Qwen/Krea-2, Z-Image, Anima | Dynamic position-encoding extrapolation | ✗ | Native high-res generation |
+| **SEGA** | FLUX, Nunchaku, Qwen/Krea-2, Z-Image, Anima | Spectral-energy RoPE sharpening | ✗ | Native high-res generation |
+| **SPA** | FLUX, Qwen/Krea-2, Z-Image, Anima | Position-bundle attention alignment | ✗ | Native high-res generation |
+| **HAP** | FLUX, Qwen/Krea-2, Z-Image, Anima | Calibrated sparse attention (speed) | ✗ | Native high-res generation |
+| **PixelRush** | Any (SDXL, SD1.5, FLUX, Qwen, …) | Patch-wise low-denoise img2img cascade | ✓ | Faithful upscale + refinement |
+| **FreeScale** | FLUX-family DiTs | Scale-fused attention + self-cascade | ✓ | Regenerative hi-res, mostly new content |
+
+> [!TIP]
+> **Quick picker:** starting from noise → DyPE (or SEGA), add SPA if you see repeated/collapsed structures, add HAP for speed. Starting from an existing image → PixelRush to keep it faithful, FreeScale to re-imagine it at high res (lower its `noise_timestep` for more fidelity).
+
 <a id="user-content-dype"></a>
+
 ### ❖ DyPE
 
 Dynamic Position Extrapolation ([paper](https://arxiv.org/abs/2411.17087), [code](https://github.com/guyyariv/DyPE)). Adjusts positional encodings at each denoising step to match the current stage of generation — low-frequency structure early, fine detail later. Training-free, no additional sampling cost.
