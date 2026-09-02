@@ -1515,7 +1515,6 @@ class TestEmptyConditioningCFG:
 
         model.model.process_latent_in = process_latent_in
 
-        ms = types.SimpleNamespace()
         EpsClass = type("EPS", (), {})
         MS = type("ModelSampling", (EpsClass,), {})
         ms_instance = MS()
