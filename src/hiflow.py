@@ -20,6 +20,8 @@ never sees model-space tensors.
 from __future__ import annotations
 
 import logging
+from dataclasses import dataclass
+from typing import Callable
 
 import torch
 import torch.fft as fft
@@ -175,3 +177,144 @@ def alignment_scales(
     scales = sigmas / entry
     scales = torch.clamp(scales, min=0.0)
     return scales, scales.clone()
+
+
+# ---------------------------------------------------------------------------
+# Reference trajectory storage + base (Stage A) sampling
+# ---------------------------------------------------------------------------
+
+def _sigma_key(sigma: float) -> float:
+    """Round a sigma to a stable dict key (float equality is fragile)."""
+    return round(float(sigma), 6)
+
+
+class TrajectoryDict:
+    """sigma -> predicted-clean-x0 dictionary, the HiFlow reference flow.
+
+    Stores every per-step clean prediction from a sampling run keyed by its
+    sigma (6-decimal rounded). Tensors are parked on CPU to keep a 30-step
+    4K trajectory (~1.5 GB fp32) off the GPU (plan D8); ``get``/``nearest``
+    move them back to the caller's device.
+
+    Time matching (plan D8): exact sigma first, then the nearest stored sigma
+    within ``tol`` — robust across differently-spaced schedules, unlike the
+    reference's exact-timestep lookup.
+    """
+
+    def __init__(self) -> None:
+        self._entries: dict[float, torch.Tensor] = {}
+
+    def put(self, sigma: float, x0: torch.Tensor) -> None:
+        self._entries[_sigma_key(sigma)] = x0.detach().to("cpu")
+
+    def get(self, sigma: float) -> torch.Tensor:
+        key = _sigma_key(sigma)
+        if key not in self._entries:
+            raise KeyError(
+                f"no trajectory entry at sigma={sigma!r}; stored sigmas: "
+                f"{sorted(self._entries)[:8]}{'...' if len(self._entries) > 8 else ''}"
+            )
+        return self._entries[key]
+
+    def nearest(
+        self,
+        sigma: float,
+        tol: float = 1e-3,
+        device: torch.device | None = None,
+    ) -> tuple[float, torch.Tensor]:
+        """Return (stored_sigma, x0) closest to ``sigma`` within ``tol``."""
+        if not self._entries:
+            raise ValueError(
+                "no reference trajectory — run the base stage first"
+            )
+        keys = sorted(self._entries)
+        target = float(sigma)
+        best = min(keys, key=lambda k: abs(k - target))
+        if abs(best - target) > tol:
+            raise ValueError(
+                f"no reference entry within {tol} of sigma={target!r} "
+                f"(nearest stored: {best!r})"
+            )
+        x0 = self._entries[best]
+        if device is not None:
+            x0 = x0.to(device)
+        return best, x0
+
+    def sigmas(self) -> list[float]:
+        return sorted(self._entries)
+
+    def __len__(self) -> int:
+        return len(self._entries)
+
+    def as_dict(self) -> dict[float, torch.Tensor]:
+        return dict(self._entries)
+
+
+@dataclass
+class HiFlowConfig:
+    """HiFlow hyperparameters (paper values; plan D7).
+
+    tau            stage-entry noise level; paper cascade [0.6, 0.3, 0.3]
+    steps          base-stage sampling steps (paper: 30)
+    steps_per_stage guided-stage transitions per cascade stage (repo: 16/10)
+    cfg            base-stage classifier-free guidance (FLUX-dev: 3.5)
+    guidance_high  guided-stage CFG (repo: 4.5-6)
+    filter_ratio   normalized Butterworth cutoff D (paper 0.4 / repo 0.2)
+    alpha_scale    direction-alignment multiplier (repo first stage 1.0)
+    beta_scale     acceleration-alignment multiplier (repo 0.5)
+    upsampling     "latent" (bicubic on latents, repo default) | "pixel"
+    eps_sigma      sigma floor in (x - x0)/sigma (reference uses 1e-6)
+    """
+
+    tau: float = 0.6
+    steps: int = 30
+    steps_per_stage: int = 16
+    cfg: float = 3.5
+    guidance_high: float = 4.5
+    filter_ratio: float = 0.2
+    alpha_scale: float = 1.0
+    beta_scale: float = 0.5
+    upsampling: str = "latent"
+    eps_sigma: float = 1e-6
+
+
+@torch.no_grad()
+def base_trajectory(
+    initial_latent: Tensor,
+    sigmas: torch.Tensor,
+    predict_x0: Callable[[Tensor, float], Tensor],
+    cfg: HiFlowConfig,
+    progress_callback: Callable[[int, int, int], None] | None = None,
+) -> tuple[Tensor, TrajectoryDict]:
+    """Stage A — ordinary rectified-flow sampling that records every step.
+
+    Euler rule (paper Sec. 1): ``v = (x_t - x0_pred) / t``,
+    ``x_{t-1} = x_t + v * (t_{t-1} - t)`` with the velocity derived from the
+    predicted clean sample (``sigma`` clamped at ``cfg.eps_sigma`` — the
+    reference divides by ``sigma + 1e-6``). The final sample is recorded at
+    sigma 0 as the endpoint prediction, mirroring the reference's
+    ``clean_predictions[0] = X``.
+
+    Runs in fp32 regardless of the input dtype; returns the final latent in
+    the input's dtype and the per-step trajectory (VAE space throughout —
+    the predict_x0 adapter owns model-space conversions).
+    """
+    x = initial_latent.float()
+    traj = TrajectoryDict()
+    n_transitions = sigmas.numel() - 1
+
+    for i in range(n_transitions):
+        sigma = float(sigmas[i])
+        x0 = predict_x0(x, sigma).float()
+        traj.put(sigma, x0)
+
+        sigma_safe = max(sigma, cfg.eps_sigma)
+        v = (x - x0) / sigma_safe
+        x = x + v * (float(sigmas[i + 1]) - sigma)
+
+        if progress_callback is not None:
+            progress_callback(i, n_transitions, -1)
+
+    # Endpoint: the last state IS the sigma-0 clean prediction.
+    traj.put(0.0, x)
+    return x.to(initial_latent.dtype), traj
