@@ -582,6 +582,11 @@ class PixelRushNode(io.ComfyNode):
                     "noise_lambda", default=0.95, min=0.0, max=1.0, step=0.01,
                     tooltip="Noise injection strength (slerp between predicted and random noise).",
                 ),
+                io.Combo.Input(
+                    "noise_injection", options=["slerp", "additive"],
+                    default="slerp",
+                    tooltip="Noise injection mode: slerp (paper) or additive (legacy 2026-08-13 behavior).",
+                ),
                 io.Float.Input(
                     "overlap", default=0.50, min=0.0, max=0.75, step=0.05,
                     tooltip="Patch overlap fraction. 0.5=50% overlap.",
@@ -607,7 +612,7 @@ class PixelRushNode(io.ComfyNode):
     @classmethod
     def execute(cls, model, vae, positive, negative, latent_image, cfg=7.0,
                 num_cascade_stages=1, k_timestep=249, noise_lambda=0.95,
-                overlap=0.50, gaussian_sigma=24.0,
+                noise_injection="slerp", overlap=0.50, gaussian_sigma=24.0,
                 patch_h=0, patch_w=0) -> io.NodeOutput:
         import comfy.utils
 
@@ -692,6 +697,7 @@ class PixelRushNode(io.ComfyNode):
             overlap=overlap,
             k_timestep=k_timestep_scaled,
             noise_lambda=noise_lambda,
+            noise_injection=noise_injection,
             gaussian_sigma=gaussian_sigma,
             operate_in_vae_space=operate_in_vae_space,
         )

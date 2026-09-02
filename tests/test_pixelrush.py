@@ -930,7 +930,8 @@ class TestPixelRushCompressionDiagnostics:
 
     def _make_cfg(self, **overrides):
         base = dict(patch_h=32, patch_w=32, overlap=0.5, k_timestep=249,
-                    noise_lambda=0.95, operate_in_vae_space=True)
+                    noise_lambda=0.95, noise_injection="additive",
+                    operate_in_vae_space=True)
         base.update(overrides)
         return PixelRushConfig(**base)
 
@@ -1066,10 +1067,11 @@ class TestPixelRushCompressionDiagnostics:
 
     # --- Step 7: fix — refinement must preserve model detail (H1) ---
     def test_refinement_preserves_hf(self):
-        """After the H1 fix, refine_latent_once must NOT remove HF vs coarse.
+        """ADDITIVE (legacy) mode: refine_latent_once must NOT remove HF.
 
         Regression guard: hf_energy(refined) / hf_energy(coarse) >= 0.9.
-        (Before the fix this was ~0.76 — refinement smoothed the image.)
+        Calibrated against the 2026-08-13 additive injection; the slerp
+        mode has its own companion test below.
         """
         import torch.nn.functional as F
         torch.manual_seed(0)
@@ -1091,4 +1093,158 @@ class TestPixelRushCompressionDiagnostics:
         ratio = _hf_energy(refined) / _hf_energy(coarse)
         assert ratio >= 0.9, (
             f"Refinement removed HF (ratio={ratio:.3f}); expected >= 0.9"
+        )
+
+
+# ---------------------------------------------------------------------------
+# Noise injection modes (slerp default, additive legacy opt-in)
+# ---------------------------------------------------------------------------
+
+@pytest.mark.unit
+class TestNoiseInjectionModes:
+    """refine_latent_once must implement both injection modes exactly.
+
+    slerp (paper default): eps_injected = slerp(eps_refined, eps_random, lambda)
+    additive (2026-08-13 legacy): eps_injected = eps_refined + lambda * eps_random
+    """
+
+    def _eps_fn(self):
+        def eps_fn(latent, timestep):
+            return 0.3 * torch.ones_like(latent)
+        return eps_fn
+
+    def _cfg(self, mode, lam=0.95):
+        return PixelRushConfig(
+            patch_h=32, patch_w=32, overlap=0.5, k_timestep=249,
+            noise_lambda=lam, noise_injection=mode,
+        )
+
+    def _refine(self, cfg, seed=123):
+        torch.manual_seed(seed)
+        coarse = torch.randn(1, 4, 32, 32)
+        return refine_latent_once(
+            coarse, self._eps_fn(), self._eps_fn(), lambda t: 0.8, cfg)
+
+    def test_slerp_mode_lambda_zero_keeps_eps_pred(self):
+        """lambda=0 -> slerp returns eps_refined; the reverse step must use it
+        exactly (refined == reverse(forward(patch, eps), eps))."""
+        from src.pixelrush import ddim_forward_one_step, ddim_reverse_one_step_to_zero
+        torch.manual_seed(123)
+        coarse = torch.randn(1, 4, 32, 32)
+        cfg = self._cfg("slerp", lam=0.0)
+        out = refine_latent_once(
+            coarse, self._eps_fn(), self._eps_fn(), lambda t: 0.8, cfg)
+        eps = self._eps_fn()(coarse, 0)
+        z_k = ddim_forward_one_step(coarse, eps, 0.8)
+        expected = ddim_reverse_one_step_to_zero(z_k, eps, 0.8)
+        assert torch.allclose(out, expected, atol=1e-5), (
+            "lambda=0 slerp must reduce to the pure-eps refinement"
+        )
+
+    def test_slerp_mode_lambda_one_uses_random(self):
+        """lambda=1 -> slerp returns eps_random; refined must equal the
+        reverse step with ONLY the (seeded) random eps."""
+        from src.pixelrush import ddim_forward_one_step, ddim_reverse_one_step_to_zero
+        torch.manual_seed(123)
+        coarse = torch.randn(1, 4, 32, 32)
+        cfg = self._cfg("slerp", lam=1.0)
+        out = refine_latent_once(
+            coarse, self._eps_fn(), self._eps_fn(), lambda t: 0.8, cfg)
+        # Reproduce the randn stream: refine draws eps_random AFTER the
+        # inversion + refinement eps draws... but our eps_fn is constant
+        # (no randn), so the only stochastic draws inside refine are the
+        # eps_random (one per patch; single patch here).
+        torch.manual_seed(123)
+        _ = torch.randn(1, 4, 32, 32)  # the coarse draw in _refine order
+        eps_random = torch.randn(1, 4, 32, 32)  # the injection draw
+        eps_pred = self._eps_fn()(coarse, 0)
+        z_k = ddim_forward_one_step(coarse, eps_pred, 0.8)
+        expected = ddim_reverse_one_step_to_zero(z_k, eps_random, 0.8)
+        assert torch.allclose(out, expected, atol=1e-4), (
+            "lambda=1 slerp must reduce to pure-random-eps refinement"
+        )
+
+    def test_additive_mode_formula(self):
+        """additive mode must reproduce the 2026-08-13 formula exactly."""
+        from src.pixelrush import ddim_forward_one_step, ddim_reverse_one_step_to_zero
+        torch.manual_seed(123)
+        coarse = torch.randn(1, 4, 32, 32)
+        cfg = self._cfg("additive", lam=0.5)
+        out = refine_latent_once(
+            coarse, self._eps_fn(), self._eps_fn(), lambda t: 0.8, cfg)
+        torch.manual_seed(123)
+        _ = torch.randn(1, 4, 32, 32)
+        eps_random = torch.randn(1, 4, 32, 32)
+        eps_pred = self._eps_fn()(coarse, 0)
+        z_k = ddim_forward_one_step(coarse, eps_pred, 0.8)
+        eps_inj = eps_pred + 0.5 * eps_random
+        expected = ddim_reverse_one_step_to_zero(z_k, eps_inj, 0.8)
+        assert torch.allclose(out, expected, atol=1e-4), (
+            "additive mode must equal eps_pred + lambda * eps_random"
+        )
+
+    def test_default_mode_is_slerp(self):
+        cfg = PixelRushConfig(patch_h=32, patch_w=32)
+        assert cfg.noise_injection == "slerp", (
+            "Default injection mode must be 'slerp' (paper / corrected theory)"
+        )
+
+    def test_invalid_mode_raises(self):
+        cfg = self._cfg("bogus")
+        with pytest.raises(ValueError, match="noise_injection"):
+            self._refine(cfg)
+
+
+@pytest.mark.unit
+class TestPixelRushSlerpHF:
+    """HF-preservation under the corrected slerp injection (paper defaults).
+
+    The injected per-patch random eps is independent and adds HF energy;
+    a ratio far below 1 re-indicates the space-mixing symptom (plan
+    2026-09-02, Step 11 recalibrates the bound from measurements).
+    """
+
+    def _identity_vae_decode(self):
+        return lambda z: z
+
+    def _identity_vae_encode(self):
+        return lambda x: x
+
+    def _structured_eps(self, scale=0.5):
+        def eps_fn(latent, timestep):
+            return scale * _laplacian_hf(latent)
+        return eps_fn
+
+    def _forward_step(self):
+        return lambda x_0, eps, sigma: x_0 + sigma * eps
+
+    def _reverse_step(self):
+        return lambda x_K, eps_inj, sigma: x_K - sigma * eps_inj
+
+    def test_refinement_preserves_hf_slerp_mode(self):
+        import torch.nn.functional as F
+        torch.manual_seed(0)
+        z0 = torch.randn(1, 4, 32, 32)
+        image_up = F.interpolate(z0, scale_factor=2.0, mode="bicubic",
+                                 align_corners=False, antialias=True)
+        coarse = self._identity_vae_encode()(image_up)
+        cfg = PixelRushConfig(
+            patch_h=32, patch_w=32, overlap=0.5, k_timestep=249,
+            noise_lambda=0.95, noise_injection="slerp",
+        )
+        refined = refine_latent_once(
+            coarse_latent=coarse,
+            inversion_eps=self._structured_eps(),
+            refiner_eps=self._structured_eps(),
+            alpha_bar_at=lambda t: 1.0 / (0.867 ** 2 + 1.0),
+            cfg=cfg,
+            forward_step=self._forward_step(),
+            reverse_step=self._reverse_step(),
+            sigma_at=lambda t: 0.867,
+        )
+        ratio = _hf_energy(refined) / _hf_energy(coarse)
+        # Provisional bound; tightened from measurements in Step 11 of the plan.
+        assert ratio >= 0.5, (
+            f"slerp-mode refinement removed too much HF (ratio={ratio:.3f}); "
+            "expected >= 0.5 — re-indicates the space-mixing symptom"
         )

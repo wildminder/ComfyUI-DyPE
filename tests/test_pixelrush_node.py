@@ -25,6 +25,16 @@ class TestPixelRushNodeSchema:
         content = (pathlib.Path(__file__).parent.parent / "src" / "pixelrush_node.py").read_text(encoding="utf-8")
         assert "image/upscaling" in content
 
+    def test_noise_injection_default_slerp(self):
+        """Node must expose the noise_injection mode with slerp default."""
+        content = (pathlib.Path(__file__).parent.parent / "src" / "pixelrush_node.py").read_text(encoding="utf-8")
+        assert "noise_injection" in content, (
+            "Node must pass noise_injection into PixelRushConfig"
+        )
+        assert 'default="slerp"' in content, (
+            "noise_injection combo default must be 'slerp' (paper default)"
+        )
+
     def test_node_defaults_match_paper(self):
         content = (pathlib.Path(__file__).parent.parent / "src" / "pixelrush_node.py").read_text(encoding="utf-8")
         assert "default=0.95" in content  # noise_lambda

@@ -39,7 +39,13 @@ class PixelRushConfig:
         in the model's schedule.  Paper default: 249.
     noise_lambda : float
         Noise injection strength for slerp between predicted and random
-        noise.  Paper default: 0.95.
+        noise.  Paper default: 0.95. Note the paper's stated convention:
+        lambda=0.95 places the slerp result close to the RANDOM vector.
+    noise_injection : str
+        Injection mode.  ``"slerp"`` (paper / corrected theory, default):
+        ``slerp(eps_refined, eps_random, noise_lambda)``.  ``"additive"``:
+        the 2026-08-13 legacy behavior ``eps_refined + noise_lambda *
+        eps_random``, kept as an opt-in for workflows tuned against it.
     gaussian_sigma : float
         Gaussian feathering sigma for the analytic patch weight mask.
         Paper default: 24.0. Rule of thumb: sigma ~ patch_size / 5.
@@ -61,6 +67,7 @@ class PixelRushConfig:
     overlap: float = 0.50
     k_timestep: int = 249
     noise_lambda: float = 0.95
+    noise_injection: str = "slerp"
     gaussian_sigma: float = 24.0
     eps: float = 1e-8
     operate_in_vae_space: bool = True
@@ -400,10 +407,21 @@ def refine_latent_once(
         eps_refined = refiner_eps(patch_k, timestep=cfg.k_timestep)
         eps_refined = eps_refined.to(patch_k.device)
 
-        # 3. Noise injection (still additive — slerp restored in the
-        # noise-injection step of plan 2026-09-02)
-        eps_rand = torch.randn_like(eps_refined)
-        eps_injected = eps_refined + cfg.noise_lambda * eps_rand
+        # 3. PixelRush noise injection (corrected theory: SLERP between the
+        # refiner's eps prediction and fresh random noise). Note the paper's
+        # stated convention: noise_lambda=0.95 places the result close to
+        # eps_random. The "additive" mode preserves the 2026-08-13 legacy
+        # behavior (eps_pred + lambda * eps_rand) as an opt-in.
+        eps_random = torch.randn_like(eps_refined)
+        if cfg.noise_injection == "additive":
+            eps_injected = eps_refined + cfg.noise_lambda * eps_random
+        elif cfg.noise_injection == "slerp":
+            eps_injected = slerp(eps_refined, eps_random, cfg.noise_lambda)
+        else:
+            raise ValueError(
+                f"Unknown noise_injection mode: {cfg.noise_injection!r} "
+                "(expected 'slerp' or 'additive')"
+            )
 
         # 4. Reverse step: K -> 0
         if reverse_step is not None:
