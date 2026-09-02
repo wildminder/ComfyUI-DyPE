@@ -1543,3 +1543,127 @@ class TestEmptyConditioningCFG:
         latent = torch.zeros(1, 4, 8, 8)
         with pytest.raises(ValueError, match="positive conditioning"):
             predict_eps(latent, timestep=0)
+
+
+@pytest.mark.unit
+class TestRefinerModelInput:
+    """Plan 2026-09-02 Step 9: optional separate refiner model (G4).
+
+    Paper setup: SDXL base generator + SDXL-Turbo (ADD-distilled) refiner.
+    When refiner_model is provided it drives the K-timestep refinement; the
+    base model drives the 0-timestep inversion. When absent, the base model
+    is reused for both (an intentional choice the corrected theory allows).
+    """
+
+    def _read_source(self):
+        return (pathlib.Path(__file__).parent.parent / "src" / "pixelrush_node.py").read_text(encoding="utf-8")
+
+    def test_schema_has_optional_refiner_model(self):
+        content = self._read_source()
+        assert 'io.Model.Input(' in content
+        assert '"refiner_model"' in content
+        assert "optional=True" in content, (
+            "refiner_model input must be optional (base model reused by default)"
+        )
+
+    def test_execute_buys_distinct_adapters(self):
+        """execute must build inversion_eps from the base model and
+        refiner_eps from refiner_model when provided (or reuse inversion_eps
+        when not)."""
+        content = self._read_source()
+        assert "inversion_eps = _make_predict_eps(" in content
+        assert "refiner_eps = _make_predict_eps(" in content, (
+            "execute must build a separate refiner_eps from refiner_model"
+        )
+        assert "refiner_model is not None and refiner_model is not model" in content, (
+            "refiner eps must only be rebuilt when a distinct refiner model is given"
+        )
+        # The cascade must receive both adapters
+        assert "inversion_eps=inversion_eps" in content
+        assert "refiner_eps=refiner_eps" in content
+
+    def test_refiner_model_none_uses_base_for_both(self):
+        """No refiner_model: all model calls hit the base model object."""
+        import sys
+        import types
+        sys.path.insert(0, str(pathlib.Path(__file__).parent.parent))
+        from src.pixelrush import PixelRushConfig, pixelrush_cascade
+
+        calls = []
+
+        def make_eps(tag):
+            def eps_fn(latent, timestep):
+                calls.append((tag, timestep))
+                return torch.zeros_like(latent)
+            return eps_fn
+
+        # Simulate the execute() wiring with refiner_model=None
+        base_eps = make_eps("base")
+        refiner_model = None
+        if refiner_model is not None and refiner_model is not object():
+            refiner_eps = make_eps("refiner")
+        else:
+            refiner_eps = base_eps
+
+        def vae_decode(z):
+            return z[:, :3] if z.shape[1] >= 3 else z
+
+        def vae_encode(x):
+            return x[:, :4] if x.shape[1] >= 4 else x
+
+        cfg = PixelRushConfig(patch_h=32, patch_w=32, overlap=0.5,
+                              k_timestep=249, noise_lambda=0.95,
+                              noise_injection="additive")
+        pixelrush_cascade(
+            torch.randn(1, 4, 32, 32), num_cascade_stages=1,
+            vae_decode=vae_decode, vae_encode=vae_encode,
+            inversion_eps=base_eps, refiner_eps=refiner_eps,
+            alpha_bar_at=lambda t: 0.8, cfg=cfg,
+        )
+        tags = {c[0] for c in calls}
+        assert tags == {"base"}, (
+            f"Without refiner_model only the base adapter may run; got {tags}"
+        )
+
+    def test_refiner_model_provided_uses_refiner_at_k(self):
+        """Distinct refiner: base model called once (t=0) and refiner once
+        (t=K) per patch — the G4 acceptance test."""
+        import sys
+        sys.path.insert(0, str(pathlib.Path(__file__).parent.parent))
+        from src.pixelrush import PixelRushConfig, refine_latent_once
+
+        base_calls, refiner_calls = [], []
+
+        def base_eps(latent, timestep):
+            base_calls.append(timestep)
+            return torch.zeros_like(latent)
+
+        def refiner_eps_fn(latent, timestep):
+            refiner_calls.append(timestep)
+            return 0.1 * torch.ones_like(latent)
+
+        cfg = PixelRushConfig(patch_h=32, patch_w=32, overlap=0.5,
+                              k_timestep=249, noise_lambda=0.95,
+                              noise_injection="additive")
+        refine_latent_once(
+            torch.randn(1, 4, 32, 32),
+            base_eps, refiner_eps_fn,
+            lambda t: 0.8, cfg,
+        )
+        assert base_calls == [0], (
+            f"Base model must be called exactly once at t=0; got {base_calls}"
+        )
+        assert refiner_calls == [249], (
+            f"Refiner must be called exactly once at t=K=249; got {refiner_calls}"
+        )
+
+    def test_refiner_receives_same_conditioning(self):
+        """execute must pass the same positive/negative to both adapters."""
+        content = self._read_source()
+        start = content.index("inversion_eps = _make_predict_eps(")
+        end = content.index("alpha_bar_at = _make_alpha_bar_at")
+        section = content[start:end]
+        assert section.count("positive, negative, cfg, latent_dimensions") == 2, (
+            "Both inversion and refiner adapters must receive the same "
+            "positive/negative/cfg/latent_dimensions"
+        )

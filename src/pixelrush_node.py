@@ -517,6 +517,10 @@ class PixelRushNode(io.ComfyNode):
                 io.Conditioning.Input("positive", tooltip="Positive conditioning."),
                 io.Conditioning.Input("negative", tooltip="Negative conditioning."),
                 io.Latent.Input("latent_image", tooltip="Base latent at native resolution."),
+                io.Model.Input(
+                    "refiner_model", optional=True,
+                    tooltip="Optional separate refiner model (e.g. SDXL-Turbo, the paper's ADD-distilled refiner). Default: reuse the base model.",
+                ),
                 io.Float.Input(
                     "cfg", default=7.0, min=0.0, max=20.0, step=0.1,
                     tooltip="Classifier-free guidance scale.",
@@ -564,7 +568,7 @@ class PixelRushNode(io.ComfyNode):
     def execute(cls, model, vae, positive, negative, latent_image, cfg=7.0,
                 num_cascade_stages=1, k_timestep=249, noise_lambda=0.95,
                 noise_injection="slerp", overlap=0.50, gaussian_sigma=24.0,
-                patch_h=0, patch_w=0) -> io.NodeOutput:
+                patch_h=0, patch_w=0, refiner_model=None) -> io.NodeOutput:
         import comfy.utils
 
         # Get initial latent
@@ -641,10 +645,25 @@ class PixelRushNode(io.ComfyNode):
             gaussian_sigma=gaussian_sigma,
         )
 
-        # Create adapters — predict_eps needs to know if model is 3D latent
-        predict_eps = _make_predict_eps(
+        # Create adapters — predict_eps needs to know if model is 3D latent.
+        # The BASE model drives the partial DDIM inversion (inversion_eps).
+        # A separate refiner model (paper: SDXL-Turbo, ADD-distilled) drives
+        # the one-step refinement (refiner_eps) when provided; otherwise the
+        # base model is reused for both — an intentional choice the corrected
+        # theory allows. The refiner uses its OWN model_sampling for
+        # sigma/timestep conversion (captured inside its predict_eps), while
+        # the schedule functions (alpha_bar_at, sigma_at, forward/reverse
+        # steps) stay bound to the BASE model's schedule: one scheduler
+        # defines the transition.
+        inversion_eps = _make_predict_eps(
             model, positive, negative, cfg, latent_dimensions,
         )
+        if refiner_model is not None and refiner_model is not model:
+            refiner_eps = _make_predict_eps(
+                refiner_model, positive, negative, cfg, latent_dimensions,
+            )
+        else:
+            refiner_eps = inversion_eps
         alpha_bar_at = _make_alpha_bar_at(model)
         vae_decode, vae_encode = _make_vae_adapters(vae, device, model)
         # Model-agnostic forward/reverse steps (handle CONST/flow, V_PRED, EPS).
@@ -696,17 +715,16 @@ class PixelRushNode(io.ComfyNode):
             prev_patches = sum(stage_patch_counts[:stage]) if stage > 0 else 0
             pbar.update_absolute(prev_patches + patch_idx)
 
-        # Run PixelRush cascade (works in 4D spatial). The same base model
-        # drives both the inversion and the refinement for now — an
-        # intentional choice the corrected theory allows; a separate
-        # refiner model input is added in a later step of plan 2026-09-02.
+        # Run PixelRush cascade (works in 4D spatial). The base model drives
+        # the inversion; the refiner model (or the base model when no separate
+        # refiner is provided) drives the one-step refinement.
         result_latent_4d = pixelrush_cascade(
             initial_latent=initial_latent_4d,
             num_cascade_stages=num_cascade_stages,
             vae_decode=vae_decode,
             vae_encode=vae_encode,
-            inversion_eps=predict_eps,
-            refiner_eps=predict_eps,
+            inversion_eps=inversion_eps,
+            refiner_eps=refiner_eps,
             alpha_bar_at=alpha_bar_at,
             cfg=cfg_obj,
             progress_callback=progress_callback,
