@@ -38,14 +38,16 @@ class PixelRushConfig:
         Partial-inversion timestep.  Must correspond to a valid timestep
         in the model's schedule.  Paper default: 249.
     noise_lambda : float
-        Noise injection strength for slerp between predicted and random
-        noise.  Paper default: 0.95. Note the paper's stated convention:
-        lambda=0.95 places the slerp result close to the RANDOM vector.
+        Noise injection coefficient.  λ weights the REFINER'S PREDICTION in
+        the injection: ``slerp(eps_random, eps_refined, λ)`` — at the
+        paper default 0.95 the injected eps is 95% the model's prediction
+        plus 5% random noise ("noise injection strength" is the informal
+        reading; the ablation only makes sense with λ as prediction weight).
     noise_injection : str
-        Injection mode.  ``"slerp"`` (paper / corrected theory, default):
-        ``slerp(eps_refined, eps_random, noise_lambda)``.  ``"additive"``:
-        the 2026-08-13 legacy behavior ``eps_refined + noise_lambda *
-        eps_random``, kept as an opt-in for workflows tuned against it.
+        Injection mode.  ``"slerp"`` (paper, default):
+        ``slerp(eps_random, eps_refined, noise_lambda)``.  ``"additive"``
+        (legacy 2026-08-13 formula, same λ convention):
+        ``eps_refined + (1 - noise_lambda) * eps_random``.
     gaussian_sigma : float
         Gaussian feathering sigma for the analytic patch weight mask.
         Paper default: 24.0. Rule of thumb: sigma ~ patch_size / 5.
@@ -403,16 +405,24 @@ def refine_latent_once(
         eps_refined = refiner_eps(patch_k, timestep=cfg.k_timestep)
         eps_refined = eps_refined.to(patch_k.device)
 
-        # 3. PixelRush noise injection (corrected theory: SLERP between the
-        # refiner's eps prediction and fresh random noise). Note the paper's
-        # stated convention: noise_lambda=0.95 places the result close to
-        # eps_random. The "additive" mode preserves the 2026-08-13 legacy
-        # behavior (eps_pred + lambda * eps_rand) as an opt-in.
+        # 3. PixelRush noise injection. lambda weights the REFINER'S
+        # PREDICTION: slerp(eps_random, eps_refined, lambda) — at the
+        # paper's lambda=0.95 the injected eps is 95% the model's
+        # prediction with 5% random. (The corrected doc's reference code
+        # used the opposite argument order, which makes lambda=0.95 mean
+        # 95% PURE RANDOM noise — at real scales that is per-pixel noise
+        # std ~1.2 vs signal std ~1, matching the reported "structure
+        # visible but completely noisy in soft patches" artifact. The
+        # doc itself flags this as the one detail to check against the
+        # authors' implementation; the ablation only makes sense with
+        # lambda as prediction weight.) The "additive" mode preserves the
+        # 2026-08-13 legacy formula with the same convention: 5% random.
         eps_random = torch.randn_like(eps_refined)
         if cfg.noise_injection == "additive":
-            eps_injected = eps_refined + cfg.noise_lambda * eps_random
+            # Legacy 2026-08-13 mode: eps_pred + (1 - lambda) * eps_rand.
+            eps_injected = eps_refined + (1.0 - cfg.noise_lambda) * eps_random
         elif cfg.noise_injection == "slerp":
-            eps_injected = slerp(eps_refined, eps_random, cfg.noise_lambda)
+            eps_injected = slerp(eps_random, eps_refined, cfg.noise_lambda)
         else:
             raise ValueError(
                 f"Unknown noise_injection mode: {cfg.noise_injection!r} "

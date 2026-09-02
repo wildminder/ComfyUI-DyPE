@@ -1099,8 +1099,12 @@ class TestPixelRushCompressionDiagnostics:
             sigma_at=self._sigma_at(),
         )
         ratio = _hf_energy(refined) / _hf_energy(coarse)
-        assert ratio >= 0.9, (
-            f"Refinement removed HF (ratio={ratio:.3f}); expected >= 0.9"
+        # Recalibrated 2026-09-02 post-λ-fix: measured 0.583 (the flipped
+        # convention injects only 5% random, which smooths less than the
+        # old +0.95*rand formula that measured 0.955). Bound 0.5.
+        assert ratio >= 0.5, (
+            f"Refinement removed HF (ratio={ratio:.3f}); expected >= 0.5 "
+            "(post-λ-fix calibration; measured 0.583)"
         )
 
 
@@ -1112,8 +1116,11 @@ class TestPixelRushCompressionDiagnostics:
 class TestNoiseInjectionModes:
     """refine_latent_once must implement both injection modes exactly.
 
-    slerp (paper default): eps_injected = slerp(eps_refined, eps_random, lambda)
-    additive (2026-08-13 legacy): eps_injected = eps_refined + lambda * eps_random
+    λ weights the REFINER'S PREDICTION (fixed 2026-09-02 post-release; the
+    corrected doc's own caveat flagged the argument order as the one
+    detail to verify against the authors' implementation):
+        slerp (paper default): eps_injected = slerp(eps_random, eps_refined, λ)
+        additive (legacy): eps_injected = eps_refined + (1-λ) * eps_random
     """
 
     def _eps_fn(self):
@@ -1133,47 +1140,44 @@ class TestNoiseInjectionModes:
         return refine_latent_once(
             coarse, self._eps_fn(), self._eps_fn(), lambda t: 0.8, cfg)
 
-    def test_slerp_mode_lambda_zero_keeps_eps_pred(self):
-        """lambda=0 -> slerp returns eps_refined; the reverse step must use it
-        exactly (refined == reverse(forward(patch, eps), eps))."""
-        from src.pixelrush import ddim_forward_one_step, ddim_reverse_one_step_to_zero
-        torch.manual_seed(123)
-        coarse = torch.randn(1, 4, 32, 32)
-        cfg = self._cfg("slerp", lam=0.0)
-        out = refine_latent_once(
-            coarse, self._eps_fn(), self._eps_fn(), lambda t: 0.8, cfg)
-        eps = self._eps_fn()(coarse, 0)
-        z_k = ddim_forward_one_step(coarse, eps, 0.8)
-        expected = ddim_reverse_one_step_to_zero(z_k, eps, 0.8)
-        assert torch.allclose(out, expected, atol=1e-5), (
-            "lambda=0 slerp must reduce to the pure-eps refinement"
-        )
-
-    def test_slerp_mode_lambda_one_uses_random(self):
-        """lambda=1 -> slerp returns eps_random; refined must equal the
-        reverse step with ONLY the (seeded) random eps."""
+    def test_slerp_mode_lambda_one_keeps_eps_pred(self):
+        """λ=1 -> slerp returns the PREDICTION (95%+λ reading); the reverse
+        step must use it exactly (refined == reverse(forward(patch, eps), eps))."""
         from src.pixelrush import ddim_forward_one_step, ddim_reverse_one_step_to_zero
         torch.manual_seed(123)
         coarse = torch.randn(1, 4, 32, 32)
         cfg = self._cfg("slerp", lam=1.0)
         out = refine_latent_once(
             coarse, self._eps_fn(), self._eps_fn(), lambda t: 0.8, cfg)
-        # Reproduce the randn stream: refine draws eps_random AFTER the
-        # inversion + refinement eps draws... but our eps_fn is constant
-        # (no randn), so the only stochastic draws inside refine are the
-        # eps_random (one per patch; single patch here).
+        eps = self._eps_fn()(coarse, 0)
+        z_k = ddim_forward_one_step(coarse, eps, 0.8)
+        expected = ddim_reverse_one_step_to_zero(z_k, eps, 0.8)
+        assert torch.allclose(out, expected, atol=1e-5), (
+            "λ=1 slerp must reduce to the pure-eps refinement"
+        )
+
+    def test_slerp_mode_lambda_zero_uses_random(self):
+        """λ=0 -> slerp returns eps_random; refined must equal the
+        reverse step with ONLY the (seeded) random eps."""
+        from src.pixelrush import ddim_forward_one_step, ddim_reverse_one_step_to_zero
         torch.manual_seed(123)
-        _ = torch.randn(1, 4, 32, 32)  # the coarse draw in _refine order
+        coarse = torch.randn(1, 4, 32, 32)
+        cfg = self._cfg("slerp", lam=0.0)
+        out = refine_latent_once(
+            coarse, self._eps_fn(), self._eps_fn(), lambda t: 0.8, cfg)
+        torch.manual_seed(123)
+        _ = torch.randn(1, 4, 32, 32)  # the coarse draw
         eps_random = torch.randn(1, 4, 32, 32)  # the injection draw
         eps_pred = self._eps_fn()(coarse, 0)
         z_k = ddim_forward_one_step(coarse, eps_pred, 0.8)
         expected = ddim_reverse_one_step_to_zero(z_k, eps_random, 0.8)
         assert torch.allclose(out, expected, atol=1e-4), (
-            "lambda=1 slerp must reduce to pure-random-eps refinement"
+            "λ=0 slerp must reduce to pure-random-eps refinement"
         )
 
     def test_additive_mode_formula(self):
-        """additive mode must reproduce the 2026-08-13 formula exactly."""
+        """additive mode must reproduce the legacy formula with the same λ
+        convention: eps_pred + (1-λ) * eps_random."""
         from src.pixelrush import ddim_forward_one_step, ddim_reverse_one_step_to_zero
         torch.manual_seed(123)
         coarse = torch.randn(1, 4, 32, 32)
@@ -1185,10 +1189,10 @@ class TestNoiseInjectionModes:
         eps_random = torch.randn(1, 4, 32, 32)
         eps_pred = self._eps_fn()(coarse, 0)
         z_k = ddim_forward_one_step(coarse, eps_pred, 0.8)
-        eps_inj = eps_pred + 0.5 * eps_random
+        eps_inj = eps_pred + (1.0 - 0.5) * eps_random
         expected = ddim_reverse_one_step_to_zero(z_k, eps_inj, 0.8)
         assert torch.allclose(out, expected, atol=1e-4), (
-            "additive mode must equal eps_pred + lambda * eps_random"
+            "additive mode must equal eps_pred + (1-λ) * eps_random"
         )
 
     def test_default_mode_is_slerp(self):
@@ -1251,11 +1255,90 @@ class TestPixelRushSlerpHF:
             sigma_at=lambda t: 0.867,
         )
         ratio = _hf_energy(refined) / _hf_energy(coarse)
-        # Calibrated in Step 11 of plan 2026-09-02: measured 0.748 on this
-        # mock (additive companion: 0.955). Bound set to 0.6 (20% below
-        # measured) — robust to RNG stream variation while catching the
-        # space-mixing symptom (pre-fix behavior removes 25%+ HF).
-        assert ratio >= 0.6, (
+        # Calibrated in Step 11 of plan 2026-09-02, recalibrated post-λ-fix:
+        # 0.584 on this mock under the flipped convention (λ weights the
+        # prediction; the pre-fix convention measured 0.748 because 95%
+        # random noise added HF). Bound 0.5.
+        assert ratio >= 0.5, (
             f"slerp-mode refinement removed too much HF (ratio={ratio:.3f}); "
-            "expected >= 0.6 (calibrated; measured 0.748)"
+            "expected >= 0.5 (post-λ-fix calibration; measured 0.584)"
+        )
+
+
+# ---------------------------------------------------------------------------
+# Post-release regression: lambda convention (2026-09-02 user report)
+# ---------------------------------------------------------------------------
+
+@pytest.mark.unit
+class TestLambdaConvention:
+    """Regression guard for the reported artifact: "structure similar to
+    the original raw image, but completely noisy — soft non-uniform
+    patches all over".
+
+    Root cause: the injection used slerp(eps_pred, eps_random, 0.95),
+    which at real scales makes the injected eps 99.6% PURE RANDOM (the
+    corrected doc's own caveat flagged the argument order as the one
+    detail to check). The reverse step then subtracted a random vector
+    per patch: per-pixel noise std ~1.17 vs signal std ~1, rendered
+    through the Gaussian feather as soft blurred patches. λ must weight
+    the PREDICTION: slerp(eps_random, eps_refined, λ).
+    """
+
+    SIGMA_K = 0.867
+
+    def test_injected_noise_small_vs_signal_at_paper_lambda(self):
+        """At real-model scales (model-space signal std 1, eps std 1) the
+        patch-independent noise in x0_hat must stay well below the signal.
+
+        Pre-fix (λ on the random side): noise std 1.17 vs signal 1.0 —
+        structure visible through heavy soft noise (the report).
+        Post-fix (λ on the prediction): noise std ~0.07.
+        """
+        from src.pixelrush import slerp
+        torch.manual_seed(0)
+        eps_refined = torch.randn(1, 4, 64, 64)   # model eps, std 1
+        eps_random = torch.randn(1, 4, 64, 64)
+        # The random component of the injected eps vs the prediction
+        inj = slerp(eps_random, eps_refined, 0.95)
+        noise_std = self.SIGMA_K * (inj - eps_refined).std().item()
+        assert noise_std < 0.2, (
+            f"Injected patch-independent noise std {noise_std:.3f} vs "
+            "signal 1.0 — λ is weighting the RANDOM side again "
+            "(pre-fix value: ~1.17, the reported 'completely noisy' artifact)"
+        )
+
+    def test_refinement_end_to_end_correlates_with_clean(self):
+        """One-patch refinement at real scales: output must stay highly
+        correlated with the clean signal (>= 0.95), not merely 'structure
+        visible through noise' (pre-fix correlation: ~0.65)."""
+        torch.manual_seed(0)
+        x0 = torch.randn(1, 4, 64, 64)              # clean signal, std 1
+        eps_true = torch.randn(1, 4, 64, 64)
+        eps_refined = eps_true + 0.2 * torch.randn(1, 4, 64, 64)  # good model
+
+        cfg = PixelRushConfig(
+            patch_h=64, patch_w=64, overlap=0.5, k_timestep=249,
+            noise_lambda=0.95, noise_injection="slerp",
+        )
+        # Single patch == full latent; run through refine_latent_once so
+        # the guard covers the real code path (forward + injection + reverse).
+        # NOTE: refine_latent_once applies the forward step itself, so the
+        # input must be the CLEAN patch (passing x_K would double-noise).
+        def eps_fn(latent, timestep):
+            return eps_refined
+
+        refined = refine_latent_once(
+            x0, eps_fn, eps_fn,
+            lambda t: 1.0 / (self.SIGMA_K ** 2 + 1.0), cfg,
+            forward_step=lambda x, e, s: x + self.SIGMA_K * e,
+            reverse_step=lambda x, e, s: x - self.SIGMA_K * e,
+            sigma_at=lambda t: self.SIGMA_K,
+        )
+        a = refined.flatten()
+        b = x0.flatten()
+        corr = torch.corrcoef(torch.stack([a, b]))[0, 1].item()
+        assert corr >= 0.95, (
+            f"Refined output correlates only {corr:.3f} with the clean "
+            "signal — pre-fix behavior (~0.65) reads as 'structure visible "
+            "but completely noisy'"
         )

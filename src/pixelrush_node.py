@@ -535,12 +535,12 @@ class PixelRushNode(io.ComfyNode):
                 ),
                 io.Float.Input(
                     "noise_lambda", default=0.95, min=0.0, max=1.0, step=0.01,
-                    tooltip="Noise injection strength (slerp between predicted and random noise).",
+                    tooltip="Noise injection coefficient: weight of the model's prediction (0.95 = 95% prediction + 5% random noise).",
                 ),
                 io.Combo.Input(
                     "noise_injection", options=["slerp", "additive"],
                     default="slerp",
-                    tooltip="Noise injection mode: slerp (paper) or additive (legacy 2026-08-13 behavior).",
+                    tooltip="Noise injection mode: slerp (paper) or additive (legacy 2026-08-13 formula).",
                 ),
                 io.Float.Input(
                     "overlap", default=0.50, min=0.0, max=0.75, step=0.05,

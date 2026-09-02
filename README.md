@@ -234,7 +234,7 @@ Cascade-based refinement node. Generates at native resolution first, then progre
 |:---|:---|
 | `num_cascade_stages` | Number of cascade stages — each doubles the resolution. |
 | `refiner_model` | **Optional** separate refiner model (paper setup: SDXL base + SDXL-Turbo). When not connected, the base model refines too. |
-| `noise_lambda` | Noise injection strength per cascade stage (paper default 0.95 — result sits close to the random vector by the paper's stated convention). |
+| `noise_lambda` | Noise injection coefficient — the weight of the model's prediction (paper default 0.95 = 95% prediction + 5% random noise). |
 | `noise_injection` | `slerp` (paper default) or `additive` (legacy pre-2.9 behavior, kept for workflows tuned against it). |
 | `overlap` | Overlap between adjacent patches (blends seams). |
 | `gaussian_sigma` | Analytic Gaussian feather sigma (paper default 24; rule of thumb: σ ≈ patch_size / 5). |
@@ -244,7 +244,7 @@ Cascade-based refinement node. Generates at native resolution first, then progre
 > PixelRush calls the diffusion model directly (not through ComfyUI's sampler), performing its own CFG and prediction-type handling for EPS, flow, V-prediction and X0 models.
 
 > [!IMPORTANT]
-> **2.9 migration notes:** the noise injection now uses the paper's SLERP by default (set `noise_injection` to `additive` for the previous behavior); `gaussian_sigma` default moved 8 → 24 and its range extends to 128; the `gaussian_kernel_size` input was removed (the mask is now the paper's analytic Gaussian — old workflows simply ignore the stale value).
+> **2.9 migration notes:** the noise injection now uses the paper's SLERP with λ weighting the model's prediction (set `noise_injection` to `additive` for the legacy formula); `gaussian_sigma` default moved 8 → 24 and its range extends to 128; the `gaussian_kernel_size` input was removed (the mask is now the paper's analytic Gaussian — old workflows simply ignore the stale value).
 
 </details>
 
@@ -314,6 +314,9 @@ Restart ComfyUI. No further dependency installation is required.
 <p align="right"><a href="#readme-top" title="back to top">⟔ ▲ ⟓</a></p>
 
 ## ▓ Changelog
+
+### v2.9.1 — 2026-09-02
+- **Fixed the PixelRush noise-injection λ convention** (user-reported "structure visible but completely noisy, soft blurred patches"). The injection now uses `slerp(eps_random, eps_refined, λ)` — λ weights the **model's prediction** (0.95 = 95% prediction + 5% noise). The previous order (`slerp(eps_pred, eps_random, λ)`) made λ=0.95 mean 99.6% pure random noise: at real scales per-pixel noise std ≈ 1.17 vs signal ≈ 1.0, which rendered through the Gaussian feather as the reported soft-patch noise. The `additive` legacy mode uses the same convention (`eps_refined + (1−λ)·eps_random`). This was exactly the argument-order caveat `pixelrush-correct.txt` flagged for verification against the authors' implementation.
 
 ### v2.9.0 — 2026-09-02
 - **PixelRush realigned with the corrected theory** (plan 2026-09-02): standard raw-vector SLERP (with collinear lerp fallback) for the noise injection — the paper's `slerp(eps_pred, eps_random, λ)` is now the default, with the 2026-08-13 additive injection kept as an opt-in (`noise_injection`).
