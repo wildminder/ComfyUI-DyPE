@@ -72,11 +72,14 @@ class PixelRushConfig:
 # Spherical interpolation
 # ---------------------------------------------------------------------------
 
-def spherical_lerp(a: Tensor, b: Tensor, t: float, eps: float = 1e-7) -> Tensor:
-    """Spherical interpolation (SLERP) between tensors ``a`` and ``b``.
+def slerp(a: Tensor, b: Tensor, t: float, eps: float = 1e-7) -> Tensor:
+    """Standard vector SLERP between tensors ``a`` and ``b`` (t=0 → a, t=1 → b).
 
-    Treats each sample's complete latent tensor as one vector.
-    Falls back to linear interpolation when vectors are nearly parallel.
+    Treats each sample's complete latent tensor as one vector. Raw-vector
+    form (paper/corrected-theory convention): the magnitudes are carried by
+    the slerp coefficients themselves, not interpolated separately. Falls
+    back to linear interpolation when the vectors are nearly collinear
+    (sin(omega) < 1e-4), where SLERP is numerically unstable.
 
     Parameters
     ----------
@@ -91,32 +94,37 @@ def spherical_lerp(a: Tensor, b: Tensor, t: float, eps: float = 1e-7) -> Tensor:
     Tensor
         Same shape as ``a``.
     """
-    a_flat = a.flatten(1)
-    b_flat = b.flatten(1)
+    assert a.shape == b.shape
+
+    a_flat = a.flatten(start_dim=1)
+    b_flat = b.flatten(start_dim=1)
 
     a_norm = a_flat.norm(dim=1, keepdim=True).clamp_min(eps)
     b_norm = b_flat.norm(dim=1, keepdim=True).clamp_min(eps)
 
-    a_unit = a_flat / a_norm
-    b_unit = b_flat / b_norm
+    cos_omega = (a_flat * b_flat).sum(dim=1, keepdim=True) / (a_norm * b_norm)
+    cos_omega = cos_omega.clamp(-1.0 + eps, 1.0 - eps)
 
-    cosine = (a_unit * b_unit).sum(dim=1, keepdim=True).clamp(-1 + eps, 1 - eps)
-    omega = torch.acos(cosine)
-    sin_omega = torch.sin(omega).clamp_min(eps)
+    omega = torch.acos(cos_omega)
+    sin_omega = torch.sin(omega)
 
-    t_tensor = torch.full_like(omega, t)
+    t_tensor = torch.full_like(omega, float(t))
 
-    # Spherical direction uses UNIT vectors. Using raw vectors (a_flat/b_flat)
-    # would square the norm whenever |a| != |b| (always true here: eps_pred≈0,
-    # eps_rand≈1), making eps_inj ~60x too large and the output pure noise.
-    direction = (
-        torch.sin((1.0 - t_tensor) * omega) / sin_omega * a_unit
-        + torch.sin(t_tensor * omega) / sin_omega * b_unit
+    # Standard vector SLERP. No separate magnitude multiplication.
+    slerp_flat = (
+        torch.sin((1.0 - t_tensor) * omega) / sin_omega * a_flat
+        + torch.sin(t_tensor * omega) / sin_omega * b_flat
     )
 
-    # Interpolate magnitudes separately (linear)
-    magnitude = (1.0 - t_tensor) * a_norm + t_tensor * b_norm
-    return (direction * magnitude).view_as(a)
+    # If vectors are almost collinear, SLERP becomes unstable.
+    lerp_flat = (1.0 - t_tensor) * a_flat + t_tensor * b_flat
+    use_lerp = sin_omega.abs() < 1e-4
+
+    return torch.where(use_lerp, lerp_flat, slerp_flat).view_as(a)
+
+
+# Backward-compatibility alias (previous name).
+spherical_lerp = slerp
 
 
 # ---------------------------------------------------------------------------

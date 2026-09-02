@@ -13,69 +13,83 @@ from src.pixelrush import (
     patch_positions,
     pixelrush_cascade,
     refine_latent_once,
+    slerp,
     spherical_lerp,
 )
 
 # ---------------------------------------------------------------------------
-# spherical_lerp
+# slerp (corrected-theory standard vector SLERP)
 # ---------------------------------------------------------------------------
 
 @pytest.mark.unit
-class TestSphericalLerp:
-    def test_t_zero_proportional_to_a(self):
-        """t=0 must return exactly a (unit-vector SLERP: direction=a_unit,
-        magnitude=a_norm -> a_unit*a_norm = a)."""
+class TestSlerp:
+    def test_t_zero_returns_a(self):
+        """t=0 must return exactly a (sin(omega)/sin(omega) coefficient = 1)."""
         a = torch.randn(2, 4, 8, 8)
         b = torch.randn(2, 4, 8, 8)
-        result = spherical_lerp(a, b, t=0.0)
-        # Correct SLERP uses unit vectors: at t=0, direction = a_unit, magnitude = a_norm
-        # -> result = a_unit * a_norm = a (exactly)
+        result = slerp(a, b, t=0.0)
         assert torch.allclose(result, a, atol=1e-5)
 
-    def test_t_one_proportional_to_b(self):
-        """t=1 must return exactly b (unit-vector SLERP: direction=b_unit,
-        magnitude=b_norm -> b_unit*b_norm = b)."""
+    def test_t_one_returns_b(self):
+        """t=1 must return exactly b."""
         a = torch.randn(2, 4, 8, 8)
         b = torch.randn(2, 4, 8, 8)
-        result = spherical_lerp(a, b, t=1.0)
+        result = slerp(a, b, t=1.0)
         assert torch.allclose(result, b, atol=1e-5)
-
-    def test_midpoint_between(self):
-        a = torch.randn(1, 4, 4, 4)
-        b = torch.randn(1, 4, 4, 4)
-        result = spherical_lerp(a, b, t=0.5)
-        # Midpoint should be between a and b
-        assert result.shape == a.shape
-
-    def test_parallel_vectors_linear(self):
-        """SLERP of parallel vectors: result = unit * (0.5*|a| + 0.5*|b|).
-
-        Using unit vectors, the direction for parallel a,b is just the shared
-        unit vector, so result = unit * interpolated_magnitude (NOT squared).
-        """
-        a = torch.ones(1, 8)
-        b = torch.ones(1, 8) * 3.0
-        result = spherical_lerp(a, b, t=0.5)
-        # For parallel vectors (omega≈0): direction = 0.5*a_unit + 0.5*b_unit = unit
-        # magnitude = 0.5 * norm_a + 0.5 * norm_b
-        norm_a = a.flatten(1).norm(dim=1, keepdim=True)
-        norm_b = b.flatten(1).norm(dim=1, keepdim=True)
-        unit = a / norm_a
-        magnitude = 0.5 * norm_a + 0.5 * norm_b
-        expected = unit * magnitude  # = 2.0 per element
-        assert torch.allclose(result, expected, atol=0.1)
 
     def test_preserves_shape(self):
         a = torch.randn(2, 3, 16, 16)
         b = torch.randn(2, 3, 16, 16)
-        result = spherical_lerp(a, b, t=0.3)
+        result = slerp(a, b, t=0.3)
         assert result.shape == a.shape
 
     def test_no_nan(self):
         a = torch.randn(1, 4, 4, 4)
         b = torch.randn(1, 4, 4, 4)
-        result = spherical_lerp(a, b, t=0.95)
+        result = slerp(a, b, t=0.95)
         assert not torch.isnan(result).any()
+
+    def test_collinear_falls_back_to_lerp(self):
+        """Nearly parallel vectors must use the lerp fallback exactly.
+
+        b = 2a is exactly collinear with a, so sin(omega)=0 and the
+        use_lerp branch must fire, giving the exact linear interpolation.
+        """
+        a = torch.ones(1, 8)
+        b = torch.ones(1, 8) * 3.0
+        result = slerp(a, b, t=0.5)
+        expected = 0.5 * a + 0.5 * b
+        assert torch.allclose(result, expected, atol=1e-6), (
+            f"Collinear slerp must equal lerp exactly; got {result.flatten()[:3]}, "
+            f"expected {expected.flatten()[:3]}"
+        )
+
+    def test_orthogonal_formula(self):
+        """Orthogonal unit vectors at t=0.5: result must be (a+b)/sqrt(2).
+
+        Standard SLERP identity. The old unit-vector x linear-magnitude form
+        gives |result| ~ |(a+b)/2|-profile magnitude; the corrected raw-vector
+        form gives exactly |a| = |b| = 1 at the midpoint for unit inputs —
+        this pins the corrected magnitude behavior.
+        """
+        a = torch.zeros(1, 2)
+        a[0, 0] = 1.0
+        b = torch.zeros(1, 2)
+        b[0, 1] = 1.0
+        result = slerp(a, b, t=0.5)
+        expected = torch.zeros(1, 2)
+        expected[0, 0] = 1.0 / math.sqrt(2.0)
+        expected[0, 1] = 1.0 / math.sqrt(2.0)
+        assert torch.allclose(result, expected, atol=1e-5), (
+            f"slerp midpoint of orthogonal unit vectors must be (a+b)/sqrt(2), "
+            f"got {result}"
+        )
+        # Norm must be exactly 1 (stays on the unit sphere)
+        assert abs(result.flatten().norm().item() - 1.0) < 1e-5
+
+    def test_alias_spherical_lerp_is_slerp(self):
+        """The backward-compat alias must point at the same function."""
+        assert spherical_lerp is slerp
 
 
 # ---------------------------------------------------------------------------

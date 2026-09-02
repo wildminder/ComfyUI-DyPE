@@ -700,26 +700,32 @@ class TestPixelRushInferenceBugFix:
             "is needed when getting raw epsilon directly"
         )
 
-    # --- Bug 3: spherical_lerp must use UNIT vectors (not raw) ---
+    # --- Bug 3 fixed per corrected theory: slerp uses RAW vectors ---
 
-    def test_spherical_lerp_uses_unit_vectors(self):
-        """spherical_lerp must use a_unit/b_unit in the direction, not raw a_flat/b_flat.
+    def test_slerp_uses_raw_vectors_and_lerp_fallback(self):
+        """slerp must use the corrected standard raw-vector form.
 
-        Using raw vectors squares the norm whenever |a| != |b| (always true for
-        eps_pred≈0 vs eps_rand≈1), making eps_inj ~60x too large -> pure noise.
+        The corrected-theory reference (pixelrush-correct.txt) uses raw
+        a_flat/b_flat in the slerp coefficients with a lerp fallback for
+        nearly-collinear vectors — NOT the unit-vector x separate-magnitude
+        form the 2026-08-12 fix introduced.
         """
         content = (pathlib.Path(__file__).parent.parent / "src" / "pixelrush.py").read_text(encoding="utf-8")
-        assert "a_unit" in content, "spherical_lerp should define a_unit"
-        assert "b_unit" in content, "spherical_lerp should define b_unit"
-        # The direction term must use a_unit/b_unit, NOT a_flat/b_flat.
-        assert "sin_omega * a_flat" not in content, (
-            "spherical_lerp direction must use a_unit (unit vector), not a_flat (raw)"
+        assert "sin_omega * a_flat" in content, (
+            "slerp direction must use a_flat (raw vector), the corrected-theory form"
         )
-        assert "sin_omega * b_flat" not in content, (
-            "spherical_lerp direction must use b_unit (unit vector), not b_flat (raw)"
+        assert "sin_omega * b_flat" in content, (
+            "slerp direction must use b_flat (raw vector), the corrected-theory form"
+        )
+        assert "use_lerp" in content, (
+            "slerp must define the collinear lerp fallback (sin_omega < 1e-4)"
+        )
+        assert "a_unit" not in content, (
+            "slerp must not use unit vectors with separate magnitude "
+            "interpolation (superseded 2026-08-12 form)"
         )
 
-    def test_spherical_lerp_does_not_explode_norm(self):
+    def test_slerp_does_not_explode_norm(self):
         """Regression: slerp of two different-magnitude vectors must not square the norm.
 
         slerp(eps_pred (norm~6), eps_rand (norm~64), 0.95) must yield a result
@@ -729,11 +735,11 @@ class TestPixelRushInferenceBugFix:
         sys.path.insert(0, str(pathlib.Path(__file__).parent.parent))
         import torch
 
-        from src.pixelrush import spherical_lerp
+        from src.pixelrush import slerp
         torch.manual_seed(0)
         a = 0.1 * torch.randn(1, 4, 32, 32)   # eps_pred-like (small norm)
         b = torch.randn(1, 4, 32, 32)          # eps_rand-like (large norm)
-        out = spherical_lerp(a, b, t=0.95)
+        out = slerp(a, b, t=0.95)
         out_norm = out.flatten(1).norm(dim=1).item()
         # Interpolated magnitude should be ~ (1-0.95)*||a|| + 0.95*||b||
         expected_mag = 0.05 * a.flatten(1).norm().item() + 0.95 * b.flatten(1).norm().item()
