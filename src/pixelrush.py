@@ -215,6 +215,60 @@ def patch_positions(
 # DDIM inversion / denoising
 # ---------------------------------------------------------------------------
 
+def predict_x0_from_epsilon(
+    x_t: Tensor,
+    epsilon: Tensor,
+    alpha_bar_t: Tensor | float,
+    eps: float = 1e-8,
+) -> Tensor:
+    """Recover x_0 from a noised latent and its epsilon.
+
+    x_t = sqrt(alpha_bar_t) * x_0 + sqrt(1 - alpha_bar_t) * epsilon, so:
+        x_0 = (x_t - sqrt(1 - alpha_bar_t) * epsilon) / sqrt(alpha_bar_t)
+    """
+    alpha_bar_t = torch.as_tensor(
+        alpha_bar_t, device=x_t.device, dtype=x_t.dtype
+    )
+
+    sqrt_alpha = alpha_bar_t.sqrt().clamp_min(eps)
+    sqrt_one_minus_alpha = (1.0 - alpha_bar_t).clamp_min(0.0).sqrt()
+
+    return (x_t - sqrt_one_minus_alpha * epsilon) / sqrt_alpha
+
+
+def ddim_deterministic_step(
+    x_from: Tensor,
+    epsilon_from: Tensor,
+    alpha_bar_from: Tensor | float,
+    alpha_bar_to: Tensor | float,
+) -> Tensor:
+    """Deterministic DDIM (eta=0) transition between ARBITRARY timesteps.
+
+    Recovers x_hat_0 from the source timestep via ``predict_x0_from_epsilon``,
+    then re-noises it to the destination timestep, keeping the SAME epsilon:
+
+        x_to = sqrt(alpha_bar_to) * x_hat_0 + sqrt(1 - alpha_bar_to) * epsilon
+
+    Works in either direction:
+      - inversion: source 0 -> destination K
+      - denoising: source K -> destination 0
+    """
+    x0_pred = predict_x0_from_epsilon(
+        x_t=x_from,
+        epsilon=epsilon_from,
+        alpha_bar_t=alpha_bar_from,
+    )
+
+    alpha_bar_to = torch.as_tensor(
+        alpha_bar_to, device=x_from.device, dtype=x_from.dtype
+    )
+
+    return (
+        alpha_bar_to.sqrt() * x0_pred
+        + (1.0 - alpha_bar_to).clamp_min(0.0).sqrt() * epsilon_from
+    )
+
+
 def ddim_forward_one_step(
     z0: Tensor,
     eps0: Tensor,
@@ -227,11 +281,7 @@ def ddim_forward_one_step(
         z_K = sqrt(alpha_bar_K) * z_0
               + sqrt(1 - alpha_bar_K) * eps(z_0, 0)
     """
-    if not torch.is_tensor(alpha_bar_k):
-        alpha_bar_k = torch.tensor(alpha_bar_k, device=z0.device, dtype=z0.dtype)
-
-    a = alpha_bar_k.to(device=z0.device, dtype=z0.dtype)
-    return a.sqrt() * z0 + (1.0 - a).sqrt() * eps0
+    return ddim_deterministic_step(z0, eps0, 1.0, alpha_bar_k)
 
 
 def ddim_reverse_one_step_to_zero(
@@ -245,11 +295,7 @@ def ddim_reverse_one_step_to_zero(
 
         z_0_hat = (z_K - sqrt(1-alpha_bar_K) * eps_K) / sqrt(alpha_bar_K)
     """
-    if not torch.is_tensor(alpha_bar_k):
-        alpha_bar_k = torch.tensor(alpha_bar_k, device=z_k.device, dtype=z_k.dtype)
-
-    a = alpha_bar_k.to(device=z_k.device, dtype=z_k.dtype)
-    return (z_k - (1.0 - a).sqrt() * eps_k) / a.sqrt().clamp_min(1e-8)
+    return ddim_deterministic_step(z_k, eps_k, alpha_bar_k, 1.0)
 
 
 # ---------------------------------------------------------------------------

@@ -6,12 +6,14 @@ import torch
 
 from src.pixelrush import (
     PixelRushConfig,
+    ddim_deterministic_step,
     ddim_forward_one_step,
     ddim_reverse_one_step_to_zero,
     gaussian_feather_mask,
     gaussian_kernel_2d,
     patch_positions,
     pixelrush_cascade,
+    predict_x0_from_epsilon,
     refine_latent_once,
     slerp,
     spherical_lerp,
@@ -274,6 +276,77 @@ class TestDDIMReverse:
         z_0 = ddim_reverse_one_step_to_zero(z_k, eps, alpha_bar_k=a)
         expected = (z_k - math.sqrt(1 - a) * eps) / math.sqrt(a)
         assert torch.allclose(z_0, expected, atol=1e-5)
+
+
+# ---------------------------------------------------------------------------
+# ddim_deterministic_step / predict_x0_from_epsilon (generic transitions)
+# ---------------------------------------------------------------------------
+
+@pytest.mark.unit
+class TestDDIMDeterministicStep:
+    def test_predict_x0_formula(self):
+        """predict_x0_from_epsilon must invert the noising formula exactly.
+
+        x_t = sqrt(ab)*x0 + sqrt(1-ab)*eps -> x0 recovered exactly for
+        ab in {0.9, 0.5, 0.1}.
+        """
+        for ab in (0.9, 0.5, 0.1):
+            x0 = torch.randn(1, 4, 8, 8)
+            eps = torch.randn(1, 4, 8, 8)
+            x_t = math.sqrt(ab) * x0 + math.sqrt(1 - ab) * eps
+            x0_rec = predict_x0_from_epsilon(x_t, eps, ab)
+            assert torch.allclose(x0_rec, x0, atol=1e-4), (
+                f"x0 recovery failed for alpha_bar={ab}"
+            )
+
+    def test_arbitrary_transition_formula(self):
+        """step(x, e, 0.5, 0.2) == sqrt(0.2)*x_hat_0 + sqrt(0.8)*e
+        with x_hat_0 = (x - sqrt(0.5)*e)/sqrt(0.5)."""
+        x = torch.randn(1, 4, 8, 8)
+        e = torch.randn(1, 4, 8, 8)
+        out = ddim_deterministic_step(x, e, 0.5, 0.2)
+        x0_hat = (x - math.sqrt(0.5) * e) / math.sqrt(0.5)
+        expected = math.sqrt(0.2) * x0_hat + math.sqrt(0.8) * e
+        assert torch.allclose(out, expected, atol=1e-5)
+
+    def test_midpoint_chain_equivalence(self):
+        """Deterministic DDIM (eta=0) is path-independent: stepping
+        a->m->b with the same epsilon equals the direct a->b step."""
+        x = torch.randn(1, 4, 8, 8)
+        e = torch.randn(1, 4, 8, 8)
+        direct = ddim_deterministic_step(x, e, 0.9, 0.1)
+        via_mid = ddim_deterministic_step(x, e, 0.9, 0.5)
+        via_mid = ddim_deterministic_step(via_mid, e, 0.5, 0.1)
+        assert torch.allclose(direct, via_mid, atol=1e-4), (
+            "eta=0 DDIM transitions must be path-independent"
+        )
+
+    def test_forward_wrapper_matches_generic(self):
+        """ddim_forward_one_step == ddim_deterministic_step(·, 1.0, ab_k)."""
+        z0 = torch.randn(1, 4, 8, 8)
+        eps = torch.randn(1, 4, 8, 8)
+        a = 0.7
+        via_wrapper = ddim_forward_one_step(z0, eps, alpha_bar_k=a)
+        via_generic = ddim_deterministic_step(z0, eps, 1.0, a)
+        assert torch.allclose(via_wrapper, via_generic, atol=1e-6)
+
+    def test_reverse_wrapper_matches_generic(self):
+        """ddim_reverse_one_step_to_zero == ddim_deterministic_step(·, ab_k, 1.0)."""
+        z_k = torch.randn(1, 4, 8, 8)
+        eps = torch.randn(1, 4, 8, 8)
+        a = 0.7
+        via_wrapper = ddim_reverse_one_step_to_zero(z_k, eps, alpha_bar_k=a)
+        via_generic = ddim_deterministic_step(z_k, eps, a, 1.0)
+        assert torch.allclose(via_wrapper, via_generic, atol=1e-6)
+
+    def test_round_trip_identity(self):
+        """reverse(forward(x0, e, ab), e, ab) must recover x0."""
+        x0 = torch.randn(1, 4, 8, 8)
+        e = torch.randn(1, 4, 8, 8)
+        ab = 0.5
+        z_k = ddim_forward_one_step(x0, e, alpha_bar_k=ab)
+        z_0_hat = ddim_reverse_one_step_to_zero(z_k, e, alpha_bar_k=ab)
+        assert torch.allclose(z_0_hat, x0, atol=1e-4)
 
 
 # ---------------------------------------------------------------------------
