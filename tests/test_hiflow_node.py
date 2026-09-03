@@ -441,3 +441,108 @@ class TestExecuteWiring:
         samples = result[0]["samples"] if not hasattr(result, "shape") \
             else result
         assert samples.shape[-1] == 32
+
+
+# ---------------------------------------------------------------------------
+# Step 8 — schema, registration, docs, version
+# ---------------------------------------------------------------------------
+
+@pytest.mark.unit
+class TestHiFlowNodeSchema:
+    def _src(self):
+        import pathlib
+        return (pathlib.Path(__file__).parent.parent / "src"
+                / "hiflow_node.py").read_text(encoding="utf-8")
+
+    def test_schema_inputs_and_paper_defaults(self):
+        src = self._src()
+        for inp in ["model", "vae", "positive", "negative", "latent_image",
+                    "cfg", "steps", "guidance", "steps_per_stage", "tau",
+                    "filter_ratio", "alpha_scale", "beta_scale", "upsampling",
+                    "target_resolution"]:
+            assert f'"{inp}"' in src, f"missing schema input {inp}"
+        assert "default=3.5" in src     # cfg (FLUX-dev)
+        assert "default=30" in src      # steps (paper)
+        assert "default=4.5" in src     # guidance
+        assert "default=16" in src      # steps_per_stage (repo)
+        assert "default=0.6" in src     # tau (paper 1K->2K)
+        assert "default=0.2" in src     # filter_ratio (repo)
+        assert 'default="latent"' in src
+
+    def test_schema_execute_signature_matches(self):
+        import re
+        src = self._src()
+        pattern = re.compile(r'io\.\w+\.Input\(\s*"([^"]+)"')
+        schema_inputs = set(pattern.findall(src))
+        assert schema_inputs, "failed to parse schema inputs"
+        sig_start = src.index("def execute(cls,")
+        sig_start += len("def execute(cls,")
+        sig = src[sig_start:src.index(") -> io.NodeOutput:", sig_start)]
+        params = set()
+        for chunk in sig.split(","):
+            chunk = chunk.strip()
+            if "=" in chunk:
+                chunk = chunk.split("=")[0].strip()
+            if chunk and chunk != "cls":
+                params.add(chunk)
+        missing = (schema_inputs - params) | (params - schema_inputs)
+        assert not missing, (
+            f"schema/execute drift: schema-only={schema_inputs - params}, "
+            f"exec-only={params - schema_inputs}"
+        )
+
+    def test_node_registered_in_extension(self):
+        import pathlib
+        init = (pathlib.Path(__file__).parent.parent
+                / "__init__.py").read_text(encoding="utf-8")
+        assert "HiFlowNode" in init, "HiFlowNode must be imported in __init__"
+        assert "HiFlowNode" in init.split("get_node_list")[-1], (
+            "HiFlowNode must appear in get_node_list()"
+        )
+
+    def test_category_matches_cascade_family(self):
+        assert 'category="image/upscaling"' in self._src()
+
+    def test_validate_inputs_none_passes(self):
+        assert hfn.HiFlowNode.validate_inputs(target_resolution=None) is True
+
+    def test_validate_inputs_small_rejected(self):
+        result = hfn.HiFlowNode.validate_inputs(target_resolution=8)
+        assert isinstance(result, str)
+
+
+@pytest.mark.unit
+class TestHiFlowDocs:
+    def test_readme_documents_hiflow(self):
+        import pathlib
+        readme = (pathlib.Path(__file__).parent.parent
+                  / "README.md").read_text(encoding="utf-8")
+        assert "HiFlow" in readme
+        assert "user-content-hiflow" in readme
+
+    def test_version_bumped(self):
+        import pathlib
+        import re
+        pyproject = (pathlib.Path(__file__).parent.parent
+                     / "pyproject.toml").read_text(encoding="utf-8")
+        readme = (pathlib.Path(__file__).parent.parent
+                  / "README.md").read_text(encoding="utf-8")
+        m = re.search(r'^version = "([^"]+)"', pyproject, re.MULTILINE)
+        assert m and m.group(1) == "2.10.0"
+        assert "### v2.10.0" in readme
+
+    def test_workflow_json_parses_and_uses_known_nodes(self):
+        import json
+        import pathlib
+        wf_path = (pathlib.Path(__file__).parent.parent
+                   / "example_workflows" / "HiFlow-Flux-workflow.json")
+        data = json.loads(wf_path.read_text(encoding="utf-8"))
+        types = set()
+        for v in data.values():
+            if isinstance(v, dict) and "class_type" in v:
+                types.add(v["class_type"])
+        core = {"UNETLoader", "DualCLIPLoader", "VAELoader", "CLIPTextEncode",
+                "EmptySD3LatentImage", "VAEDecode", "SaveImage"}
+        unknown = types - core - {"HiFlow"}
+        assert not unknown, f"workflow references unknown nodes: {unknown}"
+        assert "HiFlow" in types

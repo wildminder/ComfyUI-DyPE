@@ -56,6 +56,7 @@ Training-free methods that push pre-trained DiT models far beyond their native r
 | **❖ [HAP (HRDiT)](#user-content-hap-hrdit)** | Sparse-attention acceleration — the speed half of HRDiT. |
 | **❖ [PixelRush](#user-content-pixelrush)** | Cascade patch refinement of an existing base image. |
 | **❖ [FreeScale](#user-content-freescale)** | Tuning-free self-cascade upscaling. |
+| **❖ [HiFlow](#user-content-hiflow)** | Trajectory-guided flow upscaling for FLUX-family models. |
 
 ### Which method when?
 
@@ -69,9 +70,10 @@ Two families: **model patches** alter how your own KSampler run attends (no imag
 | **HAP** | FLUX, Qwen/Krea-2, Z-Image, Anima | Calibrated sparse attention (speed) | ✗ | Native high-res generation |
 | **PixelRush** | Any (SDXL, SD1.5, FLUX, Qwen, …) | Patch-wise low-denoise img2img cascade | ✓ | Faithful upscale + refinement |
 | **FreeScale** | FLUX-family DiTs | Scale-fused attention + self-cascade | ✓ | Regenerative hi-res, mostly new content |
+| **HiFlow** | Flow models (FLUX, Qwen-Image, …) | Time-matched reference trajectory guidance | ✓ | Structure-faithful flow upscale |
 
 > [!TIP]
-> **Quick picker:** starting from noise → DyPE (or SEGA), add SPA if you see repeated/collapsed structures, add HAP for speed. Starting from an existing image → PixelRush to keep it faithful, FreeScale to re-imagine it at high res (lower its `noise_timestep` for more fidelity).
+> **Quick picker:** starting from noise → DyPE (or SEGA), add SPA if you see repeated/collapsed structures, add HAP for speed. Starting from an existing image → PixelRush to keep it faithful, FreeScale to re-imagine it at high res (lower its `noise_timestep` for more fidelity), HiFlow for FLUX-family flow models — it reuses the whole base-resolution denoising trajectory as guidance, so structure survives while detail is re-synthesized.
 
 <a id="user-content-dype"></a>
 
@@ -286,6 +288,35 @@ Tuning-free higher-resolution generation via scale-fused attention and self-casc
 
 <p align="right"><a href="#readme-top" title="back to top">⟔ ▲ ⟓</a></p>
 
+<a id="user-content-hiflow"></a>
+### ❖ HiFlow
+
+Training-free high-resolution upscaling for **rectified-flow models** (FLUX, Qwen-Image, …) via flow-aligned guidance ([paper](https://arxiv.org/abs/2504.06232), NeurIPS 2025). The base-resolution sampling runs once, recording every per-step clean prediction; each upscale stage then reuses that **time-matched trajectory** as a virtual reference — initialization alignment seeds the stage from it, direction alignment keeps low frequencies true to it, acceleration alignment matches its detail-generation rhythm. Structure survives; high-res detail is synthesized fresh.
+
+**Usage:** connect `model` (flow models only), `vae`, `positive`, `negative` and a base latent at native resolution (e.g. `EmptySD3LatentImage`) → set `target_resolution` → decode. Chain `DyPE (ntk)` before the loader for RoPE extrapolation at the target resolution.
+
+<details>
+<summary><b>Inputs & Parameters</b></summary>
+
+| Parameter | Default | Description |
+|:---|:---:|:---|
+| `cfg` | 3.5 | Base-stage CFG (FLUX-dev default). |
+| `steps` | 30 | Base-stage steps; their clean predictions form the reference trajectory. |
+| `guidance` | 4.5 | Guided-stage CFG (paper uses 4.5–6). |
+| `steps_per_stage` | 16 | Guided steps per cascade stage (upper bound — the stage walks schedule sigmas below `tau`). |
+| `tau` | 0.6 | Stage-entry noise level (paper cascade: 0.6, 0.3, 0.3). Lower = stronger content preservation. |
+| `filter_ratio` | 0.2 | Butterworth low-pass cutoff D for direction alignment (paper 0.4, repo 0.2). |
+| `alpha_scale` / `beta_scale` | 1.0 / 0.5 | Direction / acceleration strength multipliers. |
+| `upsampling` | latent | Reference upsample: `latent` bicubic (repo default) or `pixel` decode→sharpen→encode. |
+| `target_resolution` | 2048 | Target pixels; each stage doubles the base until reached. |
+
+</details>
+
+> [!TIP]
+> **HiFlow inherits the reference's structure** — including its mistakes. Generate a good base first; `tau` lower keeps more of it, higher re-imagines.
+
+<p align="right"><a href="#readme-top" title="back to top">⟔ ▲ ⟓</a></p>
+
 ## ▓ Node Reference
 
 All nodes registered by this pack (V3 schema ids):
@@ -299,6 +330,7 @@ All nodes registered by this pack (V3 schema ids):
 | `HAPCalibrate` | HAP Calibrate (HRDiT) | In-graph scope-plan calibration for HAP. |
 | `PixelRushNode` | PixelRush | Cascade refinement for existing latents. |
 | `FreeScaleNode` | FreeScale | Tuning-free scale-fusion + self-cascade upscaling. |
+| `HiFlowNode` | HiFlow | Trajectory-guided flow upscaling (initialization + direction + acceleration alignment). |
 
 <p align="right"><a href="#readme-top" title="back to top">⟔ ▲ ⟓</a></p>
 
@@ -331,6 +363,9 @@ Restart ComfyUI. No further dependency installation is required.
 <p align="right"><a href="#readme-top" title="back to top">⟔ ▲ ⟓</a></p>
 
 ## ▓ Changelog
+
+### v2.10.0 — 2026-09-03
+- **New HiFlow node** (plan 2026-09-03): training-free high-resolution upscaling for rectified-flow models (FLUX, Qwen-Image, …) via flow-aligned guidance (arXiv:2504.06232). The base-resolution trajectory is recorded per-step and guides each upscale stage through initialization, direction and acceleration alignment. Non-flow and video models are rejected with a pointer to PixelRush.
 
 ### v2.9.1 — 2026-09-02
 - **Fixed the PixelRush noise-injection λ convention** (user-reported "structure visible but completely noisy, soft blurred patches"). The injection now uses `slerp(eps_random, eps_refined, λ)` — λ weights the **model's prediction** (0.95 = 95% prediction + 5% noise). The previous order (`slerp(eps_pred, eps_random, λ)`) made λ=0.95 mean 99.6% pure random noise: at real scales per-pixel noise std ≈ 1.17 vs signal ≈ 1.0, which rendered through the Gaussian feather as the reported soft-patch noise. The `additive` legacy mode uses the same convention (`eps_refined + (1−λ)·eps_random`). This was exactly the argument-order caveat `pixelrush-correct.txt` flagged for verification against the authors' implementation.
@@ -415,6 +450,7 @@ Restart ComfyUI. No further dependency installation is required.
 * **The SEGA authors** — [SEGA](https://github.com/rajabi2001/sega)
 * **The HRDiT team** — [HRDiT](https://arxiv.org/abs/2608.07003) ([code](https://github.com/zylwithxy/HRDiT-HAP)) — basis for SPA & HAP
 * **The PixelRush authors** — [PixelRush](https://arxiv.org/abs/2602.12769)
+* **The HiFlow authors** — [HiFlow](https://arxiv.org/abs/2504.06232) ([code](https://github.com/Bujiazi/HiFlow))
 * **Yanhong Zeng et al.** — [FreeScale](https://github.com/ali-vilab/FreeScale) ([paper](https://arxiv.org/abs/2412.09626))
 * **The ComfyUI team** — for the platform
 

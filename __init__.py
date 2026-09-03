@@ -5,6 +5,7 @@ from comfy_api.latest import ComfyExtension, io
 from .src.freescale_node import FreeScaleNode
 from .src.hap import ScopePlan, apply_hap_to_model
 from .src.hap_calib_node import HAPCalibrate
+from .src.hiflow_node import HiFlowNode
 from .src.patch_utils import apply_dype_to_model, apply_sega_to_model
 from .src.pixelrush_node import PixelRushNode
 from .src.qwen2d_vae_patch import install_qwen2d_patch
@@ -518,7 +519,7 @@ class DyPEExtension(ComfyExtension):
         install_qwen2d_patch()
 
     async def get_node_list(self) -> list[type[io.ComfyNode]]:
-        return [DyPE_FLUX, SEGA, SPA, HAP, HAPCalibrate, PixelRushNode, FreeScaleNode]
+        return [DyPE_FLUX, SEGA, SPA, HAP, HAPCalibrate, PixelRushNode, FreeScaleNode, HiFlowNode]
 
 async def comfy_entrypoint() -> DyPEExtension:
     return DyPEExtension()
