@@ -23,6 +23,7 @@ import logging
 from dataclasses import dataclass
 from typing import Callable
 
+import numpy as np
 import torch
 import torch.fft as fft
 import torch.nn.functional as F
@@ -168,8 +169,85 @@ def build_stage_sigmas(
     return stage
 
 
-def alignment_scales(
-    stage_sigmas: torch.Tensor,
+def denoise_sigmas(
+    full_sigmas: torch.Tensor,
+    denoise: float,
+    steps: int,
+) -> torch.Tensor:
+    """Truncate the base schedule for img2img (denoise < 1).
+
+    ComfyUI KSampler convention (samplers.py set_steps): with denoise d,
+    compute ``new_steps = int(steps / d)`` sigmas and keep the LAST
+    ``(steps + 1)`` of them. The stage then enters at sigma_start < 1, where
+    the cascade's CONST noising ``sigma_start*eps + (1-sigma_start)*latent``
+    keeps ``(1-sigma_start)`` of the content latent — at denoise=1 the
+    schedule starts at sigma 1 and the content weight is 0 (from-noise
+    generation, the reference pipeline's behavior with a random start).
+
+    An EMPTY content latent (all zeros — EmptySD3LatentImage) always keeps
+    the full schedule: truncating for zeros would waste high-noise steps
+    re-generating nothing. Returns ``(sigmas, truncated)``.
+    """
+    if not (0.0 < denoise <= 1.0):
+        raise ValueError(f"denoise must be in (0, 1]; got {denoise!r}")
+    if steps < 1:
+        raise ValueError(f"steps must be >= 1; got {steps!r}")
+    if denoise > 0.9999:
+        return full_sigmas, False
+
+    new_steps = max(steps + 1, int(steps / denoise))
+    if new_steps <= steps:
+        return full_sigmas, False
+
+    full = calculate_full_sigmas(full_sigmas, new_steps, steps)
+    if full is None:
+        return full_sigmas, False
+    return full, True
+
+
+def calculate_full_sigmas(
+    full_sigmas: torch.Tensor,
+    new_steps: int,
+    keep: int,
+) -> torch.Tensor | None:
+    """Re-derive a denser schedule and keep its last ``keep + 1`` sigmas.
+
+    The model's sigma table is not available here (the node passes one
+    concrete schedule), so the denser schedule is interpolated in FLOW-TIME
+    space: sigma(t) is a monotone reparameterization of t, and the "simple"
+    spacing the node uses is even in t. Interpolating on the given grid
+    preserves the entry/exit behavior of ComfyUI's own denser-table slice
+    (entry sigma lower than the steps-schedule's, same spacing class).
+    Returns None when the source schedule is too short to interpolate
+    (fewer than 2 interior sigmas).
+    """
+    interior = full_sigmas[full_sigmas > 0]
+    if interior.numel() < 2:
+        return None
+    t = torch.linspace(1.0, 0.0, interior.numel(), dtype=torch.float64)
+    t_new = torch.linspace(1.0, 0.0, new_steps, dtype=torch.float64)
+    dense = torch.from_numpy(
+        _interp_flow_time(t, interior.to(torch.float64), t_new)
+    )
+    # dense covers flow-times 1 -> 0 at new_steps points: drop the last
+    # (t=0, sigma 0) and re-append an exact 0 so the kept slice has exactly
+    # `keep` interior sigmas + the trailing 0 (KSampler's sigmas[-(steps+1):]).
+    kept = dense[-(keep + 1):-1] if new_steps > keep else dense[:-1]
+    return torch.cat(
+        [kept.to(full_sigmas.dtype),
+         torch.zeros(1, dtype=full_sigmas.dtype)]
+    )
+
+
+def _interp_flow_time(t_old, sigmas_old, t_new):
+    """Monotone-in-sigma interpolation of sigma(t) at new flow times."""
+    t_old_np = t_old.numpy()
+    s_old_np = sigmas_old.numpy()
+    t_new_np = t_new.numpy()
+    return np.interp(t_new_np, t_old_np[::-1], s_old_np[::-1])
+
+
+def alignment_scales(    stage_sigmas: torch.Tensor,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """Per-step direction (alpha) and acceleration (beta) scales.
 
@@ -565,20 +643,31 @@ def hiflow_cascade(
     vae_downscale: int = 8,
     progress_callback: Callable[[int, int, int], None] | None = None,
     noise_seed: int | None = None,
+    denoise: float = 1.0,
 ) -> Tensor:
     """Full HiFlow cascade: base trajectory, then guided upscale stages.
 
     Stage sizes double per stage until the pixel resolution reaches the
     target (plan D6). The base trajectory is recorded once at the native
-    size from a NOISED start (plan D1): ``x_start = sigma[0]*eps +
-    (1 - sigma[0])*initial_latent`` — for every CONST flow model sigma[0]==1
-    (pure noise, the reference's randn start); a non-empty input latent
-    survives as content only when sigma[0] < 1. Each guided stage consumes
-    the PREVIOUS stage's RAW-x0 trajectory (upsampled per-step: latent
-    bicubic or the pixel round trip per ``cfg.upsampling``) and anchors its
-    initialization on the previous chain's FINAL latent, ALWAYS pixel round
-    tripped (decode -> bicubic -> sharpen -> encode) — the reference anchors
-    on the final image regardless of upsampling_choice (plan D2).
+    size from a NOISED start (plan D1): ``x_start = sigma_start*eps +
+    (1 - sigma_start)*initial_latent``.
+
+    ``denoise`` (img2img, KSampler convention): 1.0 runs the full schedule
+    from pure noise (sigma_start == 1 — the reference's randn start; an
+    empty latent + noise_seed reproduces the reference pipeline). Values
+    below 1 truncate the base schedule so sigma_start < 1 and the content
+    latent survives with weight ``(1 - sigma_start)`` — a sampler latent
+    connected here is upsampled faithfully. An EMPTY content latent
+    (all zeros) always keeps the full schedule regardless of denoise
+    (truncating for zeros would waste high-noise steps regenerating
+    nothing).
+
+    Each guided stage consumes the PREVIOUS stage's RAW-x0 trajectory
+    (upsampled per-step: latent bicubic or the pixel round trip per
+    ``cfg.upsampling``) and anchors its initialization on the previous
+    chain's FINAL latent, ALWAYS pixel round tripped (decode -> bicubic ->
+    sharpen -> encode) — the reference anchors on the final image
+    regardless of upsampling_choice (plan D2).
 
     ``noise_seed`` seeds one generator that drives the base-start noise and
     every stage's initialization noise; None uses the global RNG (the
@@ -596,6 +685,25 @@ def hiflow_cascade(
     generator = None
     if noise_seed is not None:
         generator = torch.Generator(device=device).manual_seed(int(noise_seed))
+
+    # ---- Img2img: truncate the base schedule for a CONTENT latent. -------
+    # KSampler convention: denoise < 1 keeps the last (steps+1) of a denser
+    # schedule, entering at sigma_start < 1 where the noising below keeps
+    # (1 - sigma_start) of the content. An empty latent skips truncation —
+    # zeros carry no content to preserve.
+    content_empty = bool(torch.count_nonzero(initial_latent) == 0)
+    effective_denoise = 1.0 if content_empty else float(denoise)
+    if effective_denoise < 1.0:
+        base_sigmas, truncated = denoise_sigmas(
+            base_sigmas, effective_denoise, cfg.steps,
+        )
+        if truncated:
+            logger.info(
+                "HiFlow: denoise %.2f — base schedule truncated, entry "
+                "sigma %.4f (content weight %.1f%%)",
+                effective_denoise, float(base_sigmas[0]),
+                100.0 * (1.0 - float(base_sigmas[0])),
+            )
 
     # ---- Stage A: base trajectory at native size, from a noised start. -----
     sigma_start = float(base_sigmas[0])

@@ -294,6 +294,13 @@ class HiFlowNode(io.ComfyNode):
                     tooltip="Seed for the base-stage noise and each stage's "
                             "initialization noise (one shared generator)."),
                 io.Float.Input(
+                    "denoise", default=1.0, min=0.05, max=1.0, step=0.05,
+                    tooltip="Img2img strength for a CONTENT latent (KSampler "
+                            "convention): 1.0 regenerates from pure noise; "
+                            "lower keeps more of the input image (0.6 "
+                            "enters at ~37% content). Ignored for an empty "
+                            "latent — that always runs the full schedule."),
+                io.Float.Input(
                     "cfg", default=3.5, min=0.0, max=20.0, step=0.1,
                     tooltip="Classifier-free guidance for the BASE stage "
                             "(FLUX-dev default 3.5). Guidance-free models "
@@ -365,7 +372,7 @@ class HiFlowNode(io.ComfyNode):
                 cfg=3.5, steps=30, guidance=4.5, steps_per_stage=16,
                 tau=0.6, filter_ratio=0.2, alpha_scale=1.0, beta_scale=0.5,
                 upsampling="latent", target_resolution=2048,
-                noise_seed=0) -> io.NodeOutput:
+                noise_seed=0, denoise=1.0) -> io.NodeOutput:
         import comfy.utils
 
         # Gate BEFORE any model calls: flow prediction + 2D latents only.
@@ -430,6 +437,16 @@ class HiFlowNode(io.ComfyNode):
 
         base_sigmas = _base_sigmas(model, int(steps))
 
+        # A content latent with denoise=1.0 is a foot-gun: sigma_start == 1
+        # zeroes the content weight entirely (from-noise generation).
+        if (torch.count_nonzero(initial_latent) > 0
+                and float(denoise) > 0.9999):
+            logger.warning(
+                "HiFlow: denoise=1.0 with a non-empty latent — the input "
+                "image is ignored (the base starts from pure noise). Lower "
+                "denoise (e.g. 0.6) to upscale the connected latent."
+            )
+
         # Progress: base transitions + per-stage transitions (upper bound).
         from .hiflow import _stage_latent_sizes
         sizes = _stage_latent_sizes(
@@ -457,6 +474,7 @@ class HiFlowNode(io.ComfyNode):
             vae_downscale=_downscale_ratio(vae),
             progress_callback=progress_callback,
             noise_seed=int(noise_seed),
+            denoise=float(denoise),
         )
         pbar.update_absolute(total)
 

@@ -16,6 +16,7 @@ from src.hiflow import (
     alignment_scales,
     build_stage_sigmas,
     butterworth_low_pass_filter_2d,
+    denoise_sigmas,
     split_frequency_components_fft,
 )
 
@@ -338,6 +339,82 @@ class TestAlignmentScales:
     def test_single_transition_raises(self):
         with pytest.raises(ValueError, match="transition"):
             alignment_scales(torch.tensor([0.6]))
+
+
+# ---------------------------------------------------------------------------
+# Img2img denoise schedule truncation
+# ---------------------------------------------------------------------------
+
+@pytest.mark.unit
+class TestDenoiseSigmas:
+    @staticmethod
+    def _linear_sigmas(steps=30):
+        """Even-in-flow-time schedule descending 1 -> 1/30, then 0."""
+        return torch.cat([
+            torch.linspace(1.0, 1.0 / steps, steps), torch.zeros(1),
+        ])
+
+    def test_full_denoise_unchanged(self):
+        sig = self._linear_sigmas()
+        out, truncated = denoise_sigmas(sig, denoise=1.0, steps=30)
+        assert truncated is False
+        assert torch.equal(out, sig)
+
+    def test_high_denoise_unchanged(self):
+        """denoise > 0.9999 is the full schedule (KSampler threshold)."""
+        sig = self._linear_sigmas()
+        out, truncated = denoise_sigmas(sig, denoise=0.99995, steps=30)
+        assert truncated is False
+        assert torch.equal(out, sig)
+
+    def test_truncation_enters_below_one(self):
+        """denoise=0.6: entry sigma < 1 so the noising keeps content."""
+        sig = self._linear_sigmas()
+        out, truncated = denoise_sigmas(sig, denoise=0.6, steps=30)
+        assert truncated is True
+        assert float(out[0]) < 1.0
+        assert float(out[0]) == pytest.approx(0.6, abs=0.05)
+        assert float(out[-1]) == 0.0
+
+    def test_truncated_length_matches_ksampler(self):
+        """KSampler keeps the last (steps+1) of a denser schedule ->
+        steps transitions, same step count as the full run."""
+        sig = self._linear_sigmas()
+        out, truncated = denoise_sigmas(sig, denoise=0.6, steps=30)
+        assert truncated is True
+        assert out.numel() == 31
+
+    def test_lower_denoise_lower_entry(self):
+        sig = self._linear_sigmas()
+        out06, _ = denoise_sigmas(sig, denoise=0.6, steps=30)
+        out03, _ = denoise_sigmas(sig, denoise=0.3, steps=30)
+        assert float(out03[0]) < float(out06[0]), (
+            "less denoise -> lower entry sigma -> more content preserved"
+        )
+
+    def test_descending(self):
+        sig = self._linear_sigmas()
+        out, _ = denoise_sigmas(sig, denoise=0.5, steps=30)
+        assert torch.all(out[:-1] > out[1:])
+
+    def test_degenerate_denoise_rejected(self):
+        sig = self._linear_sigmas()
+        with pytest.raises(ValueError, match="denoise"):
+            denoise_sigmas(sig, denoise=0.0, steps=30)
+        with pytest.raises(ValueError, match="denoise"):
+            denoise_sigmas(sig, denoise=1.5, steps=30)
+
+    def test_steps_below_one_rejected(self):
+        with pytest.raises(ValueError, match="steps"):
+            denoise_sigmas(self._linear_sigmas(), denoise=0.6, steps=0)
+
+    def test_too_short_schedule_falls_back(self):
+        """A schedule with < 2 interior sigmas cannot be densified — the
+        original schedule is returned untruncated (graceful fallback)."""
+        sig = torch.tensor([0.7, 0.0])
+        out, truncated = denoise_sigmas(sig, denoise=0.6, steps=30)
+        assert truncated is False
+        assert torch.equal(out, sig)
 
 
 # ---------------------------------------------------------------------------
@@ -1080,6 +1157,83 @@ class TestHiflowCascade:
         c = run(8)
         assert torch.allclose(a, b, atol=1e-6), "same seed must reproduce"
         assert not torch.allclose(a, c, atol=1e-4), "different seed must differ"
+
+    def test_img2img_denoise_keeps_content(self):
+        """A content latent + denoise < 1 enters below sigma 1: the first
+        model input must be sigma_start*eps + (1-sigma_start)*latent — the
+        KSampler img2img convention (the Z-Image 'connecting the real
+        latent does nothing' fix). The truncated schedule keeps
+        cfg.steps transitions (same step count, denser spacing)."""
+        torch.manual_seed(21)
+        z = torch.randn(1, 4, 32, 32)          # a real sampler latent
+        seen = []
+
+        def base_predict(x, s):
+            seen.append((x.clone(), s))
+            return 0.5 * x
+
+        hiflow_cascade(
+            z, self.SIGMAS,
+            base_predict, lambda x, s: 0.5 * x,
+            target_resolution=256,            # base-at-target: no stages
+            cfg=self._cfg(steps=2),
+            vae_decode=None, vae_encode=None,
+            noise_seed=5, denoise=0.5,
+        )
+        assert len(seen) == 2, "truncated schedule keeps cfg.steps transitions"
+        sigma_start = float(seen[0][1])
+        assert sigma_start < 1.0, "denoise=0.5 must truncate the entry sigma"
+        g = torch.Generator().manual_seed(5)
+        eps = torch.randn(1, 4, 32, 32, generator=g)
+        expected = sigma_start * eps + (1 - sigma_start) * z
+        assert torch.allclose(seen[0][0], expected, atol=1e-5), (
+            "img2img noising: sigma_start*eps + (1-sigma_start)*content"
+        )
+
+    def test_empty_latent_ignores_denoise(self):
+        """An empty latent always runs the FULL schedule (denoise is
+        meaningless for zeros — entry sigma stays 1, pure noise start)."""
+        torch.manual_seed(22)
+        z = torch.zeros(1, 4, 32, 32)
+        seen = []
+
+        def base_predict(x, s):
+            seen.append(s)
+            return 0.5 * x
+
+        hiflow_cascade(
+            z, self.SIGMAS,
+            base_predict, lambda x, s: 0.5 * x,
+            target_resolution=256,
+            cfg=self._cfg(),
+            vae_decode=None, vae_encode=None,
+            noise_seed=5, denoise=0.3,
+        )
+        assert len(seen) == 4, "full schedule runs — no truncation for zeros"
+        assert float(seen[0]) == pytest.approx(1.0), "entry stays at sigma 1"
+
+    def test_content_denoise1_full_schedule(self):
+        """denoise=1.0 on a content latent: full schedule, sigma_start=1 —
+        the content is annihilated (from-noise regeneration; the node layer
+        warns about this combination)."""
+        torch.manual_seed(23)
+        z = torch.randn(1, 4, 32, 32)
+        seen = []
+
+        def base_predict(x, s):
+            seen.append(s)
+            return 0.5 * x
+
+        hiflow_cascade(
+            z, self.SIGMAS,
+            base_predict, lambda x, s: 0.5 * x,
+            target_resolution=256,
+            cfg=self._cfg(),
+            vae_decode=None, vae_encode=None,
+            noise_seed=5, denoise=1.0,
+        )
+        assert float(seen[0]) == pytest.approx(1.0)
+        assert len(seen) == 4
 
     def test_vae_required_in_both_modes(self):
         """The always-pixel init anchor makes the VAE adapters mandatory

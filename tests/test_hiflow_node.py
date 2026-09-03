@@ -480,6 +480,7 @@ class TestExecuteWiring:
             cfg=3.5, steps=4, guidance=4.5, steps_per_stage=2,
             tau=0.5, filter_ratio=0.2, alpha_scale=1.0, beta_scale=0.5,
             upsampling=upsampling, target_resolution=target,
+            noise_seed=0, denoise=1.0,
         )
         # NodeOutput wraps the payload positionally; unwrap to the dict.
         samples = result[0]["samples"] if not hasattr(result, "shape") \
@@ -530,10 +531,105 @@ class TestExecuteWiring:
             model, vae, COND_POS, COND_NEG, {"samples": z},
             steps=2, steps_per_stage=2, tau=0.5,
             target_resolution=256,
+            noise_seed=0, denoise=1.0,
         )
         samples = result[0]["samples"] if not hasattr(result, "shape") \
             else result
         assert tuple(samples.shape[-2:]) == (32, 32)
+
+    def test_execute_content_denoise1_warns(self, monkeypatch, caplog):
+        """A content latent with denoise=1.0 annihilates the image — the
+        node warns (the 'connecting the real latent does nothing' report)."""
+        import logging
+        _install_fake_pbar_utils(monkeypatch)
+        _install_fake_comfy(monkeypatch)
+        model = _mock_flow_model()
+        sys.modules["comfy.samplers"].calculate_sigmas = (
+            lambda ms, scheduler, steps:
+            torch.cat([torch.linspace(1.0, 0.1, steps), torch.zeros(1)])
+        )
+        vae = types.SimpleNamespace(
+            decode=lambda z: torch.randn(
+                z.shape[0], z.shape[-2] * 8, z.shape[-1] * 8, 3),
+            encode=lambda im: {"samples": torch.randn(
+                1, 16, im.shape[-3] // 8, im.shape[-2] // 8)},
+            downscale_ratio=8,
+        )
+        z = torch.randn(1, 16, 16, 16)  # NON-empty content latent
+        with caplog.at_level(logging.WARNING, logger="ComfyUI-DyPE"):
+            hfn.HiFlowNode.execute(
+                model, vae, COND_POS, COND_NEG, {"samples": z},
+                steps=2, steps_per_stage=2, tau=0.5,
+                target_resolution=256, denoise=1.0,
+            )
+        assert any("denoise=1.0" in r.message for r in caplog.records)
+
+    def test_execute_img2img_no_warning_on_denoise(self, monkeypatch, caplog):
+        """denoise < 1 with a content latent is the intended img2img path —
+        no foot-gun warning fires."""
+        import logging
+        _install_fake_pbar_utils(monkeypatch)
+        _install_fake_comfy(monkeypatch)
+        model = _mock_flow_model()
+        sys.modules["comfy.samplers"].calculate_sigmas = (
+            lambda ms, scheduler, steps:
+            torch.cat([torch.linspace(1.0, 0.1, steps), torch.zeros(1)])
+        )
+        vae = types.SimpleNamespace(
+            decode=lambda z: torch.randn(
+                z.shape[0], z.shape[-2] * 8, z.shape[-1] * 8, 3),
+            encode=lambda im: {"samples": torch.randn(
+                1, 16, im.shape[-3] // 8, im.shape[-2] // 8)},
+            downscale_ratio=8,
+        )
+        z = torch.randn(1, 16, 16, 16)
+        with caplog.at_level(logging.WARNING, logger="ComfyUI-DyPE"):
+            hfn.HiFlowNode.execute(
+                model, vae, COND_POS, COND_NEG, {"samples": z},
+                steps=2, steps_per_stage=2, tau=0.5,
+                target_resolution=256, denoise=0.6,
+            )
+        assert not any(
+            "denoise=1.0" in r.message for r in caplog.records)
+
+    def test_execute_img2img_truncates_entry_sigma(self, monkeypatch):
+        """denoise=0.6 with a content latent must lower the first sigma the
+        base adapter sees below 1.0 (KSampler truncation, wired through)."""
+        _install_fake_pbar_utils(monkeypatch)
+        fake = _install_fake_comfy(monkeypatch)
+        model = _mock_flow_model()
+        sys.modules["comfy.samplers"].calculate_sigmas = (
+            lambda ms, scheduler, steps:
+            torch.cat([torch.linspace(1.0, 0.1, steps), torch.zeros(1)])
+        )
+        vae = types.SimpleNamespace(
+            decode=lambda z: torch.randn(
+                z.shape[0], z.shape[-2] * 8, z.shape[-1] * 8, 3),
+            encode=lambda im: {"samples": torch.randn(
+                1, 16, im.shape[-3] // 8, im.shape[-2] // 8)},
+            downscale_ratio=8,
+        )
+        z = torch.randn(1, 16, 16, 16)
+        hfn.HiFlowNode.execute(
+            model, vae, COND_POS, COND_NEG, {"samples": z},
+            steps=4, steps_per_stage=2, tau=0.5,
+            target_resolution=256, denoise=0.5,
+        )
+        first_t = fake.sampling_calls[0]["timestep"]
+        first_sigma = float(first_t) / 1000.0  # the mock's DiscreteFlow probe
+        assert first_sigma < 1.0, (
+            f"denoise=0.5 must truncate the entry sigma below 1 "
+            f"(got {first_sigma})"
+        )
+
+    def test_schema_has_denoise_input(self):
+        """The V3-schema mock has no introspectable input list — pin the
+        input's presence the established way (schema source grep)."""
+        import inspect
+        import pathlib
+        src = pathlib.Path(inspect.getfile(hfn)).read_text(encoding="utf-8")
+        assert '"denoise", default=1.0' in src
+        assert '"noise_seed", default=0' in src
 
     def test_execute_pixel_mode_uses_vae(self, monkeypatch):
         """upsampling=pixel must reach the (fake) VAE decode/encode."""
@@ -659,8 +755,8 @@ class TestHiFlowDocs:
         readme = (pathlib.Path(__file__).parent.parent
                   / "README.md").read_text(encoding="utf-8")
         m = re.search(r'^version = "([^"]+)"', pyproject, re.MULTILINE)
-        assert m and m.group(1) == "2.11.0"
-        assert "### v2.11.0" in readme
+        assert m and m.group(1) == "2.12.0"
+        assert "### v2.12.0" in readme
 
     def test_workflow_json_parses_and_uses_known_nodes(self):
         import json

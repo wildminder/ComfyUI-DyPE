@@ -305,6 +305,7 @@ Training-free high-resolution upscaling for **rectified-flow models** (FLUX, Qwe
 | `guidance` | 4.5 | Guided-stage CFG (paper uses 4.5–6). Same auto-skip rule as `cfg`. |
 | `steps_per_stage` | 16 | Guided steps per cascade stage (upper bound — the stage walks schedule sigmas below `tau`). |
 | `noise_seed` | 0 | Seed for the base noise and each stage's initialization noise. |
+| `denoise` | 1.0 | Img2img strength for a content latent (KSampler convention): 1.0 regenerates from pure noise; lower keeps more of the input (ignored for an empty latent). |
 | `tau` | 0.6 | Stage-entry noise level (paper cascade: 0.6, 0.3, 0.3). Lower = stronger content preservation. |
 | `filter_ratio` | 0.2 | Butterworth low-pass cutoff D for direction alignment (paper 0.4, repo 0.2). |
 | `alpha_scale` / `beta_scale` | 1.0 / 0.5 | Direction / acceleration strength multipliers. |
@@ -363,6 +364,9 @@ Restart ComfyUI. No further dependency installation is required.
 <p align="right"><a href="#readme-top" title="back to top">⟔ ▲ ⟓</a></p>
 
 ## ▓ Changelog
+
+### v2.12.0 — 2026-09-03
+- **HiFlow img2img: `denoise` parameter** (user-reported "connecting the real latent does nothing"): with the full flow schedule the base start σ=1 zeroes the content weight, so a sampler latent connected to the node was silently ignored. The KSampler convention now applies — `denoise` < 1 truncates the base schedule so the walk enters below σ=1 and keeps `(1−σ_start)` of the input latent (an empty latent always runs the full schedule; the node warns when a content latent meets `denoise=1.0`).
 
 ### v2.11.0 — 2026-09-03
 - **HiFlow realigned with the authors' implementation** (plan 2026-09-03-realignment, user-reported Z-Image "burned and blurred" output identical in both upsampling modes): the base stage now starts from noised latent instead of the raw input (an `EmptySD3LatentImage` was being sampled verbatim as all-zeros "noise" — the root cause); stage initialization anchors on the previous chain's final image (always pixel round-tripped) instead of the time-matched reference; the reference velocity derives from the walk's own state; trajectories store the raw (uncorrected) x0 so guidance doesn't compound across stages; α/β follow the code's linear-in-index schedule, not the paper's σ/σ_entry (which over-locks low frequencies late on shifted schedules). New `noise_seed` input drives the base and per-stage init noise reproducibly.
