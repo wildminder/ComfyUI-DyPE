@@ -285,7 +285,14 @@ class HiFlowNode(io.ComfyNode):
                 io.Latent.Input(
                     "latent_image",
                     tooltip="Base latent at the model's native resolution "
-                            "(e.g. from EmptySD3LatentImage)."),
+                            "(e.g. from EmptySD3LatentImage). The cascade "
+                            "noises it to the first sigma itself — an empty "
+                            "latent + noise_seed reproduces the reference "
+                            "pipeline's from-noise start."),
+                io.Int.Input(
+                    "noise_seed", default=0, min=0, max=2**32 - 1, step=1,
+                    tooltip="Seed for the base-stage noise and each stage's "
+                            "initialization noise (one shared generator)."),
                 io.Float.Input(
                     "cfg", default=3.5, min=0.0, max=20.0, step=0.1,
                     tooltip="Classifier-free guidance for the BASE stage "
@@ -328,8 +335,10 @@ class HiFlowNode(io.ComfyNode):
                 io.Combo.Input(
                     "upsampling", options=["latent", "pixel"],
                     default="latent",
-                    tooltip="Reference upsample: latent bicubic (repo "
-                            "default) or pixel decode->sharpen->encode."),
+                    tooltip="Per-step reference upsample: latent bicubic "
+                            "(repo default) or pixel decode->sharpen->encode. "
+                            "The stage-initialization anchor is always the "
+                            "pixel round-trip of the previous final image."),
                 io.Int.Input(
                     "target_resolution", default=2048, min=1024, max=8192,
                     step=128,
@@ -355,7 +364,8 @@ class HiFlowNode(io.ComfyNode):
     def execute(cls, model, vae, positive, negative, latent_image,
                 cfg=3.5, steps=30, guidance=4.5, steps_per_stage=16,
                 tau=0.6, filter_ratio=0.2, alpha_scale=1.0, beta_scale=0.5,
-                upsampling="latent", target_resolution=2048) -> io.NodeOutput:
+                upsampling="latent", target_resolution=2048,
+                noise_seed=0) -> io.NodeOutput:
         import comfy.utils
 
         # Gate BEFORE any model calls: flow prediction + 2D latents only.
@@ -413,9 +423,10 @@ class HiFlowNode(io.ComfyNode):
         predict_x0_stage = _make_predict_x0(
             model, positive, negative, cfg_scale=float(guidance))
 
-        vae_decode = vae_encode = None
-        if cfg_obj.upsampling == "pixel":
-            vae_decode, vae_encode = _make_vae_adapters(vae, device)
+        # VAE adapters are ALWAYS needed — the stage-initialization anchor
+        # is the pixel round-trip of the previous final latent in both
+        # upsampling modes (plan D2).
+        vae_decode, vae_encode = _make_vae_adapters(vae, device)
 
         base_sigmas = _base_sigmas(model, int(steps))
 
@@ -445,6 +456,7 @@ class HiFlowNode(io.ComfyNode):
             sharpen=_sharpen,
             vae_downscale=_downscale_ratio(vae),
             progress_callback=progress_callback,
+            noise_seed=int(noise_seed),
         )
         pbar.update_absolute(total)
 

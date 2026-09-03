@@ -464,11 +464,13 @@ class TestExecuteWiring:
 
         vae = types.SimpleNamespace(
             # ComfyUI VAE boundary layout: decode -> [B,H,W,3] channels-last,
-            # encode <- [B,H,W,3]. (Z-Image bugfix 2026-09-03.)
+            # encode <- [B,H,W,3]. (Z-Image bugfix 2026-09-03.) The fake
+            # encode returns the MODEL's 16 latent channels so the init
+            # anchor matches the stage latent (always-pixel anchor, plan D2).
             decode=lambda z: torch.randn(
-                1, z.shape[-2] * 8, z.shape[-1] * 8, 3),
+                z.shape[0], z.shape[-2] * 8, z.shape[-1] * 8, 3),
             encode=lambda im: {"samples": torch.randn(
-                1, 4, im.shape[-3] // 8, im.shape[-2] // 8)},
+                1, 16, im.shape[-3] // 8, im.shape[-2] // 8)},
             downscale_ratio=8,
         )
         z = torch.randn(*latent)
@@ -514,7 +516,15 @@ class TestExecuteWiring:
             lambda ms, scheduler, steps:
             torch.cat([torch.linspace(1.0, 0.1, steps), torch.zeros(1)])
         )
-        vae = types.SimpleNamespace(downscale_ratio=8)
+        vae = types.SimpleNamespace(
+            # VAE adapters are ALWAYS wired now (always-pixel anchor, plan
+            # D2) — the empty-latent path also needs working fakes.
+            decode=lambda z: torch.randn(
+                z.shape[0], z.shape[-2] * 8, z.shape[-1] * 8, 3),
+            encode=lambda im: {"samples": torch.randn(
+                1, 16, im.shape[-3] // 8, im.shape[-2] // 8)},
+            downscale_ratio=8,
+        )
         z = torch.zeros(1, 4, 16, 16)  # empty, wrong channel count
         result = hfn.HiFlowNode.execute(
             model, vae, COND_POS, COND_NEG, {"samples": z},
@@ -649,8 +659,8 @@ class TestHiFlowDocs:
         readme = (pathlib.Path(__file__).parent.parent
                   / "README.md").read_text(encoding="utf-8")
         m = re.search(r'^version = "([^"]+)"', pyproject, re.MULTILINE)
-        assert m and m.group(1) == "2.10.0"
-        assert "### v2.10.0" in readme
+        assert m and m.group(1) == "2.11.0"
+        assert "### v2.11.0" in readme
 
     def test_workflow_json_parses_and_uses_known_nodes(self):
         import json

@@ -293,28 +293,28 @@ Tuning-free higher-resolution generation via scale-fused attention and self-casc
 
 Training-free high-resolution upscaling for **rectified-flow models** (FLUX, Qwen-Image, …) via flow-aligned guidance ([paper](https://arxiv.org/abs/2504.06232), NeurIPS 2025). The base-resolution sampling runs once, recording every per-step clean prediction; each upscale stage then reuses that **time-matched trajectory** as a virtual reference — initialization alignment seeds the stage from it, direction alignment keeps low frequencies true to it, acceleration alignment matches its detail-generation rhythm. Structure survives; high-res detail is synthesized fresh.
 
-**Usage:** connect `model` (flow models only), `vae`, `positive`, `negative` and a base latent at native resolution (e.g. `EmptySD3LatentImage`) → set `target_resolution` → decode. Chain `DyPE (ntk)` before the loader for RoPE extrapolation at the target resolution.
+**Usage:** connect `model` (flow models only), `vae`, `positive`, `negative` and a base latent at native resolution (e.g. `EmptySD3LatentImage`) → set `noise_seed` + `target_resolution` → decode. The cascade noises the latent to the first sigma itself — an empty latent + seed reproduces the reference pipeline's from-noise start. Chain `DyPE (ntk)` before the loader for RoPE extrapolation at the target resolution.
 
 <details>
 <summary><b>Inputs & Parameters</b></summary>
 
 | Parameter | Default | Description |
 |:---|:---:|:---|
-| `cfg` | 3.5 | Base-stage CFG (FLUX-dev default). |
+| `cfg` | 3.5 | Base-stage CFG (FLUX-dev default). Guidance-free models (Z-Image, Chroma) or empty negatives: leave at 1.0 — CFG is auto-skipped when the negative carries no tokens. |
 | `steps` | 30 | Base-stage steps; their clean predictions form the reference trajectory. |
-| `guidance` | 4.5 | Guided-stage CFG (paper uses 4.5–6). |
+| `guidance` | 4.5 | Guided-stage CFG (paper uses 4.5–6). Same auto-skip rule as `cfg`. |
 | `steps_per_stage` | 16 | Guided steps per cascade stage (upper bound — the stage walks schedule sigmas below `tau`). |
+| `noise_seed` | 0 | Seed for the base noise and each stage's initialization noise. |
 | `tau` | 0.6 | Stage-entry noise level (paper cascade: 0.6, 0.3, 0.3). Lower = stronger content preservation. |
 | `filter_ratio` | 0.2 | Butterworth low-pass cutoff D for direction alignment (paper 0.4, repo 0.2). |
 | `alpha_scale` / `beta_scale` | 1.0 / 0.5 | Direction / acceleration strength multipliers. |
-| `upsampling` | latent | Reference upsample: `latent` bicubic (repo default) or `pixel` decode→sharpen→encode. |
+| `upsampling` | latent | Per-step reference upsample: `latent` bicubic (repo default) or `pixel` decode→sharpen→encode. The stage anchor is always the pixel round-trip. |
 | `target_resolution` | 2048 | Target pixels; each stage doubles the base until reached. |
 
 </details>
 
 > [!TIP]
 > **HiFlow inherits the reference's structure** — including its mistakes. Generate a good base first; `tau` lower keeps more of it, higher re-imagines.
-
 <p align="right"><a href="#readme-top" title="back to top">⟔ ▲ ⟓</a></p>
 
 ## ▓ Node Reference
@@ -363,6 +363,9 @@ Restart ComfyUI. No further dependency installation is required.
 <p align="right"><a href="#readme-top" title="back to top">⟔ ▲ ⟓</a></p>
 
 ## ▓ Changelog
+
+### v2.11.0 — 2026-09-03
+- **HiFlow realigned with the authors' implementation** (plan 2026-09-03-realignment, user-reported Z-Image "burned and blurred" output identical in both upsampling modes): the base stage now starts from noised latent instead of the raw input (an `EmptySD3LatentImage` was being sampled verbatim as all-zeros "noise" — the root cause); stage initialization anchors on the previous chain's final image (always pixel round-tripped) instead of the time-matched reference; the reference velocity derives from the walk's own state; trajectories store the raw (uncorrected) x0 so guidance doesn't compound across stages; α/β follow the code's linear-in-index schedule, not the paper's σ/σ_entry (which over-locks low frequencies late on shifted schedules). New `noise_seed` input drives the base and per-stage init noise reproducibly.
 
 ### v2.10.0 — 2026-09-03
 - **New HiFlow node** (plan 2026-09-03): training-free high-resolution upscaling for rectified-flow models (FLUX, Qwen-Image, …) via flow-aligned guidance (arXiv:2504.06232). The base-resolution trajectory is recorded per-step and guides each upscale stage through initialization, direction and acceleration alignment. Non-flow and video models are rejected with a pointer to PixelRush.

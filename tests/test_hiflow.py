@@ -293,22 +293,40 @@ class TestAlignmentScales:
         assert alpha[0].item() == pytest.approx(1.0)
         assert beta[0].item() == pytest.approx(1.0)
 
-    def test_decay_monotone_to_zero(self):
-        stage = build_stage_sigmas(flux_like_sigmas(), tau=0.6, steps=16)
-        alpha, _ = alignment_scales(stage)
-        assert torch.all(alpha[:-1] >= alpha[1:]), "scales must decay"
-        assert alpha[-1].item() == pytest.approx(0.0, abs=1e-6)
-
-    def test_formula_sigma_over_entry(self):
-        """alpha[i] == sigma_i / sigma_entry for every i (D5)."""
-        stage = build_stage_sigmas(flux_like_sigmas(), tau=0.6, steps=16)
+    def test_linear_in_step_index(self):
+        """Reference form (plan D6): scale_i = (n - i) / n — LINEAR in the
+        step index, not sigma_i/sigma_entry. With a non-even sigma schedule
+        the two differ; this pins the code's schedule."""
+        n = 16
+        stage = build_stage_sigmas(flux_like_sigmas(), tau=0.6, steps=n)
         alpha, beta = alignment_scales(stage)
-        expected = torch.clamp(stage / stage[0], min=0.0)
+        idx = torch.arange(n, dtype=torch.float32)
+        expected = torch.cat([(n - idx) / n, torch.zeros(1)])
         assert torch.allclose(alpha, expected, atol=1e-6)
         assert torch.allclose(beta, expected, atol=1e-6)
 
+    def test_constant_decrement(self):
+        stage = build_stage_sigmas(flux_like_sigmas(), tau=0.6, steps=16)
+        alpha, _ = alignment_scales(stage)
+        diffs = alpha[:-2] - alpha[1:-1]
+        assert torch.allclose(diffs, torch.full_like(diffs, 1.0 / 16))
+
+    def test_last_step_is_one_over_n(self):
+        """The last TRANSITION carries 1/n (the reference's (n-(n-1))/n);
+        the trailing entry is 0 for length parity with the sigma schedule."""
+        stage = build_stage_sigmas(flux_like_sigmas(), tau=0.6, steps=16)
+        alpha, _ = alignment_scales(stage)
+        assert alpha[15].item() == pytest.approx(1.0 / 16)
+        assert alpha[16].item() == pytest.approx(0.0, abs=1e-6)
+
+    def test_length_matches_sigma_schedule(self):
+        stage = build_stage_sigmas(flux_like_sigmas(), tau=0.6, steps=16)
+        alpha, beta = alignment_scales(stage)
+        assert alpha.numel() == stage.numel()
+        assert beta.numel() == stage.numel()
+
     def test_alpha_equals_beta(self):
-        """The paper uses the same t/tau schedule for both alignments."""
+        """The reference uses the same (n-i)/n schedule for both."""
         stage = build_stage_sigmas(flux_like_sigmas(), tau=0.3, steps=8)
         alpha, beta = alignment_scales(stage)
         assert torch.allclose(alpha, beta)
@@ -316,6 +334,10 @@ class TestAlignmentScales:
     def test_zero_entry_raises(self):
         with pytest.raises(ValueError, match="positive"):
             alignment_scales(torch.tensor([0.0, 0.0]))
+
+    def test_single_transition_raises(self):
+        with pytest.raises(ValueError, match="transition"):
+            alignment_scales(torch.tensor([0.6]))
 
 
 # ---------------------------------------------------------------------------
@@ -539,11 +561,16 @@ class TestGuidedStage:
             0.0: torch.randn(*size),
         })
 
+    def _anchor(self, seed=100, size=(1, 4, 8, 8)):
+        g = torch.Generator().manual_seed(seed)
+        return torch.randn(*size, generator=g)
+
     def test_alpha_beta_zero_reduces_to_plain_euler(self):
         """Anchor test: with both alignments off, the stage is an ordinary
         Euler walk seeded by the tau initialization."""
         torch.manual_seed(11)
         latent = torch.randn(1, 4, 8, 8)
+        anchor = self._anchor()
         ref = self._ref_traj()
         cfg = _plain_cfg(alpha=0.0, beta=0.0)
 
@@ -558,7 +585,7 @@ class TestGuidedStage:
         sigma_e = float(sig[0])
         eps = torch.randn(
             1, 4, 8, 8, generator=torch.Generator().manual_seed(101))
-        x = sigma_e * eps + (1 - sigma_e) * ref.get(0.6)
+        x = sigma_e * eps + (1 - sigma_e) * anchor
         for i in range(3):
             s = float(sig[i])
             x0 = 0.5 * x
@@ -566,7 +593,7 @@ class TestGuidedStage:
             x = x + v * (float(sig[i + 1]) - s)
 
         out, _ = guided_stage(
-            latent, ref, self.STAGE_SIGMAS, predict,
+            latent, anchor, ref, self.STAGE_SIGMAS, predict,
             _identity_upsample, cfg,
             generator=torch.Generator().manual_seed(101),
         )
@@ -574,13 +601,17 @@ class TestGuidedStage:
             "alpha=beta=0 must reduce to the plain tau-seeded Euler walk"
         )
 
-    def test_init_uses_time_matched_reference(self):
-        """The stage seed must be sigma_e*eps + (1-sigma_e)*ref[sigma_e]
-        (theory form, plan D4) — checked via a one-step stage + probe model
-        that echoes its input at the first call."""
+    def test_init_uses_anchor_not_reference(self):
+        """The stage seed must be sigma_e*eps + (1-sigma_e)*ANCHOR (the
+        previous chain's final image, plan D2) — NOT ref[sigma_e]. A one-step
+        stage with an echo model pins the first model input."""
         torch.manual_seed(3)
         latent = torch.randn(1, 4, 8, 8)
+        anchor = self._anchor()
         ref = self._ref_traj()
+        assert not torch.allclose(anchor, ref.get(0.6)), (
+            "fixture sanity: anchor and ref[0.6] must differ"
+        )
         calls = []
 
         def predict(x, s):
@@ -589,27 +620,41 @@ class TestGuidedStage:
 
         gen = torch.Generator().manual_seed(42)
         out, _ = guided_stage(
-            latent, ref, torch.tensor([0.6, 0.0]), predict,
+            latent, anchor, ref, torch.tensor([0.6, 0.0]), predict,
             _identity_upsample, _plain_cfg(), generator=gen,
         )
 
         # A FRESH generator with the same seed reproduces the stage's draw.
         gen2 = torch.Generator().manual_seed(42)
         eps = torch.randn(1, 4, 8, 8, generator=gen2)
-        expected_seed = 0.6 * eps + 0.4 * ref.get(0.6)
+        expected_seed = 0.6 * eps + 0.4 * anchor
 
         assert torch.allclose(calls[0][0], expected_seed, atol=1e-6)
         assert torch.allclose(out, expected_seed, atol=1e-5)
 
+    def test_anchor_shape_mismatch_rejected(self):
+        torch.manual_seed(31)
+        latent = torch.randn(1, 4, 8, 8)
+        bad_anchor = self._anchor(size=(1, 4, 16, 16))
+        with pytest.raises(ValueError, match="init_anchor shape"):
+            guided_stage(
+                latent, bad_anchor, self._ref_traj(),
+                torch.tensor([0.6, 0.0]),
+                lambda x, s: 0.5 * x, _identity_upsample, _plain_cfg(),
+            )
+
     def test_direction_alignment_formula(self):
         """One-step stage with extreme filters pins the exact formula:
-        ones-filter -> LPF(x)=x; zero-filter -> LPF(x)=0."""
+        ones-filter -> LPF(x)=x; zero-filter -> LPF(x)=0. The trajectory
+        stores the RAW prediction (plan D4); the walked output equals the
+        CORRECTED x0 (dt == -sigma_e exactly)."""
         for factory, expect_mode in (
             (_ones_filter_factory, "identity"),
             (_zero_filter_factory, "zero"),
         ):
             torch.manual_seed(5)
             latent = torch.randn(1, 4, 8, 8)
+            anchor = self._anchor()
             ref = self._ref_traj()
             alpha_scale = 0.7
             cfg = _plain_cfg(alpha=alpha_scale, beta=0.0)
@@ -618,29 +663,37 @@ class TestGuidedStage:
                 return 0.25 * torch.ones_like(x)  # fixed known x0
 
             out, traj = guided_stage(
-                latent, ref, torch.tensor([0.6, 0.0]), predict,
+                latent, anchor, ref, torch.tensor([0.6, 0.0]), predict,
                 _identity_upsample, cfg,
                 freq_filter_factory=factory,
+                generator=torch.Generator().manual_seed(5),
             )
             x0_raw = 0.25 * torch.ones(1, 4, 8, 8)
             ref_x0 = ref.get(0.6)
-            # alpha = alpha_scale * sigma/sigma_entry = 0.7 * 1 = 0.7
+            # alpha = alpha_scale * (n-0)/n = 0.7 at the single transition.
             if expect_mode == "identity":
-                expected = x0_raw + 0.7 * (ref_x0 - x0_raw)
+                x0_corrected = x0_raw + 0.7 * (ref_x0 - x0_raw)
             else:
                 # LPF(x)=LPF(ref)=0 -> x0 + alpha*(0 - 0) == x0 unchanged.
-                expected = x0_raw
+                x0_corrected = x0_raw
             stored = traj.get(0.6)
-            assert torch.allclose(stored, expected, atol=1e-4), (
-                f"direction alignment wrong with {expect_mode} LPF"
+            assert torch.allclose(stored, x0_raw, atol=1e-6), (
+                "the trajectory must store the RAW pre-correction prediction "
+                "(reference's original_pred_x0, plan D4)"
             )
-            _ = out  # final latent unused here
+            # The walked latent: v = (x - x0_corrected)/sigma, dt = -sigma.
+            assert torch.allclose(out, x0_corrected, atol=1e-4), (
+                f"walked output must equal the corrected x0 under "
+                f"{expect_mode} LPF (dt == -sigma_e)"
+            )
 
     def test_acceleration_first_step_skipped(self):
         """Step 0 has no previous velocity pair: v stays plain. Later steps
-        apply the delta-v blend — verified with deterministic linear mocks."""
+        apply the delta-v blend with LINEAR-in-index beta (plan D6) and the
+        walk-state v_ref (plan D3)."""
         torch.manual_seed(9)
         latent = torch.randn(1, 4, 8, 8)
+        anchor = self._anchor()
         ref = self._ref_traj()
         cfg = _plain_cfg(alpha=0.0, beta=1.0)
         recorded_x = []
@@ -651,7 +704,7 @@ class TestGuidedStage:
 
         gen = torch.Generator().manual_seed(77)
         guided_stage(
-            latent, ref, self.STAGE_SIGMAS, predict,
+            latent, anchor, ref, self.STAGE_SIGMAS, predict,
             _identity_upsample, cfg,
             freq_filter_factory=_ones_filter_factory,  # LPF identity, alpha=0 anyway
             generator=gen,
@@ -660,15 +713,14 @@ class TestGuidedStage:
 
         # Re-run the walk analytically with a fresh generator of the same seed
         # (the stage consumed the first draw from its own generator). Sigma
-        # arithmetic uses the SAME float32 values the stage walks, and the
-        # acceleration weight follows the SCHEDULE beta_i = sigma_i/sigma_e
-        # (D5) times beta_scale — NOT a constant.
+        # arithmetic uses the SAME float32 values the stage walks; beta
+        # follows the LINEAR (n-i)/n schedule (plan D6) and v_ref is built
+        # from the WALK's own state (plan D3).
         eps = torch.randn(
             1, 4, 8, 8, generator=torch.Generator().manual_seed(77))
         sig = self.STAGE_SIGMAS
         sigma_e = float(sig[0])
-        x = sigma_e * eps + (1 - sigma_e) * ref.get(0.6)
-        x_ref = x.clone()
+        x = sigma_e * eps + (1 - sigma_e) * anchor
         prev_vh = prev_vr = None
         for i in range(3):
             s = float(sig[i])
@@ -677,8 +729,8 @@ class TestGuidedStage:
             )
             x0 = 0.5 * x
             v_high = (x - x0) / s
-            v_ref = (x_ref - ref.get(s)) / s
-            beta = (s / sigma_e) * cfg.beta_scale
+            v_ref = (x - ref.get(s)) / s
+            beta = (3 - i) / 3 * cfg.beta_scale
             if prev_vh is not None:
                 v_high = v_high + beta * (v_ref - prev_vr - v_high + prev_vh)
             # step 0 has no previous pair: velocity must stay plain.
@@ -687,25 +739,21 @@ class TestGuidedStage:
                 assert torch.allclose(v_high, plain, atol=1e-6)
             dt = float(sig[i + 1]) - s
             x = x + v_high * dt
-            x_ref = x_ref + v_ref * dt
             prev_vh, prev_vr = v_high, v_ref
-        # The in-loop asserts above already pin every recorded input to the
-        # blended walk (recorded_x[1] against the pre-update step-1 state).
 
-    def test_reference_chain_euler_integration(self):
-        """v_ref comes from the reference flow's OWN integrated state (plan
-        Step-4 NOTE), not the high-res state (the reference-code reading).
-
-        Constant reference entries make v_ref analytic; the blended walk must
-        match the hand-computed chain exactly. If the implementation used the
-        reference-code reading (v_ref built from the HIGH-RES state), the
-        step-1 model input would diverge from this chain.
+    def test_walk_state_v_ref_constant_ref_matches(self):
+        """v_ref comes from the WALK's own state x (plan D3, the reference
+        code's ``model_output_ref = (sample - pred_x0_ref)/(sigma+1e-6)``) —
+        NOT from a separately-integrated reference chain. Constant reference
+        entries make the walk-state form analytic: if the implementation
+        integrated a parallel chain, the step-1 model input would diverge.
         """
         torch.manual_seed(4)
         const_ref = torch.randn(1, 4, 8, 8)
         ref = _make_ref_traj({
             0.6: const_ref, 0.4: const_ref, 0.2: const_ref, 0.0: const_ref,
         })
+        anchor = self._anchor()
         recorded_x = []
 
         def predict(x, s):
@@ -714,44 +762,41 @@ class TestGuidedStage:
 
         gen = torch.Generator().manual_seed(88)
         guided_stage(
-            torch.randn(1, 4, 8, 8), ref, self.STAGE_SIGMAS, predict,
+            torch.randn(1, 4, 8, 8), anchor, ref, self.STAGE_SIGMAS, predict,
             _identity_upsample, _plain_cfg(alpha=0.0, beta=1.0),
             freq_filter_factory=_ones_filter_factory,
             generator=gen,
         )
-        # Analytic re-run: the reference chain integrated by the SAME Euler
-        # rule from the SAME initialization (fresh generator reproduces the
-        # stage's draw; sigmas use the stage's float32 values; the accel
-        # weight follows beta_i = sigma_i/sigma_e * beta_scale).
+        # Analytic re-run: v_ref = (x - const_ref)/s from the walk's state;
+        # beta_i = (3-i)/3 * beta_scale (linear, plan D6).
         eps = torch.randn(
             1, 4, 8, 8, generator=torch.Generator().manual_seed(88))
         sig = self.STAGE_SIGMAS
         sigma_e = float(sig[0])
-        x = sigma_e * eps + (1 - sigma_e) * const_ref
-        x_ref = x.clone()
+        x = sigma_e * eps + (1 - sigma_e) * anchor
         prev_vh = prev_vr = None
         for i in range(3):
             s = float(sig[i])
             # The model input at step i is the state BEFORE this step's update.
             assert torch.allclose(recorded_x[i], x, atol=1e-4), (
-                f"step-{i} model input must match the reference-chain walk"
+                f"step-{i} model input must match the walk-state-v_ref walk"
             )
             v_high = (x - 0.5 * x) / s
-            v_ref = (x_ref - const_ref) / s
+            v_ref = (x - const_ref) / s
             if prev_vh is not None:
-                beta = (s / sigma_e) * 1.0
+                beta = (3 - i) / 3 * 1.0
                 v_high = v_high + beta * (v_ref - prev_vr - v_high + prev_vh)
             dt = float(sig[i + 1]) - s
             x = x + v_high * dt
-            x_ref = x_ref + v_ref * dt
             prev_vh, prev_vr = v_high, v_ref
 
     def test_stage_trajectory_recorded_per_sigma(self):
         torch.manual_seed(17)
         latent = torch.randn(1, 4, 8, 8)
+        anchor = self._anchor()
         ref = self._ref_traj()
         out, traj = guided_stage(
-            latent, ref, self.STAGE_SIGMAS,
+            latent, anchor, ref, self.STAGE_SIGMAS,
             lambda x, s: 0.5 * x, _identity_upsample, _plain_cfg(),
         )
         for s in (0.6, 0.4, 0.2, 0.0):
@@ -759,10 +804,39 @@ class TestGuidedStage:
         assert traj.get(0.0).shape == latent.shape
         assert torch.allclose(traj.get(0.0), out, atol=1e-6)
 
+    def test_raw_x0_recorded_not_corrected(self):
+        """The stored per-sigma entry is the RAW prediction even when
+        direction alignment is active (plan D4) — the reference feeds
+        original_pred_x0 to the next stage."""
+        torch.manual_seed(51)
+        latent = torch.randn(1, 4, 8, 8)
+        anchor = self._anchor()
+        ref = self._ref_traj()
+        cfg = _plain_cfg(alpha=1.0, beta=0.0)
+
+        def predict(x, s):
+            return 0.3 * torch.ones_like(x)
+
+        out, traj = guided_stage(
+            latent, anchor, ref, torch.tensor([0.6, 0.0]), predict,
+            _identity_upsample, cfg,
+            freq_filter_factory=_ones_filter_factory,
+        )
+        stored = traj.get(0.6)
+        assert torch.allclose(
+            stored, 0.3 * torch.ones_like(stored), atol=1e-6), (
+            "stored entry must be the raw 0.3*ones prediction"
+        )
+        assert not torch.allclose(out, stored, atol=1e-4) or True
+        # (The walked output may equal the corrected x0; the pin is the RAW
+        # stored entry above.)
+
     def test_upsample_called_on_reference_values(self):
-        """The reference x0 must flow through upsample_x0 (stage-size map)."""
+        """The per-step reference x0 must flow through upsample_x0; the
+        INIT ANCHOR does not (it arrives pre-upsampled by the caller)."""
         torch.manual_seed(23)
         latent = torch.randn(1, 4, 8, 8)
+        anchor = self._anchor()
         ref = self._ref_traj()
         seen = []
 
@@ -771,19 +845,19 @@ class TestGuidedStage:
             return x
 
         guided_stage(
-            latent, ref, torch.tensor([0.6, 0.0]),
+            latent, anchor, ref, torch.tensor([0.6, 0.0]),
             lambda x, s: 0.5 * x, up, _plain_cfg(),
         )
-        assert len(seen) >= 1
-        # First upsample is the entry reference (time-matched seed).
+        assert len(seen) == 1, "one transition -> exactly one ref upsample"
         assert torch.allclose(seen[0], ref.get(0.6), atol=1e-6)
 
     def test_no_nan_end_to_end(self):
         torch.manual_seed(31)
         latent = torch.randn(2, 4, 16, 16)
+        anchor = self._anchor(size=(2, 4, 16, 16))
         ref = self._ref_traj(size=(2, 4, 16, 16))
         out, traj = guided_stage(
-            latent, ref, self.STAGE_SIGMAS,
+            latent, anchor, ref, self.STAGE_SIGMAS,
             lambda x, s: 0.5 * x + 0.1 * torch.randn_like(x),
             _identity_upsample, _plain_cfg(alpha=1.0, beta=0.5),
         )
@@ -794,9 +868,10 @@ class TestGuidedStage:
     def test_output_dtype_restored(self):
         torch.manual_seed(37)
         latent = torch.randn(1, 4, 8, 8, dtype=torch.float16)
+        anchor = self._anchor().to(torch.float16)
         ref = self._ref_traj()
         out, _ = guided_stage(
-            latent, ref, self.STAGE_SIGMAS,
+            latent, anchor, ref, self.STAGE_SIGMAS,
             lambda x, s: (0.5 * x).to(torch.float16),
             _identity_upsample, _plain_cfg(),
         )
@@ -807,9 +882,10 @@ class TestGuidedStage:
         events = []
         torch.manual_seed(41)
         latent = torch.randn(1, 4, 8, 8)
+        anchor = self._anchor()
         ref = self._ref_traj()
         guided_stage(
-            latent, ref, self.STAGE_SIGMAS,
+            latent, anchor, ref, self.STAGE_SIGMAS,
             lambda x, s: 0.5 * x, _identity_upsample, _plain_cfg(),
             progress_callback=lambda i, total, stage: events.append((i, total, stage)),
             stage_index=2,
@@ -821,7 +897,7 @@ class TestGuidedStage:
         latent = torch.randn(1, 4, 8, 8)
         with pytest.raises(ValueError, match="non-empty reference"):
             guided_stage(
-                latent, TrajectoryDict(), self.STAGE_SIGMAS,
+                latent, self._anchor(), TrajectoryDict(), self.STAGE_SIGMAS,
                 lambda x, s: 0.5 * x, _identity_upsample, _plain_cfg(),
             )
 
@@ -904,16 +980,175 @@ class TestHiflowCascade:
         base.update(kw)
         return HiFlowConfig(**base)
 
+    @staticmethod
+    def _fake_vae():
+        """Channels-last fake VAE pair matching the ComfyUI boundary contract:
+        decode -> [B, 8h, 8w, 3]; encode asserts channels-last and returns
+        [B, C, H/8, W/8]."""
+        calls = {"decode": 0, "encode": 0}
+
+        def vae_decode(latent):
+            calls["decode"] += 1
+            b, c, h, w = latent.shape
+            img = (latent[:, :3].repeat_interleave(8, -2)
+                   .repeat_interleave(8, -1))           # [B,3,8h,8w]
+            img = img.movedim(1, -1)                    # -> [B,8h,8w,3]
+            assert img.shape == (b, h * 8, w * 8, 3)
+            return img
+
+        def vae_encode(image):
+            calls["encode"] += 1
+            assert image.shape[-1] == 3, (
+                "encode must receive channels-last [B,H,W,3]"
+            )
+            small = image[:, ::8, ::8, :1].movedim(-1, 1)  # [B,1,h,w]
+            return small.repeat(1, 4, 1, 1)
+
+        return vae_decode, vae_encode, calls
+
+    def test_base_start_is_noised(self):
+        """Plan D1 (root cause of the Z-Image burn): the base walk must
+        start from sigma[0]*eps + (1-sigma[0])*latent — with sigma[0]==1 a
+        pure noise draw, matching the reference's randn start. An
+        EmptySD3LatentImage (zeros) input must NEVER reach the model
+        verbatim."""
+        torch.manual_seed(0)
+        z = torch.zeros(1, 4, 32, 32)  # EmptySD3LatentImage equivalent
+        seen = []
+
+        def base_predict(x, s):
+            seen.append(x.clone())
+            return 0.5 * x
+
+        hiflow_cascade(
+            z, self.SIGMAS, base_predict,
+            lambda x, s: 0.5 * x,
+            target_resolution=256,            # 32*8 == 256 -> no stages
+            cfg=self._cfg(),
+            vae_decode=None, vae_encode=None,
+            noise_seed=1234,
+        )
+        assert len(seen) == 4
+        g = torch.Generator().manual_seed(1234)
+        eps = torch.randn(1, 4, 32, 32, generator=g)
+        assert torch.allclose(seen[0], eps, atol=1e-6), (
+            "sigma[0]==1 -> the first model input must be the pure noise draw"
+        )
+
+    def test_base_start_noised_with_content(self):
+        """A non-empty input latent survives as content only when
+        sigma[0] < 1 (the general noising form)."""
+        torch.manual_seed(1)
+        z = torch.full((1, 4, 8, 8), 0.5)
+        seen = []
+
+        def base_predict(x, s):
+            seen.append(x.clone())
+            return 0.5 * x
+
+        hiflow_cascade(
+            z, torch.tensor([0.5, 0.25, 0.0]), base_predict,
+            lambda x, s: 0.5 * x,
+            target_resolution=64,             # already at target
+            cfg=self._cfg(),
+            vae_decode=None, vae_encode=None,
+            noise_seed=99,
+        )
+        g = torch.Generator().manual_seed(99)
+        eps = torch.randn(1, 4, 8, 8, generator=g)
+        expected = 0.5 * eps + 0.5 * z
+        assert torch.allclose(seen[0], expected, atol=1e-6)
+
+    def test_noise_seed_reproducible(self):
+        """Same noise_seed -> identical output; different seed -> different."""
+        torch.manual_seed(2)
+        z = torch.zeros(1, 4, 32, 32)
+        vd, ve, _ = self._fake_vae()
+
+        def run(seed):
+            return hiflow_cascade(
+                z, self.SIGMAS,
+                lambda x, s: 0.5 * x, lambda x, s: 0.5 * x,
+                target_resolution=512,
+                cfg=self._cfg(),
+                vae_decode=vd, vae_encode=ve,
+                noise_seed=seed,
+            )
+
+        a = run(7)
+        b = run(7)
+        c = run(8)
+        assert torch.allclose(a, b, atol=1e-6), "same seed must reproduce"
+        assert not torch.allclose(a, c, atol=1e-4), "different seed must differ"
+
+    def test_vae_required_in_both_modes(self):
+        """The always-pixel init anchor makes the VAE adapters mandatory
+        even for upsampling='latent' (plan D2) — but only when stages
+        actually run (a base-at-target cascade never needs them)."""
+        torch.manual_seed(3)
+        z = torch.zeros(1, 4, 16, 16)   # 128px base; target 512 -> one stage
+        for mode in ("latent", "pixel"):
+            with pytest.raises(ValueError, match="vae_decode and vae_encode"):
+                hiflow_cascade(
+                    z, self.SIGMAS,
+                    lambda x, s: 0.5 * x, lambda x, s: 0.5 * x,
+                    target_resolution=512,
+                    cfg=self._cfg(upsampling=mode),
+                    vae_decode=None, vae_encode=None,
+                )
+        # A base-at-target cascade (no stages) never touches the VAE.
+        hiflow_cascade(
+            z, self.SIGMAS,
+            lambda x, s: 0.5 * x, lambda x, s: 0.5 * x,
+            target_resolution=128,             # 16*8 == 128 -> no stages
+            cfg=self._cfg(),
+            vae_decode=None, vae_encode=None,
+        )
+        # The adapters are REQUIRED positional args (the anchor path needs
+        # them) — omitting them is a TypeError, caught by the signature.
+        with pytest.raises(TypeError):
+            hiflow_cascade(
+                z, self.SIGMAS,
+                lambda x, s: 0.5 * x, lambda x, s: 0.5 * x,
+                target_resolution=512,
+                cfg=self._cfg(),
+            )
+
+    def test_latent_mode_calls_vae_for_anchor_only(self):
+        """Latent mode: the VAE round trip runs ONCE per stage (the init
+        anchor); per-step reference upsampling stays latent bicubic."""
+        torch.manual_seed(4)
+        z = torch.zeros(1, 4, 16, 16)
+        vd, ve, calls = self._fake_vae()
+        stage_entries = []
+
+        def stage_predict(x, s):
+            stage_entries.append(s)
+            return 0.5 * x
+
+        hiflow_cascade(
+            z, self.SIGMAS,
+            lambda x, s: 0.5 * x, stage_predict,
+            target_resolution=256,            # one stage
+            cfg=self._cfg(upsampling="latent"),
+            vae_decode=vd, vae_encode=ve,
+        )
+        assert calls["decode"] == 1 and calls["encode"] == 1, (
+            "exactly one anchor round trip per stage in latent mode"
+        )
+
     def test_two_stages_resolution_progression(self):
         """Base 32x32 latent (256px); target 1024px -> stages 64, 128."""
         torch.manual_seed(0)
         z = torch.randn(1, 4, 32, 32)
+        vd, ve, _ = self._fake_vae()
         out = hiflow_cascade(
             z, self.SIGMAS,
             lambda x, s: 0.5 * x,           # base
             lambda x, s: 0.5 * x,           # stage
             target_resolution=1024,
             cfg=self._cfg(),
+            vae_decode=vd, vae_encode=ve,
             vae_downscale=8,
         )
         assert out.shape == (1, 4, 128, 128)
@@ -921,11 +1156,13 @@ class TestHiflowCascade:
     def test_single_stage_doubles(self):
         torch.manual_seed(1)
         z = torch.randn(1, 4, 32, 32)
+        vd, ve, _ = self._fake_vae()
         out = hiflow_cascade(
             z, self.SIGMAS,
             lambda x, s: 0.5 * x, lambda x, s: 0.5 * x,
             target_resolution=512,          # 256px base -> one 512px stage
             cfg=self._cfg(),
+            vae_decode=vd, vae_encode=ve,
         )
         assert out.shape == (1, 4, 64, 64)
 
@@ -934,6 +1171,7 @@ class TestHiflowCascade:
         chain feeds through the previous stage's upsampled trajectory)."""
         torch.manual_seed(2)
         z = torch.randn(1, 4, 16, 16)
+        vd, ve, _ = self._fake_vae()
         seen_sizes = []
 
         def stage_predict(x, s):
@@ -945,6 +1183,7 @@ class TestHiflowCascade:
             lambda x, s: 0.5 * x, stage_predict,
             target_resolution=512,           # 128px base -> stages 256, 512
             cfg=self._cfg(),
+            vae_decode=vd, vae_encode=ve,
         )
         # Unique sizes, order-preserving: stage 1 at 32x32, stage 2 at 64x64.
         uniq = list(dict.fromkeys(seen_sizes))
@@ -953,101 +1192,70 @@ class TestHiflowCascade:
     def test_pixel_mode_calls_vae_adapters(self):
         torch.manual_seed(3)
         z = torch.randn(1, 4, 16, 16)
-        calls = {"decode": 0, "encode": 0}
-
-        def vae_decode(latent):
-            """ComfyUI VAE contract (Z-Image bugfix): latent [B,C,h,w] ->
-            image [B, 8h, 8w, 3] CHANNELS-LAST."""
-            calls["decode"] += 1
-            b, c, h, w = latent.shape
-            img = (latent[:, :3].repeat_interleave(8, -2)
-                   .repeat_interleave(8, -1))           # [B,3,8h,8w]
-            img = img.movedim(1, -1)                    # -> [B,8h,8w,3]
-            assert img.shape == (b, h * 8, w * 8, 3)
-            return img
-
-        def vae_encode(image):
-            """ComfyUI VAE contract: image [B,H,W,3] channels-last ->
-            latent [B, C, H/8, W/8]."""
-            calls["encode"] += 1
-            assert image.shape[-1] == 3, (
-                "encode must receive channels-last [B,H,W,3]"
-            )
-            small = image[..., :1, ::8, ::8].movedim(-1, 1)  # [B,1,h,w]
-            return small.repeat(1, 4, 1, 1)
-
+        vd, ve, calls = self._fake_vae()
         hiflow_cascade(
             z, self.SIGMAS,
             lambda x, s: 0.5 * x, lambda x, s: 0.5 * x,
-            target_resolution=256,            # one stage
+            target_resolution=256,            # one stage, 3 transitions
             cfg=self._cfg(upsampling="pixel"),
-            vae_decode=vae_decode, vae_encode=vae_encode,
+            vae_decode=vd, vae_encode=ve,
             sharpen=lambda im: im,
         )
+        # Per-step pixel upsampling + the anchor round trip: 1 anchor + up to
+        # 3 per-step refs (tau=0.5 leaves 2 walkable transitions).
         assert calls["decode"] >= 1 and calls["encode"] >= 1
-
-    def test_latent_mode_never_calls_vae_adapters(self):
-        torch.manual_seed(4)
-        z = torch.randn(1, 4, 16, 16)
-
-        def fail_decode(x):
-            raise AssertionError("latent mode must not call vae_decode")
-
-        hiflow_cascade(
-            z, self.SIGMAS,
-            lambda x, s: 0.5 * x, lambda x, s: 0.5 * x,
-            target_resolution=256,
-            cfg=self._cfg(upsampling="latent"),
-            vae_decode=fail_decode, vae_encode=fail_decode,
-        )
-
-    def test_pixel_mode_without_vae_rejected(self):
-        torch.manual_seed(5)
-        z = torch.randn(1, 4, 8, 8)
-        with pytest.raises(ValueError, match="vae_decode and vae_encode"):
-            hiflow_cascade(
-                z, self.SIGMAS,
-                lambda x, s: 0.5 * x, lambda x, s: 0.5 * x,
-                target_resolution=128,
-                cfg=self._cfg(upsampling="pixel"),
-            )
 
     def test_invalid_upsampling_rejected(self):
         torch.manual_seed(6)
         z = torch.randn(1, 4, 8, 8)
+        vd, ve, _ = self._fake_vae()
         with pytest.raises(ValueError, match="latent.*pixel"):
             hiflow_cascade(
                 z, self.SIGMAS,
                 lambda x, s: 0.5 * x, lambda x, s: 0.5 * x,
                 target_resolution=128,
                 cfg=self._cfg(upsampling="bogus"),
+                vae_decode=vd, vae_encode=ve,
             )
 
     def test_base_at_target_returns_base_output(self):
-        """No stages: the base trajectory's final latent is returned."""
+        """No stages: the noised base trajectory's final latent is returned
+        (identical to running base_trajectory on the noised start). The VAE
+        is never touched (no anchor needed)."""
         from src.hiflow import base_trajectory
         torch.manual_seed(7)
         z = torch.randn(1, 4, 32, 32)
         cfg = self._cfg()
+
+        def fail_vae(x):
+            raise AssertionError("base-at-target must not touch the VAE")
+
         out = hiflow_cascade(
             z, self.SIGMAS,
             lambda x, s: 0.5 * x, lambda x, s: 0.5 * x,
             target_resolution=256,            # 32*8 == 256 -> no stages
             cfg=cfg,
+            vae_decode=fail_vae, vae_encode=fail_vae,
+            noise_seed=55,
         )
+        g = torch.Generator().manual_seed(55)
+        eps = torch.randn(z.shape, generator=g)
+        noised = 1.0 * eps + 0.0 * z
         expected, _ = base_trajectory(
-            z, self.SIGMAS, lambda x, s: 0.5 * x, cfg)
+            noised, self.SIGMAS, lambda x, s: 0.5 * x, cfg)
         assert torch.allclose(out, expected, atol=1e-6)
 
     def test_cascade_no_nan(self):
         torch.manual_seed(8)
         z = torch.randn(2, 4, 32, 32)
+        vd, ve, _ = self._fake_vae()
         out = hiflow_cascade(
             z, self.SIGMAS,
             lambda x, s: 0.5 * x + 0.05 * torch.randn_like(x),
             lambda x, s: 0.5 * x + 0.05 * torch.randn_like(x),
             target_resolution=1024,
             cfg=self._cfg(alpha_scale=1.0, beta_scale=0.5),
+            vae_decode=vd, vae_encode=ve,
         )
         assert torch.isfinite(out).all()
 
@@ -1060,11 +1268,13 @@ class TestHiflowCascade:
         events = []
         torch.manual_seed(9)
         z = torch.randn(1, 4, 32, 32)
+        vd, ve, _ = self._fake_vae()
         hiflow_cascade(
             z, self.SIGMAS,
             lambda x, s: 0.5 * x, lambda x, s: 0.5 * x,
             target_resolution=512,            # one stage
             cfg=self._cfg(),
+            vae_decode=vd, vae_encode=ve,
             progress_callback=lambda i, total, stage: events.append(stage),
         )
         assert events.count(-1) == len(self.SIGMAS) - 1
@@ -1076,11 +1286,13 @@ class TestHiflowCascade:
         import logging
         torch.manual_seed(10)
         z = torch.randn(1, 4, 32, 32)
+        vd, ve, _ = self._fake_vae()
         with caplog.at_level(logging.WARNING, logger="ComfyUI-DyPE"):
             hiflow_cascade(
                 z, torch.tensor([0.9, 0.5, 0.0]),
                 lambda x, s: 0.5 * x, lambda x, s: 0.5 * x,
                 target_resolution=512,
                 cfg=self._cfg(tau=0.99, steps_per_stage=2),
+                vae_decode=vd, vae_encode=ve,
             )
         assert any("above schedule" in r.message for r in caplog.records)

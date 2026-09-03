@@ -116,12 +116,19 @@ def build_stage_sigmas(
     Mirrors the HiFlow reference ``dlfg_timesteps = timesteps[-n:]`` (R4): the
     stage runs on the LAST ``steps`` sigmas of the model's full schedule —
     same spacing as the base run, entered at the sigma nearest ``tau`` from
-    below — plus a trailing 0 so the walk lands on a clean sample.
+    below — plus a trailing 0 so the walk lands on a clean sample. Stage
+    sigmas MUST stay a subset of the base schedule: the reference lookups
+    are exact-timestep keyed, and TrajectoryDict.nearest only tolerates
+    small spacing drift.
 
     Rules:
       - the entry sigma must satisfy sigma_entry <= tau + 1e-6 (clamped to the
         largest schedule sigma below tau; if tau exceeds sigma_max the full
         schedule runs and a warning is logged);
+      - the tail is the LAST (steps-1) interior sigmas strictly below the
+        entry ("suffix-below-tau": when tau picks an early entry and the
+        tail is capped, one enlarged first transition appears — accepted;
+        the reference avoids it only because its entry IS schedule[-n]);
       - the result is strictly descending except for the trailing 0 and has
         exactly ``steps`` transitions (len == steps + 1);
       - ``tau <= 0`` or ``steps < 1`` raises ValueError.
@@ -166,17 +173,27 @@ def alignment_scales(
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """Per-step direction (alpha) and acceleration (beta) scales.
 
-    Theory form (plan D5): ``alpha_i = beta_i = sigma_i / sigma_entry`` for
-    every entry sigma in the stage schedule — 1.0 at the stage entry,
-    decaying to ~0 at the clean end (the trailing 0 gets an exact 0). The
-    multiplier (cfg.alpha_scale / cfg.beta_scale) is applied by the caller.
+    Reference form (flux_pipeline_hiflow.py lines 903-904): LINEAR in the
+    step index — ``(n - i) / n`` per transition, 1.0 at the stage entry
+    decaying to 1/n at the last step — NOT the paper's alpha_t = t/tau =
+    sigma_i/sigma_entry. The two coincide only when the schedule is evenly
+    spaced in sigma; ComfyUI's "simple" spacing on a shifted model table
+    (Z-Image: shift 3.0) is not, and the sigma-ratio form stays near 1.0
+    mid-walk — over-locking low frequencies late (the Z-Image blur report,
+    plan D6). A trailing 0 keeps length parity with the sigma schedule.
     """
     sigmas = stage_sigmas.float()
     entry = float(sigmas[0])
     if entry <= 0.0:
         raise ValueError("stage schedule must enter at a positive sigma")
-    scales = sigmas / entry
-    scales = torch.clamp(scales, min=0.0)
+    n = sigmas.numel() - 1
+    if n < 1:
+        raise ValueError("stage schedule needs at least one transition")
+    idx = torch.arange(n, dtype=sigmas.dtype, device=sigmas.device)
+    scales = (float(n) - idx) / float(n)
+    scales = torch.cat(
+        [scales, torch.zeros(1, dtype=sigmas.dtype, device=sigmas.device)]
+    )
     return scales, scales.clone()
 
 
@@ -328,6 +345,7 @@ def base_trajectory(
 @torch.no_grad()
 def guided_stage(
     stage_latent: Tensor,
+    init_anchor: Tensor,
     ref_traj: TrajectoryDict,
     stage_sigmas: torch.Tensor,
     predict_x0: Callable[[Tensor, float], Tensor],
@@ -345,10 +363,17 @@ def guided_stage(
     stage_latent : Tensor
         VAE-space seed latent at the stage's TARGET size (used only for
         shape/device/dtype — its content is replaced by the initialization).
+    init_anchor : Tensor
+        Pre-upsampled initialization anchor at the stage's TARGET size in
+        VAE space: the previous chain's FINAL latent (base output for the
+        first stage, the previous stage's sigma-0 endpoint after that),
+        pixel round-tripped (decode -> bicubic -> sharpen -> encode) by the
+        caller — the reference pipeline always anchors on the final image
+        regardless of upsampling_choice (plan D2).
     ref_traj : TrajectoryDict
-        Reference flow (previous stage's or the base trajectory), x0 entries
-        at the PREVIOUS (smaller) latent size.
-    stage_sigmas : Tensor
+        Reference flow (previous stage's or the base trajectory), RAW
+        (uncorrected) x0 entries at the PREVIOUS (smaller) latent size.
+    stage_sigmas : torch.Tensor
         Descending stage schedule from `build_stage_sigmas`; entry sigma is
         the effective tau.
     predict_x0 : callable
@@ -356,7 +381,8 @@ def guided_stage(
         the high-resolution model prediction.
     upsample_x0 : callable
         ``x0_prev_size -> x0_stage_size`` (VAE space; latent bicubic or the
-        pixel decode/encode round trip, decided by the caller).
+        pixel decode/encode round trip, decided by the caller) — used ONLY
+        for the per-step time-matched reference x0's.
     cfg : HiFlowConfig
     freq_filter_factory : callable, optional
         ``(shape) -> [H, W] Butterworth mask``; defaults to building one from
@@ -373,21 +399,29 @@ def guided_stage(
     Returns
     -------
     (final_latent, stage_traj) : the walked latent and this stage's own
-    per-sigma corrected-x0 trajectory (the NEXT stage's reference — R9).
+    per-sigma RAW-x0 trajectory (the NEXT stage's reference + its sigma-0
+    endpoint is the next stage's anchor — both follow the reference code,
+    plan D4).
 
-    Alignment math (paper Sec. 4-6; plan D4/D5 for the deviations):
+    Alignment math (paper Sec. 4-6; plan D2-D4 for the code-vs-theory calls):
 
-    - Initialization: ``x = sigma_e * eps + (1 - sigma_e) * up(ref[sigma_e])``
+    - Initialization: ``x = sigma_e * eps + (1 - sigma_e) * init_anchor``
       where sigma_e is the stage entry sigma (== effective tau) and eps is
-      fresh std-1 noise. Theory form: the seed is the TIME-MATCHED reference
-      prediction, not the reference code's final-image encode (plan D4).
+      fresh std-1 noise. The anchor is the previous chain's FINAL image
+      (the reference pipeline's scale_noise on the pixel round-tripped
+      final latent), not the time-matched ref[sigma_e] of the theory doc.
     - Direction: ``x0_hat = x0 + alpha_i * (LPF(ref_i) - LPF(x0))`` with
-      ``alpha_i = alpha_scale * sigma_i / sigma_e``.
-    - Acceleration: the reference flow's own noisy state x_ref is
-      Euler-integrated alongside the high-res walk (plan Step-4 NOTE):
-      ``v_ref = (x_ref - ref_i)/sigma_i``; the high-res velocity gains
-      ``beta_i * beta_scale * (v_ref - v_ref_prev - v_hat + v_prev)``.
-      The first guided step has no previous pair — acceleration skipped.
+      ``alpha_i = alpha_scale * (n - i) / n`` (linear in step index).
+    - Acceleration: ``v_ref = (x - ref_i) / sigma_i`` — the reference
+      velocity derived from the HIGH-RES WALK's own current state, exactly
+      the reference code's ``model_output_ref = (sample - pred_x0_ref) /
+      (sigma + 1e-6)`` (there is no separately-integrated reference chain);
+      the high-res velocity gains ``beta_i * beta_scale * (v_ref -
+      prev_v_ref - v_hat + prev_v)``. The first guided step has no previous
+      pair — acceleration skipped.
+    - Recording: the RAW (pre-correction) model x0 per sigma (the reference
+      returns original_pred_x0 to pred_x0_dict) — guidance does not
+      compound across stages.
     """
     if len(ref_traj) == 0:
         raise ValueError(
@@ -409,17 +443,21 @@ def guided_stage(
     alphas, betas = alignment_scales(stage_sigmas)
     sigma_e = float(stage_sigmas[0])
 
-    # ---- Initialization alignment (plan D4) ------------------------------
-    _, ref_entry = ref_traj.nearest(sigma_e, device=device)
-    ref_entry = upsample_x0(ref_entry.float()).to(device)
+    # ---- Initialization alignment (plan D2) ------------------------------
+    # Anchor already at the stage size; the seed latent only carries
+    # shape/device/dtype.
+    anchor = init_anchor.to(device=device, dtype=torch.float32)
+    if anchor.shape != x.shape:
+        raise ValueError(
+            f"init_anchor shape {tuple(anchor.shape)} does not match the "
+            f"stage latent {tuple(x.shape)}"
+        )
     eps = torch.randn(
         x.shape, device=device, dtype=torch.float32, generator=generator,
     )
-    x = sigma_e * eps + (1.0 - sigma_e) * ref_entry
+    x = sigma_e * eps + (1.0 - sigma_e) * anchor
 
-    # Reference chain state (integrated with the SAME Euler rule).
-    x_ref = x.clone()
-    ref_up: dict[float, Tensor] = {sigma_e: ref_entry}
+    ref_up: dict[float, Tensor] = {}
 
     prev_v_high: Tensor | None = None
     prev_v_ref: Tensor | None = None
@@ -430,8 +468,10 @@ def guided_stage(
         sigma = float(stage_sigmas[i])
         sigma_safe = max(sigma, cfg.eps_sigma)
 
-        # A. High-resolution model prediction.
+        # A. High-resolution model prediction (RAW — recorded before any
+        # correction, plan D4: the reference's original_pred_x0).
         x0_high = predict_x0(x, sigma).float()
+        traj.put(sigma, x0_high)
 
         # B. Direction alignment: nudge low frequencies toward the reference.
         ref_x0 = ref_up.get(_sigma_key(sigma))
@@ -445,13 +485,9 @@ def guided_stage(
             low_high = split_frequency_components_fft(x0_high, filter_mask, is_low=True)
             x0_high = x0_high + alpha * (low_ref - low_high)
 
-        # Record the CORRECTED prediction (R9: the next stage consumes it).
-        traj.put(sigma, x0_high)
-
-        # C. Velocities. v_ref from the reference chain's OWN state (plan
-        # Step-4 NOTE); v_high from the corrected clean prediction.
+        # C. Velocities — both from the walk's own current state x (plan D3).
         v_high = (x - x0_high) / sigma_safe
-        v_ref = (x_ref - ref_x0) / sigma_safe
+        v_ref = (x - ref_x0) / sigma_safe
 
         # Acceleration alignment (skipped on the first guided step).
         beta = float(betas[i]) * cfg.beta_scale
@@ -462,10 +498,9 @@ def guided_stage(
         prev_v_high = v_high
         prev_v_ref = v_ref
 
-        # D. Euler update for both chains.
+        # D. Euler update.
         dt = float(stage_sigmas[i + 1]) - sigma
         x = x + v_high * dt
-        x_ref = x_ref + v_ref * dt
 
         if progress_callback is not None:
             progress_callback(i, n_steps, stage_index)
@@ -524,38 +559,56 @@ def hiflow_cascade(
     predict_x0_stage: Callable[[Tensor, float], Tensor],
     target_resolution: int,
     cfg: HiFlowConfig,
-    vae_decode: Callable[[Tensor], Tensor] | None = None,
-    vae_encode: Callable[[Tensor], Tensor] | None = None,
+    vae_decode: Callable[[Tensor], Tensor],
+    vae_encode: Callable[[Tensor], Tensor],
     sharpen: Callable[[Tensor], Tensor] | None = None,
     vae_downscale: int = 8,
     progress_callback: Callable[[int, int, int], None] | None = None,
+    noise_seed: int | None = None,
 ) -> Tensor:
     """Full HiFlow cascade: base trajectory, then guided upscale stages.
 
     Stage sizes double per stage until the pixel resolution reaches the
     target (plan D6). The base trajectory is recorded once at the native
-    size; each guided stage consumes the PREVIOUS stage's corrected-x0
-    trajectory (R9), upsampled to the new latent size — latent bicubic by
-    default, or the pixel decode->(sharpen)->encode round trip when
-    ``cfg.upsampling == "pixel"`` (needs vae_decode/vae_encode/sharpen).
+    size from a NOISED start (plan D1): ``x_start = sigma[0]*eps +
+    (1 - sigma[0])*initial_latent`` — for every CONST flow model sigma[0]==1
+    (pure noise, the reference's randn start); a non-empty input latent
+    survives as content only when sigma[0] < 1. Each guided stage consumes
+    the PREVIOUS stage's RAW-x0 trajectory (upsampled per-step: latent
+    bicubic or the pixel round trip per ``cfg.upsampling``) and anchors its
+    initialization on the previous chain's FINAL latent, ALWAYS pixel round
+    tripped (decode -> bicubic -> sharpen -> encode) — the reference anchors
+    on the final image regardless of upsampling_choice (plan D2).
+
+    ``noise_seed`` seeds one generator that drives the base-start noise and
+    every stage's initialization noise; None uses the global RNG (the
+    reference passes a single generator through the whole pipeline).
 
     Returns the final VAE-space latent at the last stage's size (or the
-    base latent unchanged when the input is already at the target).
+    base latent when the input is already at the target).
     """
     if cfg.upsampling not in ("latent", "pixel"):
         raise ValueError(
             f"upsampling must be 'latent' or 'pixel'; got {cfg.upsampling!r}"
         )
-    if cfg.upsampling == "pixel" and (
-        vae_decode is None or vae_encode is None
-    ):
-        raise ValueError(
-            "upsampling='pixel' needs vae_decode and vae_encode adapters"
-        )
 
-    # ---- Stage A: base trajectory at native size (guidance cfg). ----------
+    device = initial_latent.device
+    generator = None
+    if noise_seed is not None:
+        generator = torch.Generator(device=device).manual_seed(int(noise_seed))
+
+    # ---- Stage A: base trajectory at native size, from a noised start. -----
+    sigma_start = float(base_sigmas[0])
+    start_noise = torch.randn(
+        initial_latent.shape, device=device, dtype=torch.float32,
+        generator=generator,
+    )
+    noised_start = (
+        sigma_start * start_noise
+        + (1.0 - sigma_start) * initial_latent.float()
+    ).to(initial_latent.dtype)
     final_base, ref_traj = base_trajectory(
-        initial_latent, base_sigmas, predict_x0_base, cfg,
+        noised_start, base_sigmas, predict_x0_base, cfg,
         progress_callback=progress_callback,
     )
 
@@ -570,7 +623,14 @@ def hiflow_cascade(
         )
         return final_base
 
-    def make_upsample(target_h: int, target_w: int) -> Callable[[Tensor], Tensor]:
+    if vae_decode is None or vae_encode is None:
+        raise ValueError(
+            "hiflow_cascade needs vae_decode and vae_encode adapters — the "
+            "initialization anchor is always the pixel round-tripped final "
+            "latent, in both upsampling modes (plan D2)"
+        )
+
+    def make_ref_upsample(target_h: int, target_w: int) -> Callable[[Tensor], Tensor]:
         if cfg.upsampling == "latent":
             return lambda x: upsample_latent(x, target_h, target_w)
 
@@ -596,11 +656,37 @@ def hiflow_cascade(
 
         return pixel_up
 
+    def make_anchor_upsample(target_h: int, target_w: int) -> Callable[[Tensor], Tensor]:
+        """ALWAYS the pixel round trip (decode -> bicubic -> sharpen ->
+        encode) — the reference's initialization anchor path, regardless of
+        cfg.upsampling (plan D2)."""
+        def anchor_up(x: Tensor) -> Tensor:
+            image = vae_decode(x)
+            channels_last = image.dim() == 4 and image.shape[-1] == 3
+            if channels_last:
+                image = image.movedim(-1, 1)
+            image_up = F.interpolate(
+                image.float(), size=(
+                    target_h * vae_downscale, target_w * vae_downscale),
+                mode="bicubic", align_corners=False, antialias=True,
+            ).to(image.dtype)
+            if channels_last:
+                image_up = image_up.movedim(1, -1)
+            if sharpen is not None:
+                image_up = sharpen(image_up)
+            return vae_encode(image_up)
+
+        return anchor_up
+
     x = final_base
     for stage_idx, (t_h, t_w) in enumerate(sizes):
         stage_sigmas = build_stage_sigmas(
             base_sigmas, cfg.tau, cfg.steps_per_stage,
         )
+        # Anchor: the previous chain's final latent, pixel round tripped to
+        # this stage's size (the previous stage's traj[0.0] == x for k > 0;
+        # the base final for stage 0 — x already holds it).
+        anchor = make_anchor_upsample(t_h, t_w)(x)
         logger.info(
             "HiFlow: stage %d/%d — latent %dx%d -> %dx%d, entry sigma %.4f",
             stage_idx + 1, len(sizes), x.shape[-2], x.shape[-1], t_h, t_w,
@@ -608,12 +694,13 @@ def hiflow_cascade(
         )
         seed = torch.zeros(
             initial_latent.shape[0], initial_latent.shape[1], t_h, t_w,
-            device=initial_latent.device, dtype=initial_latent.dtype,
+            device=device, dtype=initial_latent.dtype,
         )
         x, ref_traj = guided_stage(
-            seed, ref_traj, stage_sigmas, predict_x0_stage,
-            make_upsample(t_h, t_w), cfg,
+            seed, anchor, ref_traj, stage_sigmas, predict_x0_stage,
+            make_ref_upsample(t_h, t_w), cfg,
             progress_callback=progress_callback,
             stage_index=stage_idx,
+            generator=generator,
         )
     return x
