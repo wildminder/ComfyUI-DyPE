@@ -111,6 +111,36 @@ def _make_predict_x0(
             )
         return _conds_by_shape[key]
 
+    # CFG guard (Z-Image bugfix 2026-09-03): with a NEGATIVE that carries no
+    # tokens (an empty CLIPTextEncode — NOT ConditioningZeroOut), CFG is
+    # undefined: the "uncond" branch is a real encoding of the empty string,
+    # and cond_scale amplifies a meaningless difference. Guidance-free
+    # models (Z-Image, Chroma) always land here when the user leaves the
+    # negative empty. Mirror ComfyUI's cfg=1 skip: run the conditional
+    # branch only (sampling_function with cond_scale=1.0 sets uncond=None
+    # and returns the conditional x0 exactly).
+    _has_negative = False
+    for _entry in negative or []:
+        if isinstance(_entry, (tuple, list)) and len(_entry) == 2:
+            _tensor, _opts = _entry
+            _tokens = 0
+            if torch.is_tensor(_tensor):
+                _tokens = int(_tensor.numel())
+            elif isinstance(_tensor, (list, tuple)):
+                _tokens = sum(
+                    int(t.numel()) if torch.is_tensor(t) else len(t)
+                    for t in _tensor
+                )
+            if _tokens > 0:
+                _has_negative = True
+                break
+    if not _has_negative:
+        cfg_scale = 1.0
+        logger.info(
+            "HiFlow: negative conditioning carries no tokens — running "
+            "the conditional branch only (CFG skipped, scale forced to 1.0)"
+        )
+
     def predict_x0(x_vae: torch.Tensor, sigma: float) -> torch.Tensor:
         x = x_vae.to(device)
         if process_latent_in is not None:
@@ -144,9 +174,20 @@ def _make_vae_adapters(vae, device):
     NOT apply process_latent_out/in — that would double-convert an already
     VAE-space tensor (the PixelRush space contract). They only normalize the
     tensor layout around the raw vae.decode/encode calls.
+
+    LAYOUT (Z-Image bugfix 2026-09-03): ComfyUI's VAE boundary is channels-
+    LAST — ``VAE.decode`` returns [B, H, W, 3] and ``VAE.encode`` expects
+    [B, H, W, 3] (it applies ``movedim(-1, 1)`` internally, sd.py:1359).
+    The adapters speak that layout end-to-end: decode passes the decoded
+    image through, bicubic/sharpen run on channels-last tensors, and encode
+    hands channels-last straight back. Converting to channels-first here
+    (the old PixelRush-style convention) made VAE.encode move the WIDTH
+    axis into the channel slot — spatial dims corrupted, encoder conv
+    crashed ("Kernel size can't be greater than actual input size").
     """
 
     def vae_decode(latent: torch.Tensor) -> torch.Tensor:
+        """latent [B,C,h,w] -> image [B, H, W, 3] (ComfyUI decode layout)."""
         if isinstance(latent, dict):
             latent = latent["samples"]
         latent = latent.to(device)
@@ -157,15 +198,11 @@ def _make_vae_adapters(vae, device):
             decoded = decoded[:, 0]
         elif decoded.ndim == 3:
             decoded = decoded.unsqueeze(0)
-        # Normalize to [B, 3, H, W].
-        if decoded.dim() == 4 and decoded.shape[-1] == 3:
-            decoded = decoded.movedim(-1, 1)
-        return decoded
+        return decoded  # [B, H, W, 3] channels-last, untouched
 
     def vae_encode(image: torch.Tensor) -> torch.Tensor:
+        """image [B, H, W, 3] -> latent [B, C, h, w] (ComfyUI encode layout)."""
         image = image.to(device)
-        if image.dim() == 4 and image.shape[-1] == 3:
-            image = image.movedim(-1, 1)
         encoded = vae.encode(image)
         if isinstance(encoded, dict):
             encoded = encoded["samples"]
@@ -178,10 +215,18 @@ def _sharpen(image: torch.Tensor, alpha: float = 1.0) -> torch.Tensor:
     """Gaussian unsharp mask: (alpha + 1) * I - alpha * blur(I).
 
     The reference (utils.gaussian_blur_image_sharpening) sharpens the
-    pixel-space upscaled image before re-encoding (pixel mode only).
+    pixel-space upscaled image before re-encoding (pixel mode only). The
+    image arrives channels-LAST ([B, H, W, 3] — the ComfyUI VAE boundary);
+    gaussian_blur_2d needs channels-first, so convert around the blur.
     """
+    channels_last = image.dim() == 4 and image.shape[-1] == 3
+    if channels_last:
+        image = image.movedim(-1, 1)
     blurred = gaussian_blur_2d(image, kernel_size=3, sigma=2.0)
-    return (alpha + 1.0) * image - alpha * blurred
+    sharpened = (alpha + 1.0) * image - alpha * blurred
+    if channels_last:
+        sharpened = sharpened.movedim(1, -1)
+    return sharpened
 
 
 def _base_sigmas(model, steps: int) -> torch.Tensor:
@@ -244,7 +289,10 @@ class HiFlowNode(io.ComfyNode):
                 io.Float.Input(
                     "cfg", default=3.5, min=0.0, max=20.0, step=0.1,
                     tooltip="Classifier-free guidance for the BASE stage "
-                            "(FLUX-dev default 3.5)."),
+                            "(FLUX-dev default 3.5). Guidance-free models "
+                            "(Z-Image, Chroma) or empty negatives: leave at "
+                            "1.0 — CFG is auto-skipped when the negative "
+                            "carries no tokens."),
                 io.Int.Input(
                     "steps", default=30, min=1, max=200, step=1,
                     tooltip="Base-stage sampling steps (paper: 30). The "
@@ -253,7 +301,8 @@ class HiFlowNode(io.ComfyNode):
                 io.Float.Input(
                     "guidance", default=4.5, min=0.0, max=20.0, step=0.1,
                     tooltip="Classifier-free guidance for the guided upscale "
-                            "stages (paper uses 4.5-6)."),
+                            "stages (paper uses 4.5-6). Same auto-skip rule "
+                            "as cfg."),
                 io.Int.Input(
                     "steps_per_stage", default=16, min=1, max=50, step=1,
                     tooltip="Guided-stage sampling steps per cascade stage "

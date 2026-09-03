@@ -218,6 +218,76 @@ class TestPredictX0:
         assert "diffusion_model(" not in content, (
             "hiflow_node must not bypass sampling_function"
         )
+
+
+@pytest.mark.unit
+class TestCfgEmptyNegativeSkip:
+    """Z-Image bugfix 2026-09-03 (blurred + over-vibrant output).
+
+    A guidance-free model with an empty-string CLIPTextEncode negative
+    produced cond_scale amplification of a meaningless (cond − uncond)
+    difference — the "high-CFG look" on a model that has no CFG at all.
+    The adapter must force cond_scale=1.0 when the negative carries no
+    tokens, so sampling_function's cfg1-skip runs the conditional branch
+    only."""
+
+    def _make_conds(self, neg_tokens):
+        pos = [(torch.ones(1, 8), {"side": "positive"})]
+        if neg_tokens is None:
+            neg = []  # no negative entries at all
+        elif neg_tokens == 0:
+            neg = [(torch.zeros(1, 0), {"side": "negative"})]  # 0 tokens
+        else:
+            neg = [(torch.zeros(1, neg_tokens), {"side": "negative"})]
+        return pos, neg
+
+    def test_empty_negative_forces_cfg_skip(self, monkeypatch):
+        fx = _install_fake_comfy(monkeypatch)
+        model = _mock_flow_model()
+        pos, neg = self._make_conds(neg_tokens=None)
+        adapter = hfn._make_predict_x0(model, pos, neg, cfg_scale=3.5)
+        adapter(torch.randn(1, 4, 8, 8), sigma=0.5)
+        assert fx.sampling_calls[-1]["cond_scale"] == 1.0, (
+            "empty negative must force cond_scale=1.0 (cfg1 skip)"
+        )
+
+    def test_zero_token_negative_forces_cfg_skip(self, monkeypatch):
+        fx = _install_fake_comfy(monkeypatch)
+        model = _mock_flow_model()
+        pos, neg = self._make_conds(neg_tokens=0)
+        adapter = hfn._make_predict_x0(model, pos, neg, cfg_scale=4.5)
+        adapter(torch.randn(1, 4, 8, 8), sigma=0.5)
+        assert fx.sampling_calls[-1]["cond_scale"] == 1.0
+
+    def test_real_negative_keeps_cfg(self, monkeypatch):
+        """A genuine negative (tokens present) keeps the requested CFG —
+        the paper's guidance still applies for CFG-trained flow models."""
+        fx = _install_fake_comfy(monkeypatch)
+        model = _mock_flow_model()
+        pos, neg = self._make_conds(neg_tokens=77)
+        adapter = hfn._make_predict_x0(model, pos, neg, cfg_scale=3.5)
+        adapter(torch.randn(1, 4, 8, 8), sigma=0.5)
+        assert fx.sampling_calls[-1]["cond_scale"] == 3.5
+
+    def test_cfg_one_with_real_negative_unchanged(self, monkeypatch):
+        fx = _install_fake_comfy(monkeypatch)
+        model = _mock_flow_model()
+        pos, neg = self._make_conds(neg_tokens=77)
+        adapter = hfn._make_predict_x0(model, pos, neg, cfg_scale=1.0)
+        adapter(torch.randn(1, 4, 8, 8), sigma=0.5)
+        assert fx.sampling_calls[-1]["cond_scale"] == 1.0
+
+    def test_list_token_negative_detected(self, monkeypatch):
+        """Token lists (batched tokenizations) count as a real negative."""
+        fx = _install_fake_comfy(monkeypatch)
+        model = _mock_flow_model()
+        pos = [(torch.ones(1, 8), {"side": "positive"})]
+        neg = [([torch.zeros(1, 4)], {"side": "negative"})]
+        adapter = hfn._make_predict_x0(model, pos, neg, cfg_scale=3.5)
+        adapter(torch.randn(1, 4, 8, 8), sigma=0.5)
+        assert fx.sampling_calls[-1]["cond_scale"] == 3.5
+
+
 def _install_fake_pbar_utils(monkeypatch):
     fake_utils = types.ModuleType("comfy.utils")
 
@@ -251,23 +321,31 @@ def _install_fake_pbar_utils(monkeypatch):
 
 @pytest.mark.unit
 class TestVaeAdapters:
-    def test_decode_normalizes_layout(self):
+    """Channels-last VAE boundary (Z-Image bugfix 2026-09-03): ComfyUI
+    VAE.decode returns [B,H,W,3] and VAE.encode expects [B,H,W,3] — the
+    adapters pass that layout through untouched. Converting to channels-
+    first here corrupted spatial dims in encode ("kernel size can't be
+    greater than actual input size")."""
+
+    def test_decode_passes_comfyui_channels_last(self):
         vae = types.SimpleNamespace(
-            decode=lambda z: torch.randn(1, 8, 8, 3),  # [B,H,W,3]
+            decode=lambda z: torch.randn(1, 8, 8, 3),  # ComfyUI layout
         )
         dec, _ = hfn._make_vae_adapters(vae, torch.device("cpu"))
         img = dec(torch.randn(1, 4, 8, 8))
-        assert img.shape[1] == 3, "decode must return [B,3,H,W]"
+        assert img.shape == (1, 8, 8, 3), (
+            "decode output must stay [B,H,W,3] — VAE.encode expects it"
+        )
 
     def test_decode_5d_squeezed(self):
         vae = types.SimpleNamespace(
-            decode=lambda z: torch.randn(1, 3, 1, 8, 8),
+            decode=lambda z: torch.randn(1, 8, 8, 3, 1),
         )
         dec, _ = hfn._make_vae_adapters(vae, torch.device("cpu"))
         img = dec(torch.randn(1, 4, 8, 8))
         assert img.ndim == 4
 
-    def test_encode_normalizes_layout(self):
+    def test_encode_accepts_channels_last(self):
         vae = types.SimpleNamespace(
             encode=lambda im: {"samples": torch.randn(1, 4, 8, 8)},
         )
@@ -275,9 +353,30 @@ class TestVaeAdapters:
         lat = enc(torch.randn(1, 8, 8, 3))  # [B,H,W,3] in
         assert lat.shape == (1, 4, 8, 8)
 
+    def test_encode_passes_tensor_untouched(self):
+        """Regression (the Z-Image crash): the adapter must hand the tensor
+        to vae.encode UNTOUCHED — ComfyUI's encode does its own movedim(-1,1)
+        on the channels-last input; any pre-conversion corrupts the axes."""
+        seen = {}
+
+        def encode(im):
+            seen["shape"] = tuple(im.shape)
+            # ComfyUI sd.py:1359 — encode does movedim(-1, 1) internally on
+            # the channels-last input it receives.
+            return {"samples": torch.randn(1, 4, 8, 8)}
+
+        vae = types.SimpleNamespace(encode=encode)
+        _, enc = hfn._make_vae_adapters(vae, torch.device("cpu"))
+        img = torch.randn(1, 8, 8, 3)  # correct channels-last input
+        lat = enc(img)
+        assert seen["shape"] == (1, 8, 8, 3), (
+            "adapter must hand vae.encode the channels-last tensor untouched"
+        )
+        assert lat.shape == (1, 4, 8, 8)
+
     def test_decode_accepts_dict_latent(self):
         vae = types.SimpleNamespace(
-            decode=lambda z: torch.randn(1, 3, 8, 8),
+            decode=lambda z: torch.randn(1, 8, 8, 3),
         )
         dec, _ = hfn._make_vae_adapters(vae, torch.device("cpu"))
         img = dec({"samples": torch.randn(1, 4, 8, 8)})
@@ -294,6 +393,20 @@ class TestSharpen:
         out = hfn._sharpen(img, alpha=1.0)
         interior = out[..., 2:-2, 2:-2]
         assert torch.allclose(interior, img[..., 2:-2, 2:-2], atol=1e-4)
+
+    def test_channels_last_passthrough(self):
+        """Z-Image bugfix 2026-09-03: pixel-mode images are channels-last
+        [B,H,W,3] (the ComfyUI VAE boundary) — sharpen must return the SAME
+        layout (it converts around the channels-first blur internally)."""
+        img = torch.zeros(1, 16, 16, 3)
+        img[0, 8, 8, 0] = 1.0
+        out = hfn._sharpen(img, alpha=1.0)
+        assert out.shape == img.shape, "layout must be preserved"
+        assert out[0, 8, 8, 0].item() > 1.0, "impulse peak must sharpen"
+        # Same values as the channels-first path (layout conversion is
+        # exact, not an approximation).
+        out_cf = hfn._sharpen(img.movedim(-1, 1), alpha=1.0)
+        assert torch.allclose(out, out_cf.movedim(1, -1), atol=1e-6)
 
     def test_unsharp_formula_on_impulse(self):
         """A delta impulse sharpens toward (alpha+1)*I at the peak (blur
@@ -350,9 +463,12 @@ class TestExecuteWiring:
         )
 
         vae = types.SimpleNamespace(
-            decode=lambda z: torch.randn(1, 3, z.shape[-2] * 8, z.shape[-1] * 8),
+            # ComfyUI VAE boundary layout: decode -> [B,H,W,3] channels-last,
+            # encode <- [B,H,W,3]. (Z-Image bugfix 2026-09-03.)
+            decode=lambda z: torch.randn(
+                1, z.shape[-2] * 8, z.shape[-1] * 8, 3),
             encode=lambda im: {"samples": torch.randn(
-                1, 4, im.shape[-2] // 8, im.shape[-1] // 8)},
+                1, 4, im.shape[-3] // 8, im.shape[-2] // 8)},
             downscale_ratio=8,
         )
         z = torch.randn(*latent)
@@ -423,11 +539,16 @@ class TestExecuteWiring:
 
         def decode(z):
             calls["n"] += 1
-            return torch.randn(1, 3, z.shape[-2] * 8, z.shape[-1] * 8)
+            # ComfyUI decode layout: [B, H, W, 3] channels-last.
+            return torch.randn(1, z.shape[-2] * 8, z.shape[-1] * 8, 3)
 
         def encode(im):
+            # ComfyUI encode layout: expects [B, H, W, 3] channels-last.
+            assert im.shape[-1] == 3, (
+                "encode must receive channels-last [B,H,W,3]"
+            )
             return {"samples": torch.randn(
-                1, 16, im.shape[-2] // 8, im.shape[-1] // 8)}
+                1, 16, im.shape[-3] // 8, im.shape[-2] // 8)}
 
         vae = types.SimpleNamespace(decode=decode, encode=encode,
                                     downscale_ratio=8)

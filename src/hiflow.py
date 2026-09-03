@@ -576,11 +576,20 @@ def hiflow_cascade(
 
         def pixel_up(x: Tensor) -> Tensor:
             image = vae_decode(x)
+            # The ComfyUI VAE boundary is channels-LAST ([B, H, W, 3],
+            # Z-Image bugfix 2026-09-03); F.interpolate with size= assumes
+            # channels-first and would resize the W and C axes — convert
+            # around the bicubic.
+            channels_last = image.dim() == 4 and image.shape[-1] == 3
+            if channels_last:
+                image = image.movedim(-1, 1)
             image_up = F.interpolate(
                 image.float(), size=(
                     target_h * vae_downscale, target_w * vae_downscale),
                 mode="bicubic", align_corners=False, antialias=True,
             ).to(image.dtype)
+            if channels_last:
+                image_up = image_up.movedim(1, -1)
             if sharpen is not None:
                 image_up = sharpen(image_up)
             return vae_encode(image_up)

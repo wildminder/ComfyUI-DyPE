@@ -956,18 +956,25 @@ class TestHiflowCascade:
         calls = {"decode": 0, "encode": 0}
 
         def vae_decode(latent):
-            """Real-VAE contract: latent [B,C,h,w] -> image [B,3,8h,8w]."""
+            """ComfyUI VAE contract (Z-Image bugfix): latent [B,C,h,w] ->
+            image [B, 8h, 8w, 3] CHANNELS-LAST."""
             calls["decode"] += 1
             b, c, h, w = latent.shape
-            img = latent[:, :3].repeat_interleave(8, -2).repeat_interleave(8, -1)
-            assert img.shape == (b, 3, h * 8, w * 8)
+            img = (latent[:, :3].repeat_interleave(8, -2)
+                   .repeat_interleave(8, -1))           # [B,3,8h,8w]
+            img = img.movedim(1, -1)                    # -> [B,8h,8w,3]
+            assert img.shape == (b, h * 8, w * 8, 3)
             return img
 
         def vae_encode(image):
-            """Real-VAE contract: image [B,3,H,W] -> latent [B,4,H/8,W/8]."""
+            """ComfyUI VAE contract: image [B,H,W,3] channels-last ->
+            latent [B, C, H/8, W/8]."""
             calls["encode"] += 1
-            small = image[:, :1, ::8, ::8]
-            return torch.cat([small] * 4, dim=1)
+            assert image.shape[-1] == 3, (
+                "encode must receive channels-last [B,H,W,3]"
+            )
+            small = image[..., :1, ::8, ::8].movedim(-1, 1)  # [B,1,h,w]
+            return small.repeat(1, 4, 1, 1)
 
         hiflow_cascade(
             z, self.SIGMAS,
