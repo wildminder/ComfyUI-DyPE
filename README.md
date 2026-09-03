@@ -293,7 +293,7 @@ Tuning-free higher-resolution generation via scale-fused attention and self-casc
 
 Training-free high-resolution upscaling for **rectified-flow models** (FLUX, Qwen-Image, …) via flow-aligned guidance ([paper](https://arxiv.org/abs/2504.06232), NeurIPS 2025). The base-resolution sampling runs once, recording every per-step clean prediction; each upscale stage then reuses that **time-matched trajectory** as a virtual reference — initialization alignment seeds the stage from it, direction alignment keeps low frequencies true to it, acceleration alignment matches its detail-generation rhythm. Structure survives; high-res detail is synthesized fresh.
 
-**Usage:** connect `model` (flow models only), `vae`, `positive`, `negative` and a base latent at native resolution (e.g. `EmptySD3LatentImage`) → set `noise_seed` + `target_resolution` → decode. The cascade noises the latent to the first sigma itself — an empty latent + seed reproduces the reference pipeline's from-noise start. Chain `DyPE (ntk)` before the loader for RoPE extrapolation at the target resolution.
+**Usage:** connect `model` (flow models only), `vae`, `positive`, `negative` and a base latent at native resolution (e.g. `EmptySD3LatentImage`) → set `noise_seed` + `scale_factor` → decode. The cascade noises the latent to the first sigma itself — an empty latent + seed reproduces the reference pipeline's from-noise start. Chain `DyPE (ntk)` before the loader for RoPE extrapolation at the scaled resolution.
 
 <details>
 <summary><b>Inputs & Parameters</b></summary>
@@ -310,7 +310,7 @@ Training-free high-resolution upscaling for **rectified-flow models** (FLUX, Qwe
 | `filter_ratio` | 0.2 | Butterworth low-pass cutoff D for direction alignment (paper 0.4, repo 0.2). |
 | `alpha_scale` / `beta_scale` | 1.0 / 0.5 | Direction / acceleration strength multipliers. |
 | `upsampling` | latent | Per-step reference upsample: `latent` bicubic (repo default) or `pixel` decode→sharpen→encode. The stage anchor is always the pixel round-trip. |
-| `target_resolution` | 2048 | Target pixels; each stage doubles the base until reached. |
+| `scale_factor` | 2.0 | Output scale relative to the input latent: 2 = double each side, 1 = unchanged, 0.5 = half. Upscales run 2× doubling stages (scales between 1 and 2 give one 2× stage); below 1 runs one refinement stage at the smaller size. |
 
 </details>
 
@@ -364,6 +364,9 @@ Restart ComfyUI. No further dependency installation is required.
 <p align="right"><a href="#readme-top" title="back to top">⟔ ▲ ⟓</a></p>
 
 ## ▓ Changelog
+
+### v2.13.0 — 2026-09-04
+- **HiFlow: `target_resolution` replaced by `scale_factor`** (user request — the absolute pixel target was unintuitive). `scale_factor` is relative to the input latent: 2 doubles each side, 1 returns the base unchanged, 0.5 halves it via a single refinement stage. Scales now apply per side (the absolute form over-upscaled the short side of non-square images), upscales keep the paper's 2×-stage quantization (a 1.5 scale runs one 2× stage), and downscale scales (0.25–1) run one guided stage at the smaller size. Example workflow updated.
 
 ### v2.12.1 — 2026-09-03
 - **Fixed HiFlow img2img noising space** (user-reported "drastic changes at any usable denoise; only 0.05 looks right"): the σ-mix `σ·ε + (1−σ)·content` now runs in MODEL space (convert the content with `process_latent_in` first, convert the mix back), matching ComfyUI's KSampler pipeline (samplers.py converts the content before the σ-mix). Mixing in VAE space scaled the noise by the latent format's `scale_factor` (Flux/Z-Image: 0.3611 — **2.77× under-noised**) and added spurious shift offsets, so the model aggressively "corrected" every img2img input. The guided-stage initialization σ-mix got the same fix. The sampler itself (rectified-flow Euler) and scheduler spacing (model-table "simple") were already faithful — the defect was the space mix, not the routine.

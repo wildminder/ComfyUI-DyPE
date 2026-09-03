@@ -273,7 +273,7 @@ class HiFlowNode(io.ComfyNode):
                 "Training-free high-resolution upscaling for rectified-flow "
                 "models (FLUX, Qwen-Image, ...) via flow-aligned guidance. "
                 "Works from a base latent; chain DyPE (ntk) before the "
-                "loader for RoPE extrapolation at the target resolution."
+                "loader for RoPE extrapolation at the scaled resolution."
             ),
             inputs=[
                 io.Model.Input("model", tooltip="The flow model."),
@@ -346,12 +346,15 @@ class HiFlowNode(io.ComfyNode):
                             "(repo default) or pixel decode->sharpen->encode. "
                             "The stage-initialization anchor is always the "
                             "pixel round-trip of the previous final image."),
-                io.Int.Input(
-                    "target_resolution", default=2048, min=1024, max=8192,
-                    step=128,
-                    tooltip="Target resolution in pixels; stages double the "
-                            "base per stage until reached (2048 = one 2x "
-                            "stage from 1024)."),
+                io.Float.Input(
+                    "scale_factor", default=2.0, min=0.25, max=8.0,
+                    step=0.05,
+                    tooltip="Output scale relative to the input latent: 2 = "
+                            "double resolution per side, 1 = unchanged, 0.5 "
+                            "= half. Upscales run 2x doubling stages (so "
+                            "scales between 1 and 2 give one 2x stage); "
+                            "scales below 1 run a single refinement stage "
+                            "at the smaller size."),
             ],
             outputs=[
                 io.Latent.Output(display_name="High-Res Latent"),
@@ -359,19 +362,19 @@ class HiFlowNode(io.ComfyNode):
         )
 
     @classmethod
-    def validate_inputs(cls, target_resolution):
+    def validate_inputs(cls, scale_factor):
         # Uninitialized graph state passes through (2026-08-25 fix pattern).
-        if target_resolution is None:
+        if scale_factor is None:
             return True
-        if int(target_resolution) < 16:
-            return "target_resolution must be >= 16"
+        if not (0.25 <= float(scale_factor) <= 8.0):
+            return "scale_factor must be between 0.25 and 8"
         return True
 
     @classmethod
     def execute(cls, model, vae, positive, negative, latent_image,
                 cfg=3.5, steps=30, guidance=4.5, steps_per_stage=16,
                 tau=0.6, filter_ratio=0.2, alpha_scale=1.0, beta_scale=0.5,
-                upsampling="latent", target_resolution=2048,
+                upsampling="latent", scale_factor=2.0,
                 noise_seed=0, denoise=1.0) -> io.NodeOutput:
         import comfy.utils
 
@@ -460,7 +463,7 @@ class HiFlowNode(io.ComfyNode):
         from .hiflow import _stage_latent_sizes
         sizes = _stage_latent_sizes(
             initial_latent.shape[-2], initial_latent.shape[-1],
-            int(target_resolution), _downscale_ratio(vae),
+            float(scale_factor), _downscale_ratio(vae),
         )
         total = max(1, len(base_sigmas) - 1 + len(sizes) * int(steps_per_stage))
         pbar = comfy.utils.ProgressBar(total)
@@ -475,7 +478,7 @@ class HiFlowNode(io.ComfyNode):
             base_sigmas=base_sigmas,
             predict_x0_base=predict_x0_base,
             predict_x0_stage=predict_x0_stage,
-            target_resolution=int(target_resolution),
+            scale_factor=float(scale_factor),
             cfg=cfg_obj,
             vae_decode=vae_decode,
             vae_encode=vae_encode,

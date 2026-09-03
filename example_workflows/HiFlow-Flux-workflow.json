@@ -89,7 +89,7 @@
       "alpha_scale": 1.0,
       "beta_scale": 0.5,
       "upsampling": "latent",
-      "target_resolution": 2048
+      "scale_factor": 2.0
     }
   },
   "8": {

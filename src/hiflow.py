@@ -617,27 +617,67 @@ def upsample_latent(x0: Tensor, target_h: int, target_w: int) -> Tensor:
     return up.to(orig_dtype)
 
 
+def _snap_latent_dim(dim: int, vae_downscale: int, latent_multiple: int) -> int:
+    """Snap a latent dim so pixels stay multiples of 16 and the latent dim a
+    multiple of ``latent_multiple`` (FLUX packs 2x2 latent patches -> even
+    latent dims). Rounds to the NEAREST valid value (up or down)."""
+    px = dim * vae_downscale
+    px = max(vae_downscale * latent_multiple, round(px / 16) * 16)
+    snapped = px // vae_downscale
+    # keep the latent dim a multiple of latent_multiple (round UP)
+    return ((snapped + latent_multiple - 1) // latent_multiple) * latent_multiple
+
+
 def _stage_latent_sizes(
-    base_h: int, base_w: int, target_resolution: int, vae_downscale: int = 8,
+    base_h: int, base_w: int, scale_factor: float, vae_downscale: int = 8,
     latent_multiple: int = 2,
 ) -> list[tuple[int, int]]:
-    """Cascade stage sizes (latent H, W), doubling per stage until the pixel
-    resolution reaches the target (plan D6). Sizes snap so pixel dimensions
-    are multiples of 16 and latent dims of ``latent_multiple`` (FLUX packs
-    2x2 latent patches -> even latent dims).
+    """Cascade stage sizes (latent H, W) for a SCALE FACTOR relative to the
+    base latent (v2.13.0 — replaces the absolute target-resolution form).
+
+    - ``scale > 1``: 2x doubling stages until the FINAL stage reaches the
+      scaled size (the last stage may land slightly ABOVE the exact scale —
+      doubling is quantized; the reference cascade is 2x stages only);
+    - ``scale == 1``: no stages (the base output is returned unchanged);
+    - ``0.25 <= scale < 1``: a SINGLE fractional stage walking toward the
+      scaled-down size (bilinear ref upsampling then blends toward it).
     """
-    def snap_latent(dim: int) -> int:
-        px = dim * vae_downscale
-        px = max(vae_downscale * latent_multiple, round(px / 16) * 16)
-        snapped = px // vae_downscale
-        # keep the latent dim a multiple of latent_multiple (round UP)
-        return ((snapped + latent_multiple - 1) // latent_multiple) * latent_multiple
+    if not (0.25 <= scale_factor <= 8.0):
+        raise ValueError(
+            f"scale_factor must be in [0.25, 8]; got {scale_factor!r}"
+        )
+    scale = float(scale_factor)
+
+    def snap(dim: int) -> int:
+        return _snap_latent_dim(dim, vae_downscale, latent_multiple)
+
+    h0, w0 = snap(base_h), snap(base_w)
+    if abs(scale - 1.0) < 1e-9:
+        return []
+
+    target_h = snap(round(h0 * scale))
+    target_w = snap(round(w0 * scale))
+
+    if scale < 1.0:
+        # Fractional stage: one walk toward the smaller size. The stage is
+        # guided exactly like an upscale stage (init anchor + per-step refs
+        # both upsample FROM the smaller target TO the previous size would
+        # invert roles, so the stage runs at the TARGET size with the
+        # reference trajectory UPsampled to it — scale<1 simply means the
+        # target is smaller; the reference chain is bicubic-downscaled).
+        if target_h >= h0 and target_w >= w0:
+            return []  # snapping ate the reduction — nothing to do
+        return [(target_h, target_w)]
 
     sizes = []
-    h, w = snap_latent(base_h), snap_latent(base_w)
-    while h * vae_downscale < target_resolution or w * vae_downscale < target_resolution:
-        h, w = snap_latent(h * 2), snap_latent(w * 2)
+    h, w = h0, w0
+    while h < target_h or w < target_w:
+        h, w = snap(h * 2), snap(w * 2)
         sizes.append((h, w))
+        if len(sizes) > 4:
+            raise ValueError(
+                f"scale_factor {scale} needs more than 4 doubling stages"
+            )
     return sizes
 
 
@@ -647,7 +687,7 @@ def hiflow_cascade(
     base_sigmas: torch.Tensor,
     predict_x0_base: Callable[[Tensor, float], Tensor],
     predict_x0_stage: Callable[[Tensor, float], Tensor],
-    target_resolution: int,
+    scale_factor: float,
     cfg: HiFlowConfig,
     vae_decode: Callable[[Tensor], Tensor],
     vae_encode: Callable[[Tensor], Tensor],
@@ -659,12 +699,15 @@ def hiflow_cascade(
     process_latent_in: Callable[[Tensor], Tensor] | None = None,
     process_latent_out: Callable[[Tensor], Tensor] | None = None,
 ) -> Tensor:
-    """Full HiFlow cascade: base trajectory, then guided upscale stages.
+    """Full HiFlow cascade: base trajectory, then guided stages.
 
-    Stage sizes double per stage until the pixel resolution reaches the
-    target (plan D6). The base trajectory is recorded once at the native
-    size from a NOISED start (plan D1): ``x_start = sigma_start*eps +
-    (1 - sigma_start)*initial_latent``.
+    ``scale_factor`` (v2.13.0) is RELATIVE to the input latent: 2 doubles
+    the resolution per side, 1 returns the base output unchanged, 0.5
+    halves it (a single fractional stage — the reference trajectory is
+    bicubic-resized to the smaller target; the stage itself walks exactly
+    like an upscale stage). Doubling stages are quantized: scales between
+    1 and 2 run ONE 2x stage (the paper's cascade is 2x stages only), so
+    the final size may land above the exact scale.
 
     ``denoise`` (img2img, KSampler convention): 1.0 runs the full schedule
     from pure noise (sigma_start == 1 — the reference's randn start; an
@@ -752,12 +795,13 @@ def hiflow_cascade(
 
     base_h, base_w = initial_latent.shape[-2], initial_latent.shape[-1]
     sizes = _stage_latent_sizes(
-        base_h, base_w, target_resolution, vae_downscale,
+        base_h, base_w, float(scale_factor), vae_downscale,
     )
     if not sizes:
         logger.info(
-            "HiFlow: base %dx%d already at target %d — returning base output",
-            base_h * vae_downscale, base_w * vae_downscale, target_resolution,
+            "HiFlow: scale %.2f needs no stages (base %dx%d) — returning "
+            "base output", scale_factor, base_h * vae_downscale,
+            base_w * vae_downscale,
         )
         return final_base
 

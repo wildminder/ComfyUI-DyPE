@@ -448,7 +448,7 @@ class TestBaseSigmas:
 
 @pytest.mark.unit
 class TestExecuteWiring:
-    def _run_execute(self, monkeypatch, target=512, upsampling="latent",
+    def _run_execute(self, monkeypatch, scale=4.0, upsampling="latent",
                      latent=(1, 16, 16, 16), prediction_mixin="CONST"):
 
         FakePBar = _install_fake_pbar_utils(monkeypatch)
@@ -479,7 +479,7 @@ class TestExecuteWiring:
             model, vae, COND_POS, COND_NEG, {"samples": z},
             cfg=3.5, steps=4, guidance=4.5, steps_per_stage=2,
             tau=0.5, filter_ratio=0.2, alpha_scale=1.0, beta_scale=0.5,
-            upsampling=upsampling, target_resolution=target,
+            upsampling=upsampling, scale_factor=scale,
             noise_seed=0, denoise=1.0,
         )
         # NodeOutput wraps the payload positionally; unwrap to the dict.
@@ -489,15 +489,20 @@ class TestExecuteWiring:
         return out_dict, FakePBar
 
     def test_execute_returns_latent_dict(self, monkeypatch):
-        result, _ = self._run_execute(monkeypatch, target=512)
+        result, _ = self._run_execute(monkeypatch, scale=4.0)
         samples = result["samples"]
         assert samples.ndim == 4
         assert torch.isfinite(samples).all()
 
     def test_execute_doubles_resolution(self, monkeypatch):
-        """16x16 latent (128px) + target 512px -> 64x64 latent out."""
-        result, _ = self._run_execute(monkeypatch, target=512)
+        """16x16 latent + scale 4.0 -> 64x64 latent out (two stages)."""
+        result, _ = self._run_execute(monkeypatch, scale=4.0)
         assert tuple(result["samples"].shape[-2:]) == (64, 64)
+
+    def test_execute_scale_two_one_stage(self, monkeypatch):
+        """scale 2.0 on a 16x16 latent -> one doubling stage -> 32x32."""
+        result, _ = self._run_execute(monkeypatch, scale=2.0)
+        assert tuple(result["samples"].shape[-2:]) == (32, 32)
 
     def test_execute_rejects_non_flow_model(self, monkeypatch):
         with pytest.raises(ValueError, match="PixelRush"):
@@ -530,7 +535,7 @@ class TestExecuteWiring:
         result = hfn.HiFlowNode.execute(
             model, vae, COND_POS, COND_NEG, {"samples": z},
             steps=2, steps_per_stage=2, tau=0.5,
-            target_resolution=256,
+            scale_factor=2.0,
             noise_seed=0, denoise=1.0,
         )
         samples = result[0]["samples"] if not hasattr(result, "shape") \
@@ -560,7 +565,7 @@ class TestExecuteWiring:
             hfn.HiFlowNode.execute(
                 model, vae, COND_POS, COND_NEG, {"samples": z},
                 steps=2, steps_per_stage=2, tau=0.5,
-                target_resolution=256, denoise=1.0,
+                scale_factor=2.0, denoise=1.0,
             )
         assert any("denoise=1.0" in r.message for r in caplog.records)
 
@@ -587,7 +592,7 @@ class TestExecuteWiring:
             hfn.HiFlowNode.execute(
                 model, vae, COND_POS, COND_NEG, {"samples": z},
                 steps=2, steps_per_stage=2, tau=0.5,
-                target_resolution=256, denoise=0.6,
+                scale_factor=2.0, denoise=0.6,
             )
         assert not any(
             "denoise=1.0" in r.message for r in caplog.records)
@@ -613,7 +618,7 @@ class TestExecuteWiring:
         hfn.HiFlowNode.execute(
             model, vae, COND_POS, COND_NEG, {"samples": z},
             steps=4, steps_per_stage=2, tau=0.5,
-            target_resolution=256, denoise=0.5,
+            scale_factor=2.0, denoise=0.5,
         )
         first_t = fake.sampling_calls[0]["timestep"]
         first_sigma = float(first_t) / 1000.0  # the mock's DiscreteFlow probe
@@ -662,7 +667,7 @@ class TestExecuteWiring:
             model, vae, COND_POS, COND_NEG,
             {"samples": torch.randn(1, 16, 16, 16)},
             steps=2, steps_per_stage=2, tau=0.5,
-            upsampling="pixel", target_resolution=256,
+            upsampling="pixel", scale_factor=2.0,
         )
         assert calls["n"] >= 1, "pixel mode must call vae.decode"
         samples = result[0]["samples"] if not hasattr(result, "shape") \
@@ -686,7 +691,7 @@ class TestHiFlowNodeSchema:
         for inp in ["model", "vae", "positive", "negative", "latent_image",
                     "cfg", "steps", "guidance", "steps_per_stage", "tau",
                     "filter_ratio", "alpha_scale", "beta_scale", "upsampling",
-                    "target_resolution"]:
+                    "scale_factor"]:
             assert f'"{inp}"' in src, f"missing schema input {inp}"
         assert "default=3.5" in src     # cfg (FLUX-dev)
         assert "default=30" in src      # steps (paper)
@@ -731,10 +736,10 @@ class TestHiFlowNodeSchema:
         assert 'category="image/upscaling"' in self._src()
 
     def test_validate_inputs_none_passes(self):
-        assert hfn.HiFlowNode.validate_inputs(target_resolution=None) is True
+        assert hfn.HiFlowNode.validate_inputs(scale_factor=None) is True
 
     def test_validate_inputs_small_rejected(self):
-        result = hfn.HiFlowNode.validate_inputs(target_resolution=8)
+        result = hfn.HiFlowNode.validate_inputs(scale_factor=16.0)
         assert isinstance(result, str)
 
 
@@ -755,8 +760,8 @@ class TestHiFlowDocs:
         readme = (pathlib.Path(__file__).parent.parent
                   / "README.md").read_text(encoding="utf-8")
         m = re.search(r'^version = "([^"]+)"', pyproject, re.MULTILINE)
-        assert m and m.group(1) == "2.12.1"
-        assert "### v2.12.1" in readme
+        assert m and m.group(1) == "2.13.0"
+        assert "### v2.13.0" in readme
 
     def test_workflow_json_parses_and_uses_known_nodes(self):
         import json

@@ -1058,24 +1058,45 @@ class TestUpsampleLatent:
 
 @pytest.mark.unit
 class TestStageLatentSizes:
-    def test_flux_1024_targets(self):
-        assert _stage_latent_sizes(128, 128, 1024) == []
-        assert _stage_latent_sizes(128, 128, 2048) == [(256, 256)]
-        assert _stage_latent_sizes(128, 128, 4096) == [(256, 256), (512, 512)]
+    def test_scale_1_no_stages(self):
+        assert _stage_latent_sizes(128, 128, 1.0) == []
+
+    def test_scale_2_one_doubling_stage(self):
+        assert _stage_latent_sizes(128, 128, 2.0) == [(256, 256)]
+
+    def test_scale_4_two_doubling_stages(self):
+        assert _stage_latent_sizes(128, 128, 4.0) == [(256, 256), (512, 512)]
+
+    def test_scale_between_1_and_2_quantizes_to_one_stage(self):
+        """The cascade is 2x stages only (paper): scales in (1, 2] run ONE
+        2x stage — the final size lands above the exact scale."""
+        assert _stage_latent_sizes(128, 128, 1.5) == [(256, 256)]
+        assert _stage_latent_sizes(128, 128, 1.2) == [(256, 256)]
+
+    def test_scale_half_single_fractional_stage(self):
+        assert _stage_latent_sizes(128, 128, 0.5) == [(64, 64)]
+
+    def test_scale_quarter_single_fractional_stage(self):
+        assert _stage_latent_sizes(128, 128, 0.25) == [(32, 32)]
+
+    def test_non_square_per_side_scaling(self):
+        """Scale applies PER SIDE: a 2x on 128x64 doubles both sides
+        (the old absolute-target form over-upscaled the short side)."""
+        assert _stage_latent_sizes(128, 64, 2.0) == [(256, 128)]
+        assert _stage_latent_sizes(128, 64, 0.5) == [(64, 32)]
 
     def test_odd_base_snapped(self):
         """1088px base (latent 136) doubles to a 16-px-multiple target."""
-        sizes = _stage_latent_sizes(136, 136, 2048)
+        sizes = _stage_latent_sizes(136, 136, 2.0)
         assert sizes == [(272, 272)]
         for h, w in sizes:
             assert (h * 8) % 16 == 0 and (w * 8) % 16 == 0
             assert h % 2 == 0 and w % 2 == 0  # FLUX 2x2 packing
 
-    def test_terminates_at_target(self):
-        sizes = _stage_latent_sizes(64, 64, 4096)
-        h, w = sizes[-1]
-        assert h * 8 >= 4096 or w * 8 >= 4096
-        assert len(sizes) <= 6  # 512px base -> bounded stage count
+    def test_out_of_range_rejected(self):
+        for bad in (0.1, 0.0, -1.0, 8.5, 16.0):
+            with pytest.raises(ValueError, match="scale_factor"):
+                _stage_latent_sizes(128, 128, bad)
 
 
 @pytest.mark.unit
@@ -1132,7 +1153,7 @@ class TestHiflowCascade:
         hiflow_cascade(
             z, self.SIGMAS, base_predict,
             lambda x, s: 0.5 * x,
-            target_resolution=256,            # 32*8 == 256 -> no stages
+            scale_factor=1.0,
             cfg=self._cfg(),
             vae_decode=None, vae_encode=None,
             noise_seed=1234,
@@ -1158,7 +1179,7 @@ class TestHiflowCascade:
         hiflow_cascade(
             z, torch.tensor([0.5, 0.25, 0.0]), base_predict,
             lambda x, s: 0.5 * x,
-            target_resolution=64,             # already at target
+            scale_factor=1.0,               # no stages: noising pin only
             cfg=self._cfg(),
             vae_decode=None, vae_encode=None,
             noise_seed=99,
@@ -1178,7 +1199,7 @@ class TestHiflowCascade:
             return hiflow_cascade(
                 z, self.SIGMAS,
                 lambda x, s: 0.5 * x, lambda x, s: 0.5 * x,
-                target_resolution=512,
+                scale_factor=2.0,
                 cfg=self._cfg(),
                 vae_decode=vd, vae_encode=ve,
                 noise_seed=seed,
@@ -1214,7 +1235,7 @@ class TestHiflowCascade:
         hiflow_cascade(
             z, self.SIGMAS,
             base_predict, lambda x, s: 0.5 * x,
-            target_resolution=256,            # base-at-target: no stages
+            scale_factor=1.0,
             cfg=self._cfg(steps=2),
             vae_decode=None, vae_encode=None,
             noise_seed=5, denoise=0.5,
@@ -1252,7 +1273,7 @@ class TestHiflowCascade:
         hiflow_cascade(
             z, self.SIGMAS,
             base_predict, lambda x, s: 0.5 * x,
-            target_resolution=256,
+            scale_factor=1.0,
             cfg=self._cfg(steps=2),
             vae_decode=None, vae_encode=None,
             noise_seed=9, denoise=0.5,
@@ -1291,7 +1312,7 @@ class TestHiflowCascade:
         hiflow_cascade(
             z, self.SIGMAS,
             base_predict, lambda x, s: 0.5 * x,
-            target_resolution=256,
+            scale_factor=1.0,
             cfg=self._cfg(steps=2),
             vae_decode=None, vae_encode=None,
             noise_seed=9, denoise=0.5,
@@ -1316,7 +1337,7 @@ class TestHiflowCascade:
         hiflow_cascade(
             z, self.SIGMAS,
             base_predict, lambda x, s: 0.5 * x,
-            target_resolution=256,
+            scale_factor=1.0,
             cfg=self._cfg(),
             vae_decode=None, vae_encode=None,
             noise_seed=5, denoise=0.3,
@@ -1339,7 +1360,7 @@ class TestHiflowCascade:
         hiflow_cascade(
             z, self.SIGMAS,
             base_predict, lambda x, s: 0.5 * x,
-            target_resolution=256,
+            scale_factor=1.0,
             cfg=self._cfg(),
             vae_decode=None, vae_encode=None,
             noise_seed=5, denoise=1.0,
@@ -1358,7 +1379,7 @@ class TestHiflowCascade:
                 hiflow_cascade(
                     z, self.SIGMAS,
                     lambda x, s: 0.5 * x, lambda x, s: 0.5 * x,
-                    target_resolution=512,
+                    scale_factor=4.0,
                     cfg=self._cfg(upsampling=mode),
                     vae_decode=None, vae_encode=None,
                 )
@@ -1366,7 +1387,7 @@ class TestHiflowCascade:
         hiflow_cascade(
             z, self.SIGMAS,
             lambda x, s: 0.5 * x, lambda x, s: 0.5 * x,
-            target_resolution=128,             # 16*8 == 128 -> no stages
+            scale_factor=1.0,
             cfg=self._cfg(),
             vae_decode=None, vae_encode=None,
         )
@@ -1376,7 +1397,7 @@ class TestHiflowCascade:
             hiflow_cascade(
                 z, self.SIGMAS,
                 lambda x, s: 0.5 * x, lambda x, s: 0.5 * x,
-                target_resolution=512,
+                scale_factor=4.0,
                 cfg=self._cfg(),
             )
 
@@ -1395,7 +1416,7 @@ class TestHiflowCascade:
         hiflow_cascade(
             z, self.SIGMAS,
             lambda x, s: 0.5 * x, stage_predict,
-            target_resolution=256,            # one stage
+            scale_factor=2.0,
             cfg=self._cfg(upsampling="latent"),
             vae_decode=vd, vae_encode=ve,
         )
@@ -1404,7 +1425,7 @@ class TestHiflowCascade:
         )
 
     def test_two_stages_resolution_progression(self):
-        """Base 32x32 latent (256px); target 1024px -> stages 64, 128."""
+        """Base 32x32 latent (256px); scale 4 -> stages 64, 128."""
         torch.manual_seed(0)
         z = torch.randn(1, 4, 32, 32)
         vd, ve, _ = self._fake_vae()
@@ -1412,12 +1433,65 @@ class TestHiflowCascade:
             z, self.SIGMAS,
             lambda x, s: 0.5 * x,           # base
             lambda x, s: 0.5 * x,           # stage
-            target_resolution=1024,
+            scale_factor=4.0,
             cfg=self._cfg(),
             vae_decode=vd, vae_encode=ve,
             vae_downscale=8,
         )
         assert out.shape == (1, 4, 128, 128)
+
+    def test_downscale_stage_halves(self):
+        """scale 0.5 runs ONE stage at half size — the reference trajectory
+        is bicubic-resized down; the walk itself is unchanged (v2.13.0)."""
+        torch.manual_seed(26)
+        z = torch.randn(1, 4, 32, 32)
+        vd, ve, _ = self._fake_vae()
+        stage_sizes = []
+
+        def stage_predict(x, s):
+            stage_sizes.append(tuple(x.shape[-2:]))
+            return 0.5 * x
+
+        out = hiflow_cascade(
+            z, self.SIGMAS,
+            lambda x, s: 0.5 * x, stage_predict,
+            scale_factor=0.5,
+            cfg=self._cfg(),
+            vae_decode=vd, vae_encode=ve,
+        )
+        assert out.shape == (1, 4, 16, 16), "scale 0.5 halves the latent"
+        assert stage_sizes and all(s == (16, 16) for s in stage_sizes)
+        assert torch.isfinite(out).all()
+
+    def test_non_square_scale_per_side(self):
+        """Scale applies per side: 128x64-pixel... 16x32 latent @2x ->
+        32x64 — both sides double (the old absolute form over-upscaled
+        the short side)."""
+        torch.manual_seed(27)
+        z = torch.randn(1, 4, 16, 32)
+        vd, ve, _ = self._fake_vae()
+        out = hiflow_cascade(
+            z, self.SIGMAS,
+            lambda x, s: 0.5 * x, lambda x, s: 0.5 * x,
+            scale_factor=2.0,
+            cfg=self._cfg(),
+            vae_decode=vd, vae_encode=ve,
+        )
+        assert tuple(out.shape[-2:]) == (32, 64)
+
+    def test_scale_out_of_range_rejected(self):
+        torch.manual_seed(28)
+        z = torch.randn(1, 4, 32, 32)
+        vd, ve, _ = self._fake_vae()
+        for bad in (0.1, 0.0, 8.5):
+            with pytest.raises(ValueError, match="scale_factor"):
+                hiflow_cascade(
+                    z, self.SIGMAS,
+                    lambda x, s: 0.5 * x, lambda x, s: 0.5 * x,
+                    scale_factor=bad,
+                    cfg=self._cfg(),
+                    vae_decode=vd, vae_encode=ve,
+                )
 
     def test_single_stage_doubles(self):
         torch.manual_seed(1)
@@ -1426,7 +1500,7 @@ class TestHiflowCascade:
         out = hiflow_cascade(
             z, self.SIGMAS,
             lambda x, s: 0.5 * x, lambda x, s: 0.5 * x,
-            target_resolution=512,          # 256px base -> one 512px stage
+            scale_factor=2.0,
             cfg=self._cfg(),
             vae_decode=vd, vae_encode=ve,
         )
@@ -1447,7 +1521,7 @@ class TestHiflowCascade:
         hiflow_cascade(
             z, self.SIGMAS,
             lambda x, s: 0.5 * x, stage_predict,
-            target_resolution=512,           # 128px base -> stages 256, 512
+            scale_factor=4.0,
             cfg=self._cfg(),
             vae_decode=vd, vae_encode=ve,
         )
@@ -1462,7 +1536,7 @@ class TestHiflowCascade:
         hiflow_cascade(
             z, self.SIGMAS,
             lambda x, s: 0.5 * x, lambda x, s: 0.5 * x,
-            target_resolution=256,            # one stage, 3 transitions
+            scale_factor=2.0,
             cfg=self._cfg(upsampling="pixel"),
             vae_decode=vd, vae_encode=ve,
             sharpen=lambda im: im,
@@ -1479,7 +1553,7 @@ class TestHiflowCascade:
             hiflow_cascade(
                 z, self.SIGMAS,
                 lambda x, s: 0.5 * x, lambda x, s: 0.5 * x,
-                target_resolution=128,
+                scale_factor=2.0,
                 cfg=self._cfg(upsampling="bogus"),
                 vae_decode=vd, vae_encode=ve,
             )
@@ -1499,7 +1573,7 @@ class TestHiflowCascade:
         out = hiflow_cascade(
             z, self.SIGMAS,
             lambda x, s: 0.5 * x, lambda x, s: 0.5 * x,
-            target_resolution=256,            # 32*8 == 256 -> no stages
+            scale_factor=1.0,
             cfg=cfg,
             vae_decode=fail_vae, vae_encode=fail_vae,
             noise_seed=55,
@@ -1519,7 +1593,7 @@ class TestHiflowCascade:
             z, self.SIGMAS,
             lambda x, s: 0.5 * x + 0.05 * torch.randn_like(x),
             lambda x, s: 0.5 * x + 0.05 * torch.randn_like(x),
-            target_resolution=1024,
+            scale_factor=4.0,
             cfg=self._cfg(alpha_scale=1.0, beta_scale=0.5),
             vae_decode=vd, vae_encode=ve,
         )
@@ -1538,7 +1612,7 @@ class TestHiflowCascade:
         hiflow_cascade(
             z, self.SIGMAS,
             lambda x, s: 0.5 * x, lambda x, s: 0.5 * x,
-            target_resolution=512,            # one stage
+            scale_factor=2.0,
             cfg=self._cfg(),
             vae_decode=vd, vae_encode=ve,
             progress_callback=lambda i, total, stage: events.append(stage),
@@ -1557,7 +1631,7 @@ class TestHiflowCascade:
             hiflow_cascade(
                 z, torch.tensor([0.9, 0.5, 0.0]),
                 lambda x, s: 0.5 * x, lambda x, s: 0.5 * x,
-                target_resolution=512,
+                scale_factor=2.0,
                 cfg=self._cfg(tau=0.99, steps_per_stage=2),
                 vae_decode=vd, vae_encode=ve,
             )
