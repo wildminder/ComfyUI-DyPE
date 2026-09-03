@@ -318,3 +318,156 @@ def base_trajectory(
     # Endpoint: the last state IS the sigma-0 clean prediction.
     traj.put(0.0, x)
     return x.to(initial_latent.dtype), traj
+
+
+# ---------------------------------------------------------------------------
+# Stage B — guided high-resolution sampling (three alignments)
+# ---------------------------------------------------------------------------
+
+@torch.no_grad()
+def guided_stage(
+    stage_latent: Tensor,
+    ref_traj: TrajectoryDict,
+    stage_sigmas: torch.Tensor,
+    predict_x0: Callable[[Tensor, float], Tensor],
+    upsample_x0: Callable[[Tensor], Tensor],
+    cfg: HiFlowConfig,
+    freq_filter_factory: Callable[[tuple[int, ...]], Tensor] | None = None,
+    progress_callback: Callable[[int, int, int], None] | None = None,
+    stage_index: int = 0,
+    generator: torch.Generator | None = None,
+) -> tuple[Tensor, TrajectoryDict]:
+    """One guided upscale stage: initialization + direction + acceleration.
+
+    Parameters
+    ----------
+    stage_latent : Tensor
+        VAE-space seed latent at the stage's TARGET size (used only for
+        shape/device/dtype — its content is replaced by the initialization).
+    ref_traj : TrajectoryDict
+        Reference flow (previous stage's or the base trajectory), x0 entries
+        at the PREVIOUS (smaller) latent size.
+    stage_sigmas : Tensor
+        Descending stage schedule from `build_stage_sigmas`; entry sigma is
+        the effective tau.
+    predict_x0 : callable
+        ``(x_stage, sigma) -> x0`` at the stage size (guidance_high CFG) —
+        the high-resolution model prediction.
+    upsample_x0 : callable
+        ``x0_prev_size -> x0_stage_size`` (VAE space; latent bicubic or the
+        pixel decode/encode round trip, decided by the caller).
+    cfg : HiFlowConfig
+    freq_filter_factory : callable, optional
+        ``(shape) -> [H, W] Butterworth mask``; defaults to building one from
+        ``cfg.filter_ratio`` at the stage latent shape. Injectable for tests.
+    progress_callback : callable, optional
+        ``cb(step_index, total_steps, stage_index)`` per guided step.
+    stage_index : int
+        Cascade index (0-based), forwarded to the progress callback.
+    generator : torch.Generator, optional
+        Drives the initialization noise. When None the global RNG is used
+        (production); tests pass an explicit generator so the seed is
+        reproducible regardless of RNG-stream leftovers.
+
+    Returns
+    -------
+    (final_latent, stage_traj) : the walked latent and this stage's own
+    per-sigma corrected-x0 trajectory (the NEXT stage's reference — R9).
+
+    Alignment math (paper Sec. 4-6; plan D4/D5 for the deviations):
+
+    - Initialization: ``x = sigma_e * eps + (1 - sigma_e) * up(ref[sigma_e])``
+      where sigma_e is the stage entry sigma (== effective tau) and eps is
+      fresh std-1 noise. Theory form: the seed is the TIME-MATCHED reference
+      prediction, not the reference code's final-image encode (plan D4).
+    - Direction: ``x0_hat = x0 + alpha_i * (LPF(ref_i) - LPF(x0))`` with
+      ``alpha_i = alpha_scale * sigma_i / sigma_e``.
+    - Acceleration: the reference flow's own noisy state x_ref is
+      Euler-integrated alongside the high-res walk (plan Step-4 NOTE):
+      ``v_ref = (x_ref - ref_i)/sigma_i``; the high-res velocity gains
+      ``beta_i * beta_scale * (v_ref - v_ref_prev - v_hat + v_prev)``.
+      The first guided step has no previous pair — acceleration skipped.
+    """
+    if len(ref_traj) == 0:
+        raise ValueError(
+            "guided_stage needs a non-empty reference trajectory"
+        )
+
+    device = stage_latent.device
+    dtype = stage_latent.dtype
+    x = stage_latent.float()
+
+    def make_filter(shape: tuple[int, ...]) -> Tensor:
+        if freq_filter_factory is not None:
+            return freq_filter_factory(shape)
+        return butterworth_low_pass_filter_2d(
+            shape, device=device, ratio=cfg.filter_ratio,
+        )
+
+    filter_mask = make_filter(tuple(x.shape))
+    alphas, betas = alignment_scales(stage_sigmas)
+    sigma_e = float(stage_sigmas[0])
+
+    # ---- Initialization alignment (plan D4) ------------------------------
+    _, ref_entry = ref_traj.nearest(sigma_e, device=device)
+    ref_entry = upsample_x0(ref_entry.float()).to(device)
+    eps = torch.randn(
+        x.shape, device=device, dtype=torch.float32, generator=generator,
+    )
+    x = sigma_e * eps + (1.0 - sigma_e) * ref_entry
+
+    # Reference chain state (integrated with the SAME Euler rule).
+    x_ref = x.clone()
+    ref_up: dict[float, Tensor] = {sigma_e: ref_entry}
+
+    prev_v_high: Tensor | None = None
+    prev_v_ref: Tensor | None = None
+    traj = TrajectoryDict()
+    n_steps = stage_sigmas.numel() - 1
+
+    for i in range(n_steps):
+        sigma = float(stage_sigmas[i])
+        sigma_safe = max(sigma, cfg.eps_sigma)
+
+        # A. High-resolution model prediction.
+        x0_high = predict_x0(x, sigma).float()
+
+        # B. Direction alignment: nudge low frequencies toward the reference.
+        ref_x0 = ref_up.get(_sigma_key(sigma))
+        if ref_x0 is None:
+            _, ref_raw = ref_traj.nearest(sigma, device=device)
+            ref_x0 = upsample_x0(ref_raw.float()).to(device)
+            ref_up[_sigma_key(sigma)] = ref_x0
+        alpha = float(alphas[i]) * cfg.alpha_scale
+        if alpha > 0.0:
+            low_ref = split_frequency_components_fft(ref_x0, filter_mask, is_low=True)
+            low_high = split_frequency_components_fft(x0_high, filter_mask, is_low=True)
+            x0_high = x0_high + alpha * (low_ref - low_high)
+
+        # Record the CORRECTED prediction (R9: the next stage consumes it).
+        traj.put(sigma, x0_high)
+
+        # C. Velocities. v_ref from the reference chain's OWN state (plan
+        # Step-4 NOTE); v_high from the corrected clean prediction.
+        v_high = (x - x0_high) / sigma_safe
+        v_ref = (x_ref - ref_x0) / sigma_safe
+
+        # Acceleration alignment (skipped on the first guided step).
+        beta = float(betas[i]) * cfg.beta_scale
+        if prev_v_high is not None and prev_v_ref is not None and beta > 0.0:
+            v_high = v_high + beta * (
+                v_ref - prev_v_ref - v_high + prev_v_high
+            )
+        prev_v_high = v_high
+        prev_v_ref = v_ref
+
+        # D. Euler update for both chains.
+        dt = float(stage_sigmas[i + 1]) - sigma
+        x = x + v_high * dt
+        x_ref = x_ref + v_ref * dt
+
+        if progress_callback is not None:
+            progress_callback(i, n_steps, stage_index)
+
+    traj.put(0.0, x)
+    return x.to(dtype), traj

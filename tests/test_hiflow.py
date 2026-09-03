@@ -489,3 +489,338 @@ class TestBaseTrajectory:
         out, _ = base_trajectory(
             x, self._sigmas(), lambda x_, s: 0.5 * x_, self.CFG)
         assert out.shape == x.shape
+
+
+# ---------------------------------------------------------------------------
+# Step 4 — guided_stage (initialization / direction / acceleration)
+# ---------------------------------------------------------------------------
+
+from src.hiflow import guided_stage  # noqa: E402
+
+
+def _make_ref_traj(values: dict[float, torch.Tensor]) -> TrajectoryDict:
+    traj = TrajectoryDict()
+    for s, v in values.items():
+        traj.put(s, v)
+    return traj
+
+
+def _identity_upsample(x):
+    return x
+
+
+def _zero_filter_factory(shape):
+    """LPF(x) == 0 for every x (zero mask kills the low component)."""
+    return torch.zeros(shape[-2], shape[-1])
+
+
+def _ones_filter_factory(shape):
+    """LPF(x) == x (ones mask passes everything)."""
+    return torch.ones(shape[-2], shape[-1])
+
+
+def _plain_cfg(alpha=0.0, beta=0.0, tau=0.6):
+    return HiFlowConfig(
+        tau=tau, filter_ratio=0.2,
+        alpha_scale=alpha, beta_scale=beta,
+    )
+
+
+@pytest.mark.unit
+class TestGuidedStage:
+    STAGE_SIGMAS = torch.tensor([0.6, 0.4, 0.2, 0.0])
+
+    def _ref_traj(self, size=(1, 4, 8, 8), seed=7):
+        torch.manual_seed(seed)
+        return _make_ref_traj({
+            0.6: torch.randn(*size),
+            0.4: torch.randn(*size),
+            0.2: torch.randn(*size),
+            0.0: torch.randn(*size),
+        })
+
+    def test_alpha_beta_zero_reduces_to_plain_euler(self):
+        """Anchor test: with both alignments off, the stage is an ordinary
+        Euler walk seeded by the tau initialization."""
+        torch.manual_seed(11)
+        latent = torch.randn(1, 4, 8, 8)
+        ref = self._ref_traj()
+        cfg = _plain_cfg(alpha=0.0, beta=0.0)
+
+        def predict(x, s):
+            return 0.5 * x
+
+        # Expected walk: the stage consumes the FIRST draw from a generator
+        # seeded 101; replay it with a FRESH generator of the same seed.
+        # Sigma arithmetic uses the stage's float32 values (exact Python
+        # floats diverge and /sigma amplifies).
+        sig = self.STAGE_SIGMAS
+        sigma_e = float(sig[0])
+        eps = torch.randn(
+            1, 4, 8, 8, generator=torch.Generator().manual_seed(101))
+        x = sigma_e * eps + (1 - sigma_e) * ref.get(0.6)
+        for i in range(3):
+            s = float(sig[i])
+            x0 = 0.5 * x
+            v = (x - x0) / s
+            x = x + v * (float(sig[i + 1]) - s)
+
+        out, _ = guided_stage(
+            latent, ref, self.STAGE_SIGMAS, predict,
+            _identity_upsample, cfg,
+            generator=torch.Generator().manual_seed(101),
+        )
+        assert torch.allclose(out, x, atol=1e-5), (
+            "alpha=beta=0 must reduce to the plain tau-seeded Euler walk"
+        )
+
+    def test_init_uses_time_matched_reference(self):
+        """The stage seed must be sigma_e*eps + (1-sigma_e)*ref[sigma_e]
+        (theory form, plan D4) — checked via a one-step stage + probe model
+        that echoes its input at the first call."""
+        torch.manual_seed(3)
+        latent = torch.randn(1, 4, 8, 8)
+        ref = self._ref_traj()
+        calls = []
+
+        def predict(x, s):
+            calls.append((x.clone(), s))
+            return x.clone()  # v = (x - x)/s = 0 -> walk stays at seed
+
+        gen = torch.Generator().manual_seed(42)
+        out, _ = guided_stage(
+            latent, ref, torch.tensor([0.6, 0.0]), predict,
+            _identity_upsample, _plain_cfg(), generator=gen,
+        )
+
+        # A FRESH generator with the same seed reproduces the stage's draw.
+        gen2 = torch.Generator().manual_seed(42)
+        eps = torch.randn(1, 4, 8, 8, generator=gen2)
+        expected_seed = 0.6 * eps + 0.4 * ref.get(0.6)
+
+        assert torch.allclose(calls[0][0], expected_seed, atol=1e-6)
+        assert torch.allclose(out, expected_seed, atol=1e-5)
+
+    def test_direction_alignment_formula(self):
+        """One-step stage with extreme filters pins the exact formula:
+        ones-filter -> LPF(x)=x; zero-filter -> LPF(x)=0."""
+        for factory, expect_mode in (
+            (_ones_filter_factory, "identity"),
+            (_zero_filter_factory, "zero"),
+        ):
+            torch.manual_seed(5)
+            latent = torch.randn(1, 4, 8, 8)
+            ref = self._ref_traj()
+            alpha_scale = 0.7
+            cfg = _plain_cfg(alpha=alpha_scale, beta=0.0)
+
+            def predict(x, s):
+                return 0.25 * torch.ones_like(x)  # fixed known x0
+
+            out, traj = guided_stage(
+                latent, ref, torch.tensor([0.6, 0.0]), predict,
+                _identity_upsample, cfg,
+                freq_filter_factory=factory,
+            )
+            x0_raw = 0.25 * torch.ones(1, 4, 8, 8)
+            ref_x0 = ref.get(0.6)
+            # alpha = alpha_scale * sigma/sigma_entry = 0.7 * 1 = 0.7
+            if expect_mode == "identity":
+                expected = x0_raw + 0.7 * (ref_x0 - x0_raw)
+            else:
+                # LPF(x)=LPF(ref)=0 -> x0 + alpha*(0 - 0) == x0 unchanged.
+                expected = x0_raw
+            stored = traj.get(0.6)
+            assert torch.allclose(stored, expected, atol=1e-4), (
+                f"direction alignment wrong with {expect_mode} LPF"
+            )
+            _ = out  # final latent unused here
+
+    def test_acceleration_first_step_skipped(self):
+        """Step 0 has no previous velocity pair: v stays plain. Later steps
+        apply the delta-v blend — verified with deterministic linear mocks."""
+        torch.manual_seed(9)
+        latent = torch.randn(1, 4, 8, 8)
+        ref = self._ref_traj()
+        cfg = _plain_cfg(alpha=0.0, beta=1.0)
+        recorded_x = []
+
+        def predict(x, s):
+            recorded_x.append(x.clone())
+            return 0.5 * x
+
+        gen = torch.Generator().manual_seed(77)
+        guided_stage(
+            latent, ref, self.STAGE_SIGMAS, predict,
+            _identity_upsample, cfg,
+            freq_filter_factory=_ones_filter_factory,  # LPF identity, alpha=0 anyway
+            generator=gen,
+        )
+        assert len(recorded_x) == 3, "3 transitions -> 3 model calls"
+
+        # Re-run the walk analytically with a fresh generator of the same seed
+        # (the stage consumed the first draw from its own generator). Sigma
+        # arithmetic uses the SAME float32 values the stage walks, and the
+        # acceleration weight follows the SCHEDULE beta_i = sigma_i/sigma_e
+        # (D5) times beta_scale — NOT a constant.
+        eps = torch.randn(
+            1, 4, 8, 8, generator=torch.Generator().manual_seed(77))
+        sig = self.STAGE_SIGMAS
+        sigma_e = float(sig[0])
+        x = sigma_e * eps + (1 - sigma_e) * ref.get(0.6)
+        x_ref = x.clone()
+        prev_vh = prev_vr = None
+        for i in range(3):
+            s = float(sig[i])
+            assert torch.allclose(recorded_x[i], x, atol=1e-5), (
+                f"step-{i} model input mismatch before velocity computation"
+            )
+            x0 = 0.5 * x
+            v_high = (x - x0) / s
+            v_ref = (x_ref - ref.get(s)) / s
+            beta = (s / sigma_e) * cfg.beta_scale
+            if prev_vh is not None:
+                v_high = v_high + beta * (v_ref - prev_vr - v_high + prev_vh)
+            # step 0 has no previous pair: velocity must stay plain.
+            if i == 0:
+                plain = (recorded_x[0] - 0.5 * recorded_x[0]) / s
+                assert torch.allclose(v_high, plain, atol=1e-6)
+            dt = float(sig[i + 1]) - s
+            x = x + v_high * dt
+            x_ref = x_ref + v_ref * dt
+            prev_vh, prev_vr = v_high, v_ref
+        # The in-loop asserts above already pin every recorded input to the
+        # blended walk (recorded_x[1] against the pre-update step-1 state).
+
+    def test_reference_chain_euler_integration(self):
+        """v_ref comes from the reference flow's OWN integrated state (plan
+        Step-4 NOTE), not the high-res state (the reference-code reading).
+
+        Constant reference entries make v_ref analytic; the blended walk must
+        match the hand-computed chain exactly. If the implementation used the
+        reference-code reading (v_ref built from the HIGH-RES state), the
+        step-1 model input would diverge from this chain.
+        """
+        torch.manual_seed(4)
+        const_ref = torch.randn(1, 4, 8, 8)
+        ref = _make_ref_traj({
+            0.6: const_ref, 0.4: const_ref, 0.2: const_ref, 0.0: const_ref,
+        })
+        recorded_x = []
+
+        def predict(x, s):
+            recorded_x.append(x.clone())
+            return 0.5 * x
+
+        gen = torch.Generator().manual_seed(88)
+        guided_stage(
+            torch.randn(1, 4, 8, 8), ref, self.STAGE_SIGMAS, predict,
+            _identity_upsample, _plain_cfg(alpha=0.0, beta=1.0),
+            freq_filter_factory=_ones_filter_factory,
+            generator=gen,
+        )
+        # Analytic re-run: the reference chain integrated by the SAME Euler
+        # rule from the SAME initialization (fresh generator reproduces the
+        # stage's draw; sigmas use the stage's float32 values; the accel
+        # weight follows beta_i = sigma_i/sigma_e * beta_scale).
+        eps = torch.randn(
+            1, 4, 8, 8, generator=torch.Generator().manual_seed(88))
+        sig = self.STAGE_SIGMAS
+        sigma_e = float(sig[0])
+        x = sigma_e * eps + (1 - sigma_e) * const_ref
+        x_ref = x.clone()
+        prev_vh = prev_vr = None
+        for i in range(3):
+            s = float(sig[i])
+            # The model input at step i is the state BEFORE this step's update.
+            assert torch.allclose(recorded_x[i], x, atol=1e-4), (
+                f"step-{i} model input must match the reference-chain walk"
+            )
+            v_high = (x - 0.5 * x) / s
+            v_ref = (x_ref - const_ref) / s
+            if prev_vh is not None:
+                beta = (s / sigma_e) * 1.0
+                v_high = v_high + beta * (v_ref - prev_vr - v_high + prev_vh)
+            dt = float(sig[i + 1]) - s
+            x = x + v_high * dt
+            x_ref = x_ref + v_ref * dt
+            prev_vh, prev_vr = v_high, v_ref
+
+    def test_stage_trajectory_recorded_per_sigma(self):
+        torch.manual_seed(17)
+        latent = torch.randn(1, 4, 8, 8)
+        ref = self._ref_traj()
+        out, traj = guided_stage(
+            latent, ref, self.STAGE_SIGMAS,
+            lambda x, s: 0.5 * x, _identity_upsample, _plain_cfg(),
+        )
+        for s in (0.6, 0.4, 0.2, 0.0):
+            assert traj.get(s) is not None, f"missing stage trajectory at {s}"
+        assert traj.get(0.0).shape == latent.shape
+        assert torch.allclose(traj.get(0.0), out, atol=1e-6)
+
+    def test_upsample_called_on_reference_values(self):
+        """The reference x0 must flow through upsample_x0 (stage-size map)."""
+        torch.manual_seed(23)
+        latent = torch.randn(1, 4, 8, 8)
+        ref = self._ref_traj()
+        seen = []
+
+        def up(x):
+            seen.append(x.clone())
+            return x
+
+        guided_stage(
+            latent, ref, torch.tensor([0.6, 0.0]),
+            lambda x, s: 0.5 * x, up, _plain_cfg(),
+        )
+        assert len(seen) >= 1
+        # First upsample is the entry reference (time-matched seed).
+        assert torch.allclose(seen[0], ref.get(0.6), atol=1e-6)
+
+    def test_no_nan_end_to_end(self):
+        torch.manual_seed(31)
+        latent = torch.randn(2, 4, 16, 16)
+        ref = self._ref_traj(size=(2, 4, 16, 16))
+        out, traj = guided_stage(
+            latent, ref, self.STAGE_SIGMAS,
+            lambda x, s: 0.5 * x + 0.1 * torch.randn_like(x),
+            _identity_upsample, _plain_cfg(alpha=1.0, beta=0.5),
+        )
+        assert out.shape == latent.shape
+        assert torch.isfinite(out).all()
+        assert torch.isfinite(traj.get(0.0)).all()
+
+    def test_output_dtype_restored(self):
+        torch.manual_seed(37)
+        latent = torch.randn(1, 4, 8, 8, dtype=torch.float16)
+        ref = self._ref_traj()
+        out, _ = guided_stage(
+            latent, ref, self.STAGE_SIGMAS,
+            lambda x, s: (0.5 * x).to(torch.float16),
+            _identity_upsample, _plain_cfg(),
+        )
+        assert out.dtype == torch.float16
+        assert torch.isfinite(out).all()
+
+    def test_progress_events_fire(self):
+        events = []
+        torch.manual_seed(41)
+        latent = torch.randn(1, 4, 8, 8)
+        ref = self._ref_traj()
+        guided_stage(
+            latent, ref, self.STAGE_SIGMAS,
+            lambda x, s: 0.5 * x, _identity_upsample, _plain_cfg(),
+            progress_callback=lambda i, total, stage: events.append((i, total, stage)),
+            stage_index=2,
+        )
+        assert events == [(0, 3, 2), (1, 3, 2), (2, 3, 2)]
+
+    def test_empty_reference_rejected(self):
+        torch.manual_seed(43)
+        latent = torch.randn(1, 4, 8, 8)
+        with pytest.raises(ValueError, match="non-empty reference"):
+            guided_stage(
+                latent, TrajectoryDict(), self.STAGE_SIGMAS,
+                lambda x, s: 0.5 * x, _identity_upsample, _plain_cfg(),
+            )
