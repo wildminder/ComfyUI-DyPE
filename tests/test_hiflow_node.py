@@ -218,3 +218,226 @@ class TestPredictX0:
         assert "diffusion_model(" not in content, (
             "hiflow_node must not bypass sampling_function"
         )
+def _install_fake_pbar_utils(monkeypatch):
+    fake_utils = types.ModuleType("comfy.utils")
+
+    class FakeProgressBar:
+        def __init__(self, total):
+            self.total = total
+            self.updates = []
+
+        def update_absolute(self, n):
+            self.updates.append(n)
+
+    fake_utils.ProgressBar = FakeProgressBar
+
+    def repeat_to_batch_size(x, count, dim=1):
+        # Tile along `dim` until it reaches `count` (mirrors comfy.utils).
+        reps = [1] * x.ndim
+        reps[dim] = -(-count // x.shape[dim])  # ceil division
+        out = x.repeat(reps)
+        slices = [slice(None)] * x.ndim
+        slices[dim] = slice(0, count)
+        return out[tuple(slices)]
+
+    fake_utils.repeat_to_batch_size = repeat_to_batch_size
+
+    monkeypatch.setitem(sys.modules, "comfy.utils", fake_utils)
+    comfy_mod = sys.modules.get("comfy")
+    if comfy_mod is not None:
+        monkeypatch.setattr(comfy_mod, "utils", fake_utils, raising=False)
+    return FakeProgressBar
+
+
+@pytest.mark.unit
+class TestVaeAdapters:
+    def test_decode_normalizes_layout(self):
+        vae = types.SimpleNamespace(
+            decode=lambda z: torch.randn(1, 8, 8, 3),  # [B,H,W,3]
+        )
+        dec, _ = hfn._make_vae_adapters(vae, torch.device("cpu"))
+        img = dec(torch.randn(1, 4, 8, 8))
+        assert img.shape[1] == 3, "decode must return [B,3,H,W]"
+
+    def test_decode_5d_squeezed(self):
+        vae = types.SimpleNamespace(
+            decode=lambda z: torch.randn(1, 3, 1, 8, 8),
+        )
+        dec, _ = hfn._make_vae_adapters(vae, torch.device("cpu"))
+        img = dec(torch.randn(1, 4, 8, 8))
+        assert img.ndim == 4
+
+    def test_encode_normalizes_layout(self):
+        vae = types.SimpleNamespace(
+            encode=lambda im: {"samples": torch.randn(1, 4, 8, 8)},
+        )
+        _, enc = hfn._make_vae_adapters(vae, torch.device("cpu"))
+        lat = enc(torch.randn(1, 8, 8, 3))  # [B,H,W,3] in
+        assert lat.shape == (1, 4, 8, 8)
+
+    def test_decode_accepts_dict_latent(self):
+        vae = types.SimpleNamespace(
+            decode=lambda z: torch.randn(1, 3, 8, 8),
+        )
+        dec, _ = hfn._make_vae_adapters(vae, torch.device("cpu"))
+        img = dec({"samples": torch.randn(1, 4, 8, 8)})
+        assert img.ndim == 4
+
+
+@pytest.mark.unit
+class TestSharpen:
+    def test_constant_image_unchanged_interior(self):
+        """Interior: blur of a constant is the constant -> sharpened == input.
+        (gaussian_blur_2d zero-pads, so borders darken; the reference
+        sharpens interior pixels.)"""
+        img = torch.full((1, 3, 8, 8), 0.5)
+        out = hfn._sharpen(img, alpha=1.0)
+        interior = out[..., 2:-2, 2:-2]
+        assert torch.allclose(interior, img[..., 2:-2, 2:-2], atol=1e-4)
+
+    def test_unsharp_formula_on_impulse(self):
+        """A delta impulse sharpens toward (alpha+1)*I at the peak (blur
+        takes most of the mass away from the peak)."""
+        img = torch.zeros(1, 1, 16, 16)
+        img[0, 0, 8, 8] = 1.0
+        out = hfn._sharpen(img, alpha=1.0)
+        assert out[0, 0, 8, 8].item() > 1.0, (
+            "the impulse peak must exceed its input (unsharp adds)"
+        )
+        assert (out[0, 0] < 0).any(), "surroundings must undershoot"
+
+
+@pytest.mark.unit
+class TestBaseSigmas:
+    def test_descending_ends_at_zero(self, monkeypatch):
+        fake_samplers = types.ModuleType("comfy.samplers")
+
+        def calculate_sigmas(ms, scheduler, steps):
+            assert scheduler == "simple"
+            interior = torch.linspace(1.0, 0.1, steps)
+            return torch.cat([interior, torch.zeros(1)])
+
+        fake_samplers.calculate_sigmas = calculate_sigmas
+        monkeypatch.setitem(sys.modules, "comfy.samplers", fake_samplers)
+        comfy_mod = sys.modules.get("comfy")
+        if comfy_mod is not None:
+            monkeypatch.setattr(
+                comfy_mod, "samplers", fake_samplers, raising=False)
+
+        model = types.SimpleNamespace()
+        model.model = types.SimpleNamespace(
+            model_sampling=types.SimpleNamespace())
+        sigmas = hfn._base_sigmas(model, steps=5)
+        assert sigmas.numel() == 6
+        assert float(sigmas[-1]) == 0.0
+        assert bool(torch.all(sigmas[:-1] > sigmas[1:]))
+
+
+@pytest.mark.unit
+class TestExecuteWiring:
+    def _run_execute(self, monkeypatch, target=512, upsampling="latent",
+                     latent=(1, 16, 16, 16), prediction_mixin="CONST"):
+
+        FakePBar = _install_fake_pbar_utils(monkeypatch)
+        _install_fake_comfy(monkeypatch)
+
+        model = _mock_flow_model(prediction_mixin=prediction_mixin)
+        # model_sampling.sigmas for _base_sigmas via fake calculate_sigmas
+        fake_samplers = sys.modules["comfy.samplers"]
+        fake_samplers.calculate_sigmas = (
+            lambda ms, scheduler, steps:
+            torch.cat([torch.linspace(1.0, 0.1, steps), torch.zeros(1)])
+        )
+
+        vae = types.SimpleNamespace(
+            decode=lambda z: torch.randn(1, 3, z.shape[-2] * 8, z.shape[-1] * 8),
+            encode=lambda im: {"samples": torch.randn(
+                1, 4, im.shape[-2] // 8, im.shape[-1] // 8)},
+            downscale_ratio=8,
+        )
+        z = torch.randn(*latent)
+
+        result = hfn.HiFlowNode.execute(
+            model, vae, COND_POS, COND_NEG, {"samples": z},
+            cfg=3.5, steps=4, guidance=4.5, steps_per_stage=2,
+            tau=0.5, filter_ratio=0.2, alpha_scale=1.0, beta_scale=0.5,
+            upsampling=upsampling, target_resolution=target,
+        )
+        # NodeOutput wraps the payload positionally; unwrap to the dict.
+        samples = result[0]["samples"] if not hasattr(result, "shape") \
+            else result
+        out_dict = {"samples": samples}
+        return out_dict, FakePBar
+
+    def test_execute_returns_latent_dict(self, monkeypatch):
+        result, _ = self._run_execute(monkeypatch, target=512)
+        samples = result["samples"]
+        assert samples.ndim == 4
+        assert torch.isfinite(samples).all()
+
+    def test_execute_doubles_resolution(self, monkeypatch):
+        """16x16 latent (128px) + target 512px -> 64x64 latent out."""
+        result, _ = self._run_execute(monkeypatch, target=512)
+        assert tuple(result["samples"].shape[-2:]) == (64, 64)
+
+    def test_execute_rejects_non_flow_model(self, monkeypatch):
+        with pytest.raises(ValueError, match="PixelRush"):
+            self._run_execute(monkeypatch, prediction_mixin="EPS")
+
+    def test_execute_rejects_3d_latents(self, monkeypatch):
+        with pytest.raises(ValueError, match="3D \\(video\\) latent"):
+            self._run_execute(monkeypatch, latent=(1, 4, 1, 16, 16))
+
+    def test_execute_empty_latent_channels_repeated(self, monkeypatch):
+        """An empty 4-channel latent for a 16-channel model is repeated."""
+
+        _install_fake_pbar_utils(monkeypatch)
+        _install_fake_comfy(monkeypatch)
+        model = _mock_flow_model()  # latent_channels=16
+        sys.modules["comfy.samplers"].calculate_sigmas = (
+            lambda ms, scheduler, steps:
+            torch.cat([torch.linspace(1.0, 0.1, steps), torch.zeros(1)])
+        )
+        vae = types.SimpleNamespace(downscale_ratio=8)
+        z = torch.zeros(1, 4, 16, 16)  # empty, wrong channel count
+        result = hfn.HiFlowNode.execute(
+            model, vae, COND_POS, COND_NEG, {"samples": z},
+            steps=2, steps_per_stage=2, tau=0.5,
+            target_resolution=256,
+        )
+        samples = result[0]["samples"] if not hasattr(result, "shape") \
+            else result
+        assert tuple(samples.shape[-2:]) == (32, 32)
+
+    def test_execute_pixel_mode_uses_vae(self, monkeypatch):
+        """upsampling=pixel must reach the (fake) VAE decode/encode."""
+
+        _install_fake_pbar_utils(monkeypatch)
+        _install_fake_comfy(monkeypatch)
+        sys.modules["comfy.samplers"].calculate_sigmas = (
+            lambda ms, scheduler, steps:
+            torch.cat([torch.linspace(1.0, 0.1, steps), torch.zeros(1)])
+        )
+        model = _mock_flow_model()
+        calls = {"n": 0}
+
+        def decode(z):
+            calls["n"] += 1
+            return torch.randn(1, 3, z.shape[-2] * 8, z.shape[-1] * 8)
+
+        def encode(im):
+            return {"samples": torch.randn(
+                1, 16, im.shape[-2] // 8, im.shape[-1] // 8)}
+
+        vae = types.SimpleNamespace(decode=decode, encode=encode,
+                                    downscale_ratio=8)
+        result = hfn.HiFlowNode.execute(
+            model, vae, COND_POS, COND_NEG,
+            {"samples": torch.randn(1, 16, 16, 16)},
+            steps=2, steps_per_stage=2, tau=0.5,
+            upsampling="pixel", target_resolution=256,
+        )
+        assert calls["n"] >= 1, "pixel mode must call vae.decode"
+        samples = result[0]["samples"] if not hasattr(result, "shape") \
+            else result
+        assert samples.shape[-1] == 32
