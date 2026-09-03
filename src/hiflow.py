@@ -433,6 +433,8 @@ def guided_stage(
     progress_callback: Callable[[int, int, int], None] | None = None,
     stage_index: int = 0,
     generator: torch.Generator | None = None,
+    process_latent_in: Callable[[Tensor], Tensor] | None = None,
+    process_latent_out: Callable[[Tensor], Tensor] | None = None,
 ) -> tuple[Tensor, TrajectoryDict]:
     """One guided upscale stage: initialization + direction + acceleration.
 
@@ -523,7 +525,11 @@ def guided_stage(
 
     # ---- Initialization alignment (plan D2) ------------------------------
     # Anchor already at the stage size; the seed latent only carries
-    # shape/device/dtype.
+    # shape/device/dtype. NOISING SPACE (v2.12.1): the sigma mix runs in
+    # MODEL space (the reference's scheduler.scale_noise operates on its
+    # model-scaled latents; ComfyUI's KSAMPLER.sample:993 likewise) — mixing
+    # in VAE space under-scales the noise by the latent format's
+    # scale_factor. The result converts back to VAE space for the walk.
     anchor = init_anchor.to(device=device, dtype=torch.float32)
     if anchor.shape != x.shape:
         raise ValueError(
@@ -533,7 +539,13 @@ def guided_stage(
     eps = torch.randn(
         x.shape, device=device, dtype=torch.float32, generator=generator,
     )
-    x = sigma_e * eps + (1.0 - sigma_e) * anchor
+    if process_latent_in is not None and process_latent_out is not None:
+        anchor_model = process_latent_in(anchor)
+        x = process_latent_out(
+            sigma_e * eps + (1.0 - sigma_e) * anchor_model
+        )
+    else:
+        x = sigma_e * eps + (1.0 - sigma_e) * anchor
 
     ref_up: dict[float, Tensor] = {}
 
@@ -644,6 +656,8 @@ def hiflow_cascade(
     progress_callback: Callable[[int, int, int], None] | None = None,
     noise_seed: int | None = None,
     denoise: float = 1.0,
+    process_latent_in: Callable[[Tensor], Tensor] | None = None,
+    process_latent_out: Callable[[Tensor], Tensor] | None = None,
 ) -> Tensor:
     """Full HiFlow cascade: base trajectory, then guided upscale stages.
 
@@ -706,15 +720,31 @@ def hiflow_cascade(
             )
 
     # ---- Stage A: base trajectory at native size, from a noised start. -----
+    # NOISING SPACE (Z-Image round-3 fix, v2.12.1): ComfyUI noises in MODEL
+    # space — samplers.py:1223 converts the content with process_latent_in
+    # BEFORE KSAMPLER.sample:993 mixes sigma*eps + (1-sigma)*content. Mixing
+    # in VAE space and converting the mixture scales the noise by the latent
+    # format's scale_factor (Flux/Z-Image: 0.3611 — 2.77x under-noised) and
+    # adds spurious shift offsets: the model then "corrects" an input that
+    # looks far noisier than the sigma claims — the drastic img2img changes
+    # at any usable denoise. Mix in model space, convert the result back.
     sigma_start = float(base_sigmas[0])
     start_noise = torch.randn(
         initial_latent.shape, device=device, dtype=torch.float32,
         generator=generator,
     )
-    noised_start = (
-        sigma_start * start_noise
-        + (1.0 - sigma_start) * initial_latent.float()
-    ).to(initial_latent.dtype)
+    if process_latent_in is not None and process_latent_out is not None:
+        content = process_latent_in(initial_latent.float())
+        noised_model = sigma_start * start_noise + (1.0 - sigma_start) * content
+        noised_start = process_latent_out(noised_model)
+    else:
+        # No conversions available (identity formats / tests): the VAE-space
+        # mix. NOTE: this is only exact for scale==1, shift==0 formats.
+        noised_start = (
+            sigma_start * start_noise
+            + (1.0 - sigma_start) * initial_latent.float()
+        )
+    noised_start = noised_start.to(initial_latent.dtype)
     final_base, ref_traj = base_trajectory(
         noised_start, base_sigmas, predict_x0_base, cfg,
         progress_callback=progress_callback,
@@ -810,5 +840,7 @@ def hiflow_cascade(
             progress_callback=progress_callback,
             stage_index=stage_idx,
             generator=generator,
+            process_latent_in=process_latent_in,
+            process_latent_out=process_latent_out,
         )
     return x

@@ -709,6 +709,38 @@ class TestGuidedStage:
         assert torch.allclose(calls[0][0], expected_seed, atol=1e-6)
         assert torch.allclose(out, expected_seed, atol=1e-5)
 
+    def test_init_noises_in_model_space(self):
+        """Stage init with a scale!=1 latent format must mix sigma_e*eps +
+        (1-sigma_e)*process_in(anchor) in MODEL space and convert back
+        (v2.12.1 — the reference's scale_noise operates on model-scaled
+        latents; a VAE-space mix under-scales the noise by 1/scale)."""
+        torch.manual_seed(45)
+        latent = torch.randn(1, 4, 8, 8)
+        anchor = self._anchor()
+        ref = self._ref_traj()
+        scale, shift = 0.3611, 0.1159
+        calls = []
+
+        def predict(x, s):
+            calls.append((x.clone(), s))
+            return x.clone()
+
+        gen = torch.Generator().manual_seed(42)
+        guided_stage(
+            latent, anchor, ref, torch.tensor([0.6, 0.0]), predict,
+            _identity_upsample, _plain_cfg(), generator=gen,
+            process_latent_in=lambda t: (t - shift) * scale,
+            process_latent_out=lambda t: (t / scale) + shift,
+        )
+        gen2 = torch.Generator().manual_seed(42)
+        eps = torch.randn(1, 4, 8, 8, generator=gen2)
+        anchor_model = (anchor - shift) * scale
+        expected = (0.6 * eps + 0.4 * anchor_model) / scale + shift
+        assert torch.allclose(calls[0][0], expected, atol=1e-5)
+        # The pre-fix VAE-space mix must NOT match:
+        wrong = 0.6 * eps + 0.4 * anchor
+        assert not torch.allclose(calls[0][0], wrong, atol=1e-3)
+
     def test_anchor_shape_mismatch_rejected(self):
         torch.manual_seed(31)
         latent = torch.randn(1, 4, 8, 8)
@@ -1160,10 +1192,11 @@ class TestHiflowCascade:
 
     def test_img2img_denoise_keeps_content(self):
         """A content latent + denoise < 1 enters below sigma 1: the first
-        model input must be sigma_start*eps + (1-sigma_start)*latent — the
-        KSampler img2img convention (the Z-Image 'connecting the real
-        latent does nothing' fix). The truncated schedule keeps
-        cfg.steps transitions (same step count, denser spacing)."""
+        model input must be process_latent_out(sigma_start*eps +
+        (1-sigma_start)*process_latent_in(latent)) — the KSampler img2img
+        convention in MODEL space (the Z-Image round-3 fix). The truncated
+        schedule keeps cfg.steps transitions (same step count, denser
+        spacing)."""
         torch.manual_seed(21)
         z = torch.randn(1, 4, 32, 32)          # a real sampler latent
         seen = []
@@ -1172,6 +1205,12 @@ class TestHiflowCascade:
             seen.append((x.clone(), s))
             return 0.5 * x
 
+        # Flux-style latent format: process_in = (x - shift)*scale,
+        # process_out = (x/scale) + shift. The noising must mix in THIS
+        # space (samplers.py:1223 converts the content BEFORE the mix at
+        # :993) — mixing in VAE space under-scales the noise by 1/scale.
+        scale, shift = 0.3611, 0.1159
+
         hiflow_cascade(
             z, self.SIGMAS,
             base_predict, lambda x, s: 0.5 * x,
@@ -1179,15 +1218,88 @@ class TestHiflowCascade:
             cfg=self._cfg(steps=2),
             vae_decode=None, vae_encode=None,
             noise_seed=5, denoise=0.5,
+            process_latent_in=lambda t: (t - shift) * scale,
+            process_latent_out=lambda t: (t / scale) + shift,
         )
         assert len(seen) == 2, "truncated schedule keeps cfg.steps transitions"
         sigma_start = float(seen[0][1])
         assert sigma_start < 1.0, "denoise=0.5 must truncate the entry sigma"
         g = torch.Generator().manual_seed(5)
         eps = torch.randn(1, 4, 32, 32, generator=g)
-        expected = sigma_start * eps + (1 - sigma_start) * z
+        content_model = (z - shift) * scale
+        expected = (sigma_start * eps + (1 - sigma_start) * content_model) \
+            / scale + shift
         assert torch.allclose(seen[0][0], expected, atol=1e-5), (
-            "img2img noising: sigma_start*eps + (1-sigma_start)*content"
+            "img2img noising must mix in MODEL space (ComfyUI samplers.py "
+            "converts the content before the sigma mix)"
+        )
+
+    def test_img2img_noise_scaled_to_model_space(self):
+        """The whole point of the model-space mix (Z-Image round 3): with a
+        scale!=1 latent format, the noised input's noise component must
+        carry the format's FULL variance in VAE space (the old VAE-space mix
+        under-scaled it by scale=0.3611 — 2.77x under-noising at every
+        sigma, so the model 'corrected' too aggressively)."""
+        torch.manual_seed(24)
+        z = torch.full((1, 4, 32, 32), 0.1)    # content: truncation fires
+        seen = []
+
+        def base_predict(x, s):
+            seen.append((x.clone(), float(s)))
+            return 0.5 * x
+
+        scale, shift = 0.3611, 0.1159
+        hiflow_cascade(
+            z, self.SIGMAS,
+            base_predict, lambda x, s: 0.5 * x,
+            target_resolution=256,
+            cfg=self._cfg(steps=2),
+            vae_decode=None, vae_encode=None,
+            noise_seed=9, denoise=0.5,
+            process_latent_in=lambda t: (t - shift) * scale,
+            process_latent_out=lambda t: (t / scale) + shift,
+        )
+        sigma_start = seen[0][1]
+        assert sigma_start < 1.0
+        g = torch.Generator().manual_seed(9)
+        eps = torch.randn(1, 4, 32, 32, generator=g)
+        content_model = (z - shift) * scale
+        expected = (
+            sigma_start * eps + (1 - sigma_start) * content_model
+        ) / scale + shift
+        assert torch.allclose(seen[0][0], expected, atol=1e-5), (
+            "noise must be scaled UP by 1/scale through the model-space mix"
+        )
+        # And the old (wrong) VAE-space mix differs materially:
+        wrong = sigma_start * eps + (1 - sigma_start) * z
+        assert not torch.allclose(seen[0][0], wrong, atol=1e-3), (
+            "the VAE-space mix is the pre-fix behavior — must NOT match"
+        )
+
+    def test_noising_identity_without_conversions(self):
+        """Without conversion callables the cascade falls back to the plain
+        VAE-space mix (identity formats, unit tests). Zero content is EMPTY
+        -> full schedule -> the noised start is the pure noise draw."""
+        torch.manual_seed(25)
+        z = torch.zeros(1, 4, 32, 32)
+        seen = []
+
+        def base_predict(x, s):
+            seen.append(x.clone())
+            return 0.5 * x
+
+        hiflow_cascade(
+            z, self.SIGMAS,
+            base_predict, lambda x, s: 0.5 * x,
+            target_resolution=256,
+            cfg=self._cfg(steps=2),
+            vae_decode=None, vae_encode=None,
+            noise_seed=9, denoise=0.5,
+        )
+        g = torch.Generator().manual_seed(9)
+        eps = torch.randn(1, 4, 32, 32, generator=g)
+        assert torch.allclose(seen[0], eps, atol=1e-6), (
+            "empty latent + no conversions: sigma_start==1 -> pure noise"
         )
 
     def test_empty_latent_ignores_denoise(self):

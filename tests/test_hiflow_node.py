@@ -755,8 +755,8 @@ class TestHiFlowDocs:
         readme = (pathlib.Path(__file__).parent.parent
                   / "README.md").read_text(encoding="utf-8")
         m = re.search(r'^version = "([^"]+)"', pyproject, re.MULTILINE)
-        assert m and m.group(1) == "2.12.0"
-        assert "### v2.12.0" in readme
+        assert m and m.group(1) == "2.12.1"
+        assert "### v2.12.1" in readme
 
     def test_workflow_json_parses_and_uses_known_nodes(self):
         import json

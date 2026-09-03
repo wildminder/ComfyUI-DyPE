@@ -393,6 +393,15 @@ class HiFlowNode(io.ComfyNode):
             else torch.device("cpu")
         initial_latent = initial_latent.to(device)
 
+        # Latent-format conversions for the cascade's img2img noising (the
+        # model-space mix, v2.12.1). None for models without them -> the
+        # cascade falls back to the plain VAE-space mix.
+        inner_model = model.model
+        inner_model_process_latent_in = getattr(
+            inner_model, "process_latent_in", None)
+        inner_model_process_latent_out = getattr(
+            inner_model, "process_latent_out", None)
+
         # Channel handling for empty latents (EmptyLatentImage may produce 4
         # channels for a 16-channel model) — the PixelRush convention.
         model_latent_channels = getattr(
@@ -475,6 +484,12 @@ class HiFlowNode(io.ComfyNode):
             progress_callback=progress_callback,
             noise_seed=int(noise_seed),
             denoise=float(denoise),
+            # Noising runs in MODEL space (ComfyUI samplers.py:1223/993 —
+            # process_latent_in on the content BEFORE the sigma mix), so the
+            # cascade needs the latent-format conversions (Z-Image round-3
+            # fix, v2.12.1).
+            process_latent_in=inner_model_process_latent_in,
+            process_latent_out=inner_model_process_latent_out,
         )
         pbar.update_absolute(total)
 

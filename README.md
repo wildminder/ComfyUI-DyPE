@@ -365,6 +365,9 @@ Restart ComfyUI. No further dependency installation is required.
 
 ## ▓ Changelog
 
+### v2.12.1 — 2026-09-03
+- **Fixed HiFlow img2img noising space** (user-reported "drastic changes at any usable denoise; only 0.05 looks right"): the σ-mix `σ·ε + (1−σ)·content` now runs in MODEL space (convert the content with `process_latent_in` first, convert the mix back), matching ComfyUI's KSampler pipeline (samplers.py converts the content before the σ-mix). Mixing in VAE space scaled the noise by the latent format's `scale_factor` (Flux/Z-Image: 0.3611 — **2.77× under-noised**) and added spurious shift offsets, so the model aggressively "corrected" every img2img input. The guided-stage initialization σ-mix got the same fix. The sampler itself (rectified-flow Euler) and scheduler spacing (model-table "simple") were already faithful — the defect was the space mix, not the routine.
+
 ### v2.12.0 — 2026-09-03
 - **HiFlow img2img: `denoise` parameter** (user-reported "connecting the real latent does nothing"): with the full flow schedule the base start σ=1 zeroes the content weight, so a sampler latent connected to the node was silently ignored. The KSampler convention now applies — `denoise` < 1 truncates the base schedule so the walk enters below σ=1 and keeps `(1−σ_start)` of the input latent (an empty latent always runs the full schedule; the node warns when a content latent meets `denoise=1.0`).
 
