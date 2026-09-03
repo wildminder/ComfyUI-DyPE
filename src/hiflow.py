@@ -25,6 +25,7 @@ from typing import Callable
 
 import torch
 import torch.fft as fft
+import torch.nn.functional as F
 
 Tensor = torch.Tensor
 
@@ -471,3 +472,139 @@ def guided_stage(
 
     traj.put(0.0, x)
     return x.to(dtype), traj
+
+
+# ---------------------------------------------------------------------------
+# Latent upsampling + cascade driver
+# ---------------------------------------------------------------------------
+
+def upsample_latent(x0: Tensor, target_h: int, target_w: int) -> Tensor:
+    """Antialiased bicubic upscale of a VAE-space x0 to (target_h, target_w).
+
+    fp32 round trip for half dtypes (antialias is not implemented for fp16 —
+    the PixelRush precedent).
+    """
+    orig_dtype = x0.dtype
+    up = F.interpolate(
+        x0.float(), size=(target_h, target_w),
+        mode="bicubic", align_corners=False, antialias=True,
+    )
+    return up.to(orig_dtype)
+
+
+def _stage_latent_sizes(
+    base_h: int, base_w: int, target_resolution: int, vae_downscale: int = 8,
+    latent_multiple: int = 2,
+) -> list[tuple[int, int]]:
+    """Cascade stage sizes (latent H, W), doubling per stage until the pixel
+    resolution reaches the target (plan D6). Sizes snap so pixel dimensions
+    are multiples of 16 and latent dims of ``latent_multiple`` (FLUX packs
+    2x2 latent patches -> even latent dims).
+    """
+    def snap_latent(dim: int) -> int:
+        px = dim * vae_downscale
+        px = max(vae_downscale * latent_multiple, round(px / 16) * 16)
+        snapped = px // vae_downscale
+        # keep the latent dim a multiple of latent_multiple (round UP)
+        return ((snapped + latent_multiple - 1) // latent_multiple) * latent_multiple
+
+    sizes = []
+    h, w = snap_latent(base_h), snap_latent(base_w)
+    while h * vae_downscale < target_resolution or w * vae_downscale < target_resolution:
+        h, w = snap_latent(h * 2), snap_latent(w * 2)
+        sizes.append((h, w))
+    return sizes
+
+
+@torch.no_grad()
+def hiflow_cascade(
+    initial_latent: Tensor,
+    base_sigmas: torch.Tensor,
+    predict_x0_base: Callable[[Tensor, float], Tensor],
+    predict_x0_stage: Callable[[Tensor, float], Tensor],
+    target_resolution: int,
+    cfg: HiFlowConfig,
+    vae_decode: Callable[[Tensor], Tensor] | None = None,
+    vae_encode: Callable[[Tensor], Tensor] | None = None,
+    sharpen: Callable[[Tensor], Tensor] | None = None,
+    vae_downscale: int = 8,
+    progress_callback: Callable[[int, int, int], None] | None = None,
+) -> Tensor:
+    """Full HiFlow cascade: base trajectory, then guided upscale stages.
+
+    Stage sizes double per stage until the pixel resolution reaches the
+    target (plan D6). The base trajectory is recorded once at the native
+    size; each guided stage consumes the PREVIOUS stage's corrected-x0
+    trajectory (R9), upsampled to the new latent size — latent bicubic by
+    default, or the pixel decode->(sharpen)->encode round trip when
+    ``cfg.upsampling == "pixel"`` (needs vae_decode/vae_encode/sharpen).
+
+    Returns the final VAE-space latent at the last stage's size (or the
+    base latent unchanged when the input is already at the target).
+    """
+    if cfg.upsampling not in ("latent", "pixel"):
+        raise ValueError(
+            f"upsampling must be 'latent' or 'pixel'; got {cfg.upsampling!r}"
+        )
+    if cfg.upsampling == "pixel" and (
+        vae_decode is None or vae_encode is None
+    ):
+        raise ValueError(
+            "upsampling='pixel' needs vae_decode and vae_encode adapters"
+        )
+
+    # ---- Stage A: base trajectory at native size (guidance cfg). ----------
+    final_base, ref_traj = base_trajectory(
+        initial_latent, base_sigmas, predict_x0_base, cfg,
+        progress_callback=progress_callback,
+    )
+
+    base_h, base_w = initial_latent.shape[-2], initial_latent.shape[-1]
+    sizes = _stage_latent_sizes(
+        base_h, base_w, target_resolution, vae_downscale,
+    )
+    if not sizes:
+        logger.info(
+            "HiFlow: base %dx%d already at target %d — returning base output",
+            base_h * vae_downscale, base_w * vae_downscale, target_resolution,
+        )
+        return final_base
+
+    def make_upsample(target_h: int, target_w: int) -> Callable[[Tensor], Tensor]:
+        if cfg.upsampling == "latent":
+            return lambda x: upsample_latent(x, target_h, target_w)
+
+        def pixel_up(x: Tensor) -> Tensor:
+            image = vae_decode(x)
+            image_up = F.interpolate(
+                image.float(), size=(
+                    target_h * vae_downscale, target_w * vae_downscale),
+                mode="bicubic", align_corners=False, antialias=True,
+            ).to(image.dtype)
+            if sharpen is not None:
+                image_up = sharpen(image_up)
+            return vae_encode(image_up)
+
+        return pixel_up
+
+    x = final_base
+    for stage_idx, (t_h, t_w) in enumerate(sizes):
+        stage_sigmas = build_stage_sigmas(
+            base_sigmas, cfg.tau, cfg.steps_per_stage,
+        )
+        logger.info(
+            "HiFlow: stage %d/%d — latent %dx%d -> %dx%d, entry sigma %.4f",
+            stage_idx + 1, len(sizes), x.shape[-2], x.shape[-1], t_h, t_w,
+            float(stage_sigmas[0]),
+        )
+        seed = torch.zeros(
+            initial_latent.shape[0], initial_latent.shape[1], t_h, t_w,
+            device=initial_latent.device, dtype=initial_latent.dtype,
+        )
+        x, ref_traj = guided_stage(
+            seed, ref_traj, stage_sigmas, predict_x0_stage,
+            make_upsample(t_h, t_w), cfg,
+            progress_callback=progress_callback,
+            stage_index=stage_idx,
+        )
+    return x

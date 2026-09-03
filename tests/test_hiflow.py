@@ -824,3 +824,256 @@ class TestGuidedStage:
                 latent, TrajectoryDict(), self.STAGE_SIGMAS,
                 lambda x, s: 0.5 * x, _identity_upsample, _plain_cfg(),
             )
+
+
+# ---------------------------------------------------------------------------
+# Step 5 — upsample + cascade driver
+# ---------------------------------------------------------------------------
+
+from src.hiflow import (  # noqa: E402
+    _stage_latent_sizes,
+    hiflow_cascade,
+    upsample_latent,
+)
+
+
+@pytest.mark.unit
+class TestUpsampleLatent:
+    def test_doubles_shape(self):
+        x = torch.randn(1, 4, 16, 16)
+        up = upsample_latent(x, 32, 32)
+        assert up.shape == (1, 4, 32, 32)
+
+    def test_antialias_smooths_high_freq(self):
+        """Upscaled (antialiased bicubic) must smooth a checkerboard more
+        than the raw input scaled to the same footprint."""
+        x = torch.zeros(1, 1, 16, 16)
+        x[0, 0, ::2, ::2] = 1.0
+        x[0, 0, 1::2, 1::2] = 1.0
+        up = upsample_latent(x, 32, 32)
+
+        def rough(t):
+            return (t[0, 0, 1:, :] - t[0, 0, :-1, :]).abs().mean().item()
+
+        assert rough(up) < rough(x), (
+            "bicubic antialiasing must reduce checkerboard roughness"
+        )
+
+    def test_fp16_roundtrip_dtype(self):
+        x = torch.randn(1, 4, 8, 8, dtype=torch.float16)
+        up = upsample_latent(x, 16, 16)
+        assert up.dtype == torch.float16
+        assert torch.isfinite(up).all()
+
+    def test_constant_image_preserved(self):
+        x = torch.full((1, 2, 8, 8), 0.7)
+        up = upsample_latent(x, 16, 16)
+        assert torch.allclose(up, torch.full_like(up, 0.7), atol=1e-3)
+
+
+@pytest.mark.unit
+class TestStageLatentSizes:
+    def test_flux_1024_targets(self):
+        assert _stage_latent_sizes(128, 128, 1024) == []
+        assert _stage_latent_sizes(128, 128, 2048) == [(256, 256)]
+        assert _stage_latent_sizes(128, 128, 4096) == [(256, 256), (512, 512)]
+
+    def test_odd_base_snapped(self):
+        """1088px base (latent 136) doubles to a 16-px-multiple target."""
+        sizes = _stage_latent_sizes(136, 136, 2048)
+        assert sizes == [(272, 272)]
+        for h, w in sizes:
+            assert (h * 8) % 16 == 0 and (w * 8) % 16 == 0
+            assert h % 2 == 0 and w % 2 == 0  # FLUX 2x2 packing
+
+    def test_terminates_at_target(self):
+        sizes = _stage_latent_sizes(64, 64, 4096)
+        h, w = sizes[-1]
+        assert h * 8 >= 4096 or w * 8 >= 4096
+        assert len(sizes) <= 6  # 512px base -> bounded stage count
+
+
+@pytest.mark.unit
+class TestHiflowCascade:
+    SIGMAS = torch.tensor([1.0, 0.75, 0.5, 0.25, 0.0])
+
+    def _cfg(self, **kw):
+        base = dict(
+            tau=0.5, steps_per_stage=3, filter_ratio=0.2, upsampling="latent",
+        )
+        base.update(kw)
+        return HiFlowConfig(**base)
+
+    def test_two_stages_resolution_progression(self):
+        """Base 32x32 latent (256px); target 1024px -> stages 64, 128."""
+        torch.manual_seed(0)
+        z = torch.randn(1, 4, 32, 32)
+        out = hiflow_cascade(
+            z, self.SIGMAS,
+            lambda x, s: 0.5 * x,           # base
+            lambda x, s: 0.5 * x,           # stage
+            target_resolution=1024,
+            cfg=self._cfg(),
+            vae_downscale=8,
+        )
+        assert out.shape == (1, 4, 128, 128)
+
+    def test_single_stage_doubles(self):
+        torch.manual_seed(1)
+        z = torch.randn(1, 4, 32, 32)
+        out = hiflow_cascade(
+            z, self.SIGMAS,
+            lambda x, s: 0.5 * x, lambda x, s: 0.5 * x,
+            target_resolution=512,          # 256px base -> one 512px stage
+            cfg=self._cfg(),
+        )
+        assert out.shape == (1, 4, 64, 64)
+
+    def test_second_stage_references_first_stage_trajectory(self):
+        """Stage-2's model inputs must be at stage-2 size (the reference
+        chain feeds through the previous stage's upsampled trajectory)."""
+        torch.manual_seed(2)
+        z = torch.randn(1, 4, 16, 16)
+        seen_sizes = []
+
+        def stage_predict(x, s):
+            seen_sizes.append(tuple(x.shape[-2:]))
+            return 0.5 * x
+
+        hiflow_cascade(
+            z, self.SIGMAS,
+            lambda x, s: 0.5 * x, stage_predict,
+            target_resolution=512,           # 128px base -> stages 256, 512
+            cfg=self._cfg(),
+        )
+        # Unique sizes, order-preserving: stage 1 at 32x32, stage 2 at 64x64.
+        uniq = list(dict.fromkeys(seen_sizes))
+        assert uniq == [(32, 32), (64, 64)]
+
+    def test_pixel_mode_calls_vae_adapters(self):
+        torch.manual_seed(3)
+        z = torch.randn(1, 4, 16, 16)
+        calls = {"decode": 0, "encode": 0}
+
+        def vae_decode(latent):
+            """Real-VAE contract: latent [B,C,h,w] -> image [B,3,8h,8w]."""
+            calls["decode"] += 1
+            b, c, h, w = latent.shape
+            img = latent[:, :3].repeat_interleave(8, -2).repeat_interleave(8, -1)
+            assert img.shape == (b, 3, h * 8, w * 8)
+            return img
+
+        def vae_encode(image):
+            """Real-VAE contract: image [B,3,H,W] -> latent [B,4,H/8,W/8]."""
+            calls["encode"] += 1
+            small = image[:, :1, ::8, ::8]
+            return torch.cat([small] * 4, dim=1)
+
+        hiflow_cascade(
+            z, self.SIGMAS,
+            lambda x, s: 0.5 * x, lambda x, s: 0.5 * x,
+            target_resolution=256,            # one stage
+            cfg=self._cfg(upsampling="pixel"),
+            vae_decode=vae_decode, vae_encode=vae_encode,
+            sharpen=lambda im: im,
+        )
+        assert calls["decode"] >= 1 and calls["encode"] >= 1
+
+    def test_latent_mode_never_calls_vae_adapters(self):
+        torch.manual_seed(4)
+        z = torch.randn(1, 4, 16, 16)
+
+        def fail_decode(x):
+            raise AssertionError("latent mode must not call vae_decode")
+
+        hiflow_cascade(
+            z, self.SIGMAS,
+            lambda x, s: 0.5 * x, lambda x, s: 0.5 * x,
+            target_resolution=256,
+            cfg=self._cfg(upsampling="latent"),
+            vae_decode=fail_decode, vae_encode=fail_decode,
+        )
+
+    def test_pixel_mode_without_vae_rejected(self):
+        torch.manual_seed(5)
+        z = torch.randn(1, 4, 8, 8)
+        with pytest.raises(ValueError, match="vae_decode and vae_encode"):
+            hiflow_cascade(
+                z, self.SIGMAS,
+                lambda x, s: 0.5 * x, lambda x, s: 0.5 * x,
+                target_resolution=128,
+                cfg=self._cfg(upsampling="pixel"),
+            )
+
+    def test_invalid_upsampling_rejected(self):
+        torch.manual_seed(6)
+        z = torch.randn(1, 4, 8, 8)
+        with pytest.raises(ValueError, match="latent.*pixel"):
+            hiflow_cascade(
+                z, self.SIGMAS,
+                lambda x, s: 0.5 * x, lambda x, s: 0.5 * x,
+                target_resolution=128,
+                cfg=self._cfg(upsampling="bogus"),
+            )
+
+    def test_base_at_target_returns_base_output(self):
+        """No stages: the base trajectory's final latent is returned."""
+        from src.hiflow import base_trajectory
+        torch.manual_seed(7)
+        z = torch.randn(1, 4, 32, 32)
+        cfg = self._cfg()
+        out = hiflow_cascade(
+            z, self.SIGMAS,
+            lambda x, s: 0.5 * x, lambda x, s: 0.5 * x,
+            target_resolution=256,            # 32*8 == 256 -> no stages
+            cfg=cfg,
+        )
+        expected, _ = base_trajectory(
+            z, self.SIGMAS, lambda x, s: 0.5 * x, cfg)
+        assert torch.allclose(out, expected, atol=1e-6)
+
+    def test_cascade_no_nan(self):
+        torch.manual_seed(8)
+        z = torch.randn(2, 4, 32, 32)
+        out = hiflow_cascade(
+            z, self.SIGMAS,
+            lambda x, s: 0.5 * x + 0.05 * torch.randn_like(x),
+            lambda x, s: 0.5 * x + 0.05 * torch.randn_like(x),
+            target_resolution=1024,
+            cfg=self._cfg(alpha_scale=1.0, beta_scale=0.5),
+        )
+        assert torch.isfinite(out).all()
+
+    def test_progress_total_events(self):
+        """Base steps + per-stage transitions fire progress events.
+
+        steps_per_stage is an UPPER bound: the stage walks only schedule
+        sigmas below tau (tau=0.5 leaves 0.25 -> 0: 2 transitions here).
+        """
+        events = []
+        torch.manual_seed(9)
+        z = torch.randn(1, 4, 32, 32)
+        hiflow_cascade(
+            z, self.SIGMAS,
+            lambda x, s: 0.5 * x, lambda x, s: 0.5 * x,
+            target_resolution=512,            # one stage
+            cfg=self._cfg(),
+            progress_callback=lambda i, total, stage: events.append(stage),
+        )
+        assert events.count(-1) == len(self.SIGMAS) - 1
+        assert events.count(0) == 2  # 0.25 -> 0 only (tau=0.5 entry)
+
+    def test_tau_above_schedule_clamps_logged(self, caplog):
+        """tau above sigma_max clamps the entry to sigma_max with a warning
+        (schedule [1.0, 0.5, 0.0]: tau=0.99 enters at 1.0)."""
+        import logging
+        torch.manual_seed(10)
+        z = torch.randn(1, 4, 32, 32)
+        with caplog.at_level(logging.WARNING, logger="ComfyUI-DyPE"):
+            hiflow_cascade(
+                z, torch.tensor([0.9, 0.5, 0.0]),
+                lambda x, s: 0.5 * x, lambda x, s: 0.5 * x,
+                target_resolution=512,
+                cfg=self._cfg(tau=0.99, steps_per_stage=2),
+            )
+        assert any("above schedule" in r.message for r in caplog.records)
