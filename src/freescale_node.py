@@ -417,10 +417,14 @@ class FreeScaleNode(io.ComfyNode):
 
             # 1. VAE decode → bicubic upscale → VAE encode
             image = vae_decode(z)
+            orig_dtype = image.dtype
             image_up = F.interpolate(
-                image, size=(res_h, res_w),
-                mode="bicubic", align_corners=False, antialias=True,
-            )
+                image.float(),                          # cast to float32
+                size=(res_h, res_w),
+                mode="bicubic",
+                align_corners=False,
+                antialias=True,
+            ).to(orig_dtype)                            # restore original dtype
             z_up = vae_encode(image_up)
 
             # 2. Noise level at timestep K.  The actual noising is performed
