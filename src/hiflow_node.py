@@ -546,4 +546,9 @@ class HiFlowNode(io.ComfyNode):
         )
         pbar.update_absolute(total)
 
+        # 3D-format models expect the 5D [B,C,1,H,W] LATENT on the output
+        # (the PixelRush output convention — downstream VAEDecode works on
+        # the 5D tensor; Krea2 plan S5).
+        if latent_dimensions == 3 and result.dim() == 4:
+            result = result.unsqueeze(2)
         return io.NodeOutput({"samples": result})

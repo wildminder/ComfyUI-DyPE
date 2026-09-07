@@ -655,6 +655,63 @@ class TestExecuteWiring:
         with pytest.raises(ValueError, match="multi-frame"):
             self._run_execute(monkeypatch, latent=(1, 4, 4, 16, 16))
 
+    @staticmethod
+    def _mock_3d_vae():
+        """3D-format fake VAE (latent_dim=3, tuple downscale_ratio) — see
+        TestVaeAdapters._fake_3d_vae for the sd.py-faithful shapes."""
+        def decode(z):
+            if z.dim() == 4:
+                z = z.unsqueeze(2)
+            b, c, t, h, w = z.shape
+            return torch.randn(b, 3, t, h * 16, w * 16).movedim(1, -1)
+
+        def encode(im):
+            assert im.shape[-1] == 3
+            b = im.shape[0]
+            return torch.randn(
+                b, 16, 1, im.shape[-3] // 16, im.shape[-2] // 16)
+
+        return types.SimpleNamespace(
+            decode=decode, encode=encode, latent_dim=3,
+            downscale_ratio=(lambda a: max(0, (a + 15) // 16), 16, 16))
+
+    def test_execute_end_to_end_krea2_style(self, monkeypatch):
+        """Krea2 crown test: a 3D-format model (latent_dimensions=3) + Qwen
+        VAE (latent_dim=3, tuple downscale_ratio) + 4D empty latent in ->
+        5D [B,C,1,H,W] scaled latent out, everything bridged."""
+        FakePBar = _install_fake_pbar_utils(monkeypatch)
+        _install_fake_comfy(monkeypatch)
+        model = _mock_flow_model(latent_dimensions=3)
+        sys.modules["comfy.samplers"].calculate_sigmas = (
+            lambda ms, scheduler, steps:
+            torch.cat([torch.linspace(1.0, 0.1, steps), torch.zeros(1)])
+        )
+        vae = self._mock_3d_vae()
+        z = torch.zeros(1, 16, 16, 16)   # 4D empty latent (2D generator node)
+        result = hfn.HiFlowNode.execute(
+            model, vae, COND_POS, COND_NEG, {"samples": z},
+            cfg=3.5, steps=4, guidance=4.5, steps_per_stage=2,
+            tau=0.5, filter_ratio=0.2, alpha_scale=1.0, beta_scale=0.5,
+            upsampling="latent", scale_factor=2.0,
+            noise_seed=0, denoise=1.0,
+        )
+        samples = result[0]["samples"] if not hasattr(result, "shape") \
+            else result
+        assert tuple(samples.shape) == (1, 16, 1, 32, 32), (
+            "3D-format output: 5D [B,C,1,H,W] at the doubled size"
+        )
+        assert torch.isfinite(samples).all()
+        _ = FakePBar
+
+    def test_downscale_ratio_tuple_form(self):
+        """Krea2 plan S5: Qwen VAEs report downscale_ratio as
+        (callable, 16, 16) — _downscale_ratio takes the h_ratio slot."""
+        vae = types.SimpleNamespace(
+            downscale_ratio=(lambda a: max(0, (a + 15) // 16), 16, 16))
+        assert hfn._downscale_ratio(vae) == 16
+        vae2 = types.SimpleNamespace(downscale_ratio=8)
+        assert hfn._downscale_ratio(vae2) == 8
+
     def test_execute_empty_latent_channels_repeated(self, monkeypatch):
         """An empty 4-channel latent for a 16-channel model is repeated."""
 
