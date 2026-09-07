@@ -737,6 +737,17 @@ def hiflow_cascade(
         raise ValueError(
             f"upsampling must be 'latent' or 'pixel'; got {cfg.upsampling!r}"
         )
+    # The core works on 4D latents [B, C, H, W]; the node layer owns the
+    # 5D<->4D bridging for 3D-format models (Krea2/Qwen-Image Wan21, the
+    # PixelRush convention). Multi-frame (T>1) input is unsupported — the
+    # paper's frequency alignment is 2D per-frame.
+    if initial_latent.dim() != 4:
+        shape = tuple(initial_latent.shape)
+        raise ValueError(
+            f"hiflow_cascade needs a 4D latent [B, C, H, W]; got {shape}. "
+            f"3D-format models must be squeezed to T=1 by the node layer; "
+            f"multi-frame (T>1) input is not supported."
+        )
 
     device = initial_latent.device
     generator = None
@@ -874,9 +885,12 @@ def hiflow_cascade(
             stage_idx + 1, len(sizes), x.shape[-2], x.shape[-1], t_h, t_w,
             float(stage_sigmas[0]),
         )
+        # Seed built from the CURRENT chain latent's shape (S1: the input
+        # latent's shape is the wrong template once stages resize — batch
+        # and channels never change, but deriving from x keeps it local).
         seed = torch.zeros(
-            initial_latent.shape[0], initial_latent.shape[1], t_h, t_w,
-            device=device, dtype=initial_latent.dtype,
+            x.shape[0], x.shape[1], t_h, t_w,
+            device=device, dtype=x.dtype,
         )
         x, ref_traj = guided_stage(
             seed, anchor, ref_traj, stage_sigmas, predict_x0_stage,

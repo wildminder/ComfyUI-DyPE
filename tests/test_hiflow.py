@@ -1493,6 +1493,63 @@ class TestHiflowCascade:
                     vae_decode=vd, vae_encode=ve,
                 )
 
+    def test_5d_latent_rejected_with_clear_message(self):
+        """S1: the core is 4D — a 5D Wan21-style latent [B,C,1,H,W] must be
+        squeezed by the NODE layer; the core raises a clear error (never
+        silently broadcasts)."""
+        torch.manual_seed(29)
+        z5 = torch.randn(1, 4, 1, 32, 32)
+        vd, ve, _ = self._fake_vae()
+        with pytest.raises(ValueError, match="4D latent"):
+            hiflow_cascade(
+                z5, self.SIGMAS,
+                lambda x, s: 0.5 * x, lambda x, s: 0.5 * x,
+                scale_factor=2.0,
+                cfg=self._cfg(),
+                vae_decode=vd, vae_encode=ve,
+            )
+
+    def test_multi_frame_5d_rejected_too(self):
+        """T>1 (real multi-frame) hits the same 4D assertion — multi-frame
+        input is unsupported (image-only theory)."""
+        torch.manual_seed(30)
+        z5 = torch.randn(1, 4, 4, 32, 32)  # T=4
+        vd, ve, _ = self._fake_vae()
+        with pytest.raises(ValueError, match="4D latent"):
+            hiflow_cascade(
+                z5, self.SIGMAS,
+                lambda x, s: 0.5 * x, lambda x, s: 0.5 * x,
+                scale_factor=2.0,
+                cfg=self._cfg(),
+                vae_decode=vd, vae_encode=ve,
+            )
+
+    def test_seed_built_from_stage_latent_shape(self):
+        """S1: the stage seed derives from the CURRENT chain latent (x), so
+        the batch/channel dims stay correct even if they differed from the
+        input latent (they can't in practice, but the pin guards the
+        construction)."""
+        torch.manual_seed(31)
+        z = torch.randn(1, 4, 32, 32)
+        vd, ve, _ = self._fake_vae()
+        stage_shapes = []
+
+        def stage_predict(x, s):
+            stage_shapes.append(tuple(x.shape))
+            return 0.5 * x
+
+        out = hiflow_cascade(
+            z, self.SIGMAS,
+            lambda x, s: 0.5 * x, stage_predict,
+            scale_factor=4.0,                   # two stages
+            cfg=self._cfg(),
+            vae_decode=vd, vae_encode=ve,
+        )
+        assert out.shape == (1, 4, 128, 128)
+        assert all(s[:2] == (1, 4) for s in stage_shapes), (
+            "batch/channels must match the chain latent across stages"
+        )
+
     def test_single_stage_doubles(self):
         torch.manual_seed(1)
         z = torch.randn(1, 4, 32, 32)
