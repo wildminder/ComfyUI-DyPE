@@ -32,12 +32,17 @@ logger = logging.getLogger("ComfyUI-DyPE")
 _FLOW_PREDICTIONS = ("const", "img_to_img_flow", "cosmos_rflow")
 
 
-def _require_flow_model(model) -> str:
-    """Gate HiFlow to rectified-flow models (plan D1, D12).
+def _require_flow_model(model) -> tuple[str, int]:
+    """Gate HiFlow to rectified-flow models (plan D1, D12; Krea2 plan S2).
 
     Raises ValueError with an actionable message for non-flow prediction
-    types and for 3D-latent (video) models.
-    Returns the detected flow prediction family name.
+    types. 3D-FORMAT latent models (Wan21: Krea2, Qwen-Image, Anima) are
+    ACCEPTED — they are image models with a 5D [B,C,1,H,W] latent layout;
+    the node layer bridges to the 4D core (the PixelRush convention).
+    Only actual multi-frame (T>1) latents are rejected — the paper's
+    frequency alignment is 2D per-frame.
+
+    Returns (detected flow family, latent_dimensions).
     """
     model_sampling = model.model.model_sampling
     mro_names = [c.__name__ for c in type(model_sampling).__mro__]
@@ -51,21 +56,20 @@ def _require_flow_model(model) -> str:
     if detected not in _FLOW_PREDICTIONS:
         raise ValueError(
             f"HiFlow needs a rectified-flow model (FLUX, Qwen-Image, "
-            f"AuraFlow, Z-Image...); this model predicts "
+            f"Krea2, AuraFlow, Z-Image...); this model predicts "
             f"'{detected.upper()}'. For SD/SDXL-style models use the "
             f"PixelRush node instead."
         )
 
     latent_dimensions = getattr(
         model.model.latent_format, "latent_dimensions", 2)
-    if latent_dimensions == 3:
+    if latent_dimensions not in (2, 3):
         raise ValueError(
-            "HiFlow does not support 3D-latent (video) models yet — the "
-            "frequency alignment is 2D per-frame. For video models use "
-            "PixelRush."
+            f"HiFlow supports 2D or 3D-format image latents; this model "
+            f"reports latent_dimensions={latent_dimensions}."
         )
 
-    return detected
+    return detected, int(latent_dimensions)
 
 
 def _make_predict_x0(
@@ -378,19 +382,29 @@ class HiFlowNode(io.ComfyNode):
                 noise_seed=0, denoise=1.0) -> io.NodeOutput:
         import comfy.utils
 
-        # Gate BEFORE any model calls: flow prediction + 2D latents only.
-        _require_flow_model(model)
+        # Gate BEFORE any model calls: flow prediction; 3D-FORMAT image
+        # models (Wan21: Krea2, Qwen-Image) pass, multi-frame latents
+        # don't (Krea2 plan S2).
+        _, latent_dimensions = _require_flow_model(model)
 
         if isinstance(latent_image, dict):
             initial_latent = latent_image["samples"]
         else:
             initial_latent = latent_image
 
-        if initial_latent.ndim == 5 and initial_latent.shape[2] == 1:
-            raise ValueError(
-                "HiFlow received a 3D (video) latent. It supports 2D image "
-                "latents only — for video models use PixelRush."
-            )
+        if initial_latent.ndim == 5:
+            if initial_latent.shape[2] != 1:
+                raise ValueError(
+                    "HiFlow received a multi-frame (video) latent "
+                    f"(T={initial_latent.shape[2]}). It supports single-"
+                    "frame image latents only — the frequency alignment "
+                    "is 2D per-frame."
+                )
+            initial_latent = initial_latent.squeeze(2)  # [B, C, H, W]
+        elif initial_latent.ndim == 4 and latent_dimensions == 3:
+            # A 4D latent on a 3D-format model (EmptySD3LatentImage etc.)
+            # carries T=1 implicitly — remember the format for the output.
+            pass
 
         device = model.load_device if hasattr(model, "load_device") \
             else torch.device("cpu")

@@ -132,16 +132,24 @@ COND_NEG = [(torch.zeros(1, 4), {"side": "negative"})]
 class TestFlowGate:
     def test_flow_gate_accepts_const(self):
         model = _mock_flow_model()
-        assert hfn._require_flow_model(model) == "const"
+        assert hfn._require_flow_model(model) == ("const", 2)
 
     def test_flow_gate_rejects_eps_with_actionable_message(self):
         model = _mock_flow_model(prediction_mixin="EPS")
         with pytest.raises(ValueError, match="PixelRush"):
             hfn._require_flow_model(model)
 
-    def test_flow_gate_rejects_3d_latents(self):
+    def test_flow_gate_accepts_3d_format_image_models(self):
+        """Krea2 plan S2: 3D-FORMAT (Wan21: Krea2, Qwen-Image) is an image
+        model with a 5D layout — the gate accepts it and reports dims."""
         model = _mock_flow_model(latent_dimensions=3)
-        with pytest.raises(ValueError, match="3D-latent"):
+        family, dims = hfn._require_flow_model(model)
+        assert family == "const"
+        assert dims == 3
+
+    def test_flow_gate_rejects_bad_latent_dimensions(self):
+        model = _mock_flow_model(latent_dimensions=4)
+        with pytest.raises(ValueError, match="latent_dimensions"):
             hfn._require_flow_model(model)
 
 
@@ -508,9 +516,17 @@ class TestExecuteWiring:
         with pytest.raises(ValueError, match="PixelRush"):
             self._run_execute(monkeypatch, prediction_mixin="EPS")
 
-    def test_execute_rejects_3d_latents(self, monkeypatch):
-        with pytest.raises(ValueError, match="3D \\(video\\) latent"):
-            self._run_execute(monkeypatch, latent=(1, 4, 1, 16, 16))
+    def test_execute_accepts_5d_t1_latent(self, monkeypatch):
+        """Krea2 plan S2: a Wan21 5D [B,C,1,H,W] latent squeezes to 4D on
+        entry and the node runs end-to-end."""
+        result, _ = self._run_execute(
+            monkeypatch, scale=2.0, latent=(1, 16, 1, 16, 16))
+        assert tuple(result["samples"].shape[-2:]) == (32, 32)
+
+    def test_execute_rejects_multi_frame_latent(self, monkeypatch):
+        """T>1 is a video latent — rejected with the per-frame message."""
+        with pytest.raises(ValueError, match="multi-frame"):
+            self._run_execute(monkeypatch, latent=(1, 4, 4, 16, 16))
 
     def test_execute_empty_latent_channels_repeated(self, monkeypatch):
         """An empty 4-channel latent for a 16-channel model is repeated."""
