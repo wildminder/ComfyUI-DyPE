@@ -56,7 +56,7 @@ Training-free methods that push pre-trained DiT models far beyond their native r
 | **❖ [HAP (HRDiT)](#user-content-hap-hrdit)** | Sparse-attention acceleration — the speed half of HRDiT. |
 | **❖ [PixelRush](#user-content-pixelrush)** | Cascade patch refinement of an existing base image. |
 | **❖ [FreeScale](#user-content-freescale)** | Tuning-free self-cascade upscaling. |
-| **❖ [HiFlow](#user-content-hiflow)** | Trajectory-guided flow upscaling for FLUX-family models. |
+| **❖ [HiFlow](#user-content-hiflow)** | Trajectory-guided flow upscaling for rectified-flow models (FLUX, Qwen-Image, Krea2, Z-Image, …). |
 
 ### Which method when?
 
@@ -70,7 +70,7 @@ Two families: **model patches** alter how your own KSampler run attends (no imag
 | **HAP** | FLUX, Qwen/Krea-2, Z-Image, Anima | Calibrated sparse attention (speed) | ✗ | Native high-res generation |
 | **PixelRush** | Any (SDXL, SD1.5, FLUX, Qwen, …) | Patch-wise low-denoise img2img cascade | ✓ | Faithful upscale + refinement |
 | **FreeScale** | FLUX-family DiTs | Scale-fused attention + self-cascade | ✓ | Regenerative hi-res, mostly new content |
-| **HiFlow** | Flow models (FLUX, Qwen-Image, …) | Time-matched reference trajectory guidance | ✓ | Structure-faithful flow upscale |
+| **HiFlow** | Flow models (FLUX, Qwen-Image, Krea2, Z-Image, …) | Time-matched reference trajectory guidance | ✓ | Structure-faithful flow upscale |
 
 > [!TIP]
 > **Quick picker:** starting from noise → DyPE (or SEGA), add SPA if you see repeated/collapsed structures, add HAP for speed. Starting from an existing image → PixelRush to keep it faithful, FreeScale to re-imagine it at high res (lower its `noise_timestep` for more fidelity), HiFlow for FLUX-family flow models — it reuses the whole base-resolution denoising trajectory as guidance, so structure survives while detail is re-synthesized.
@@ -291,7 +291,7 @@ Tuning-free higher-resolution generation via scale-fused attention and self-casc
 <a id="user-content-hiflow"></a>
 ### ❖ HiFlow
 
-Training-free high-resolution upscaling for **rectified-flow models** (FLUX, Qwen-Image, …) via flow-aligned guidance ([paper](https://arxiv.org/abs/2504.06232), NeurIPS 2025). The base-resolution sampling runs once, recording every per-step clean prediction; each upscale stage then reuses that **time-matched trajectory** as a virtual reference — initialization alignment seeds the stage from it, direction alignment keeps low frequencies true to it, acceleration alignment matches its detail-generation rhythm. Structure survives; high-res detail is synthesized fresh.
+Training-free high-resolution upscaling for **rectified-flow models** (FLUX, Qwen-Image, Krea2, Z-Image, …) via flow-aligned guidance ([paper](https://arxiv.org/abs/2504.06232), NeurIPS 2025). The base-resolution sampling runs once, recording every per-step clean prediction; each upscale stage then reuses that **time-matched trajectory** as a virtual reference — initialization alignment seeds the stage from it, direction alignment keeps low frequencies true to it, acceleration alignment matches its detail-generation rhythm. Structure survives; high-res detail is synthesized fresh.
 
 **Usage:** connect `model` (flow models only), `vae`, `positive`, `negative` and a base latent at native resolution (e.g. `EmptySD3LatentImage`) → set `noise_seed` + `scale_factor` → decode. The cascade noises the latent to the first sigma itself — an empty latent + seed reproduces the reference pipeline's from-noise start. Chain `DyPE (ntk)` before the loader for RoPE extrapolation at the scaled resolution.
 
@@ -315,7 +315,7 @@ Training-free high-resolution upscaling for **rectified-flow models** (FLUX, Qwe
 </details>
 
 > [!TIP]
-> **HiFlow inherits the reference's structure** — including its mistakes. Generate a good base first; `tau` lower keeps more of it, higher re-imagines.
+> **HiFlow inherits the reference's structure** — including its mistakes. Generate a good base first; `tau` lower keeps more of it, higher re-imagines. 3D-latent image models (Krea2, Qwen-Image — Wan21 format, Qwen VAE) work as single-frame (T=1) latents; actual multi-frame/video input is rejected.
 <p align="right"><a href="#readme-top" title="back to top">⟔ ▲ ⟓</a></p>
 
 ## ▓ Node Reference
@@ -364,6 +364,9 @@ Restart ComfyUI. No further dependency installation is required.
 <p align="right"><a href="#readme-top" title="back to top">⟔ ▲ ⟓</a></p>
 
 ## ▓ Changelog
+
+### v2.14.0 — 2026-09-07
+- **HiFlow: 3D-latent image model support — Krea2 and Qwen-Image work now** (plan 2026-09-07, user-reported Krea2 "does not support 3D-latent (video) models" rejection). These models are *image* models with a 5D Wan21-style latent layout `[B,C,1,H,W]` (Qwen VAE) — the old gate conflated 5D tensors with video. The gate now accepts `latent_dimensions=3` image models and rejects only actual multi-frame (T>1) input; the node bridges 5D↔4D around the 4D core (the PixelRush convention): latents squeeze on entry and re-expand on output, the model-call adapter unsqueezes before `process_latent_in` (Wan21's per-channel mean/std stats broadcast on 5D only), and the VAE adapters speak the Qwen-VAE `latent_dim=3` boundary (decode frame-slices the `[B,T,H,W,3]` image; encode lets the VAE do its own `not_video` unsqueeze). Qwen-Image gains real (previously gate-blocked) support from the same fix; Anima inherits it, untested on real runs.
 
 ### v2.13.0 — 2026-09-04
 - **HiFlow: `target_resolution` replaced by `scale_factor`** (user request — the absolute pixel target was unintuitive). `scale_factor` is relative to the input latent: 2 doubles each side, 1 returns the base unchanged, 0.5 halves it via a single refinement stage. Scales now apply per side (the absolute form over-upscaled the short side of non-square images), upscales keep the paper's 2×-stage quantization (a 1.5 scale runs one 2× stage), and downscale scales (0.25–1) run one guided stage at the smaller size. Example workflow updated.
