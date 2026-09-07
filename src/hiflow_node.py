@@ -77,6 +77,7 @@ def _make_predict_x0(
     positive,
     negative,
     cfg_scale: float,
+    latent_dimensions: int = 2,
 ) -> Callable[[torch.Tensor, float], torch.Tensor]:
     """Create the x0 adapter: (x_vae, sigma) -> x0 in VAE space (plan D3).
 
@@ -86,6 +87,12 @@ def _make_predict_x0(
     DENOISED x0 (apply_model applies calculate_denoised) with full CFG,
     areas, control nets and hooks. The VAE<->model conversions bracket the
     model call and cancel per call (plan D2).
+
+    ``latent_dimensions == 3`` (Wan21: Krea2, Qwen-Image — Krea2 plan S3):
+    the adapter unsqueezes the 4D core tensor to 5D [B,C,1,H,W] BEFORE
+    process_latent_in (the Wan21 mean/std stats are [1,C,1,1,1] views —
+    they broadcast correctly on 5D only) and the model call, and squeezes
+    the result back — the PixelRush predict_eps ``was_4d`` pattern.
     """
     import comfy.model_management
     import comfy.sampler_helpers
@@ -147,6 +154,12 @@ def _make_predict_x0(
 
     def predict_x0(x_vae: torch.Tensor, sigma: float) -> torch.Tensor:
         x = x_vae.to(device)
+        # 3D-format models (Wan21) need the 5D tensor — the latent-format
+        # mean/std stats are [1,C,1,1,1] views and the model was trained
+        # on 5D (Krea2 plan S3). Track the bridging to undo it after.
+        was_4d = x.dim() == 4
+        if was_4d and latent_dimensions == 3:
+            x = x.unsqueeze(2)  # [B, C, 1, H, W]
         if process_latent_in is not None:
             x = process_latent_in(x)
 
@@ -162,6 +175,8 @@ def _make_predict_x0(
         )
         if process_latent_out is not None:
             x0 = process_latent_out(x0)
+        if was_4d and x0.dim() == 5:
+            x0 = x0.squeeze(2)
         return x0.to(x_vae.dtype).to(x_vae.device)
 
     return predict_x0
@@ -452,9 +467,11 @@ class HiFlowNode(io.ComfyNode):
         )
 
         predict_x0_base = _make_predict_x0(
-            model, positive, negative, cfg_scale=float(cfg))
+            model, positive, negative, cfg_scale=float(cfg),
+            latent_dimensions=latent_dimensions)
         predict_x0_stage = _make_predict_x0(
-            model, positive, negative, cfg_scale=float(guidance))
+            model, positive, negative, cfg_scale=float(guidance),
+            latent_dimensions=latent_dimensions)
 
         # VAE adapters are ALWAYS needed — the stage-initialization anchor
         # is the pixel round-trip of the previous final latent in both

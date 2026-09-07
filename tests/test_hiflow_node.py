@@ -189,6 +189,53 @@ class TestPredictX0:
             "adapter must call model_sampling.timestep(sigma)"
         )
 
+    def test_5d_bridge_on_3d_format_models(self, monkeypatch):
+        """Krea2 plan S3: with latent_dimensions=3 the adapter unsqueezes
+        4D -> 5D before process_latent_in (Wan21 mean/std stats are
+        [1,C,1,1,1] — 5D broadcast), the model call sees 5D, and the result
+        squeezes back to 4D."""
+        fx = _install_fake_comfy(monkeypatch)
+        model = _mock_flow_model(latent_dimensions=3)
+
+        # Wan21-style process_in: (x - mean)/std with [1,C,1,1,1] views —
+        # asserts the 5D input the bridge must provide.
+        mean = torch.zeros(1, 16, 1, 1, 1)
+        std = torch.ones(1, 16, 1, 1, 1)
+        seen_ndim = []
+
+        def process_latent_in(t):
+            seen_ndim.append(t.dim())
+            assert t.dim() == 5, "Wan21 stats need the 5D tensor"
+            return (t - mean) / std
+
+        model.model.process_latent_in = process_latent_in
+        model.model.process_latent_out = lambda t: t * std + mean
+
+        adapter = hfn._make_predict_x0(
+            model, COND_POS, COND_NEG, cfg_scale=1.0,
+            latent_dimensions=3)
+        torch.manual_seed(0)
+        x_vae = torch.randn(1, 16, 8, 8)
+        out = adapter(x_vae, sigma=0.6)
+
+        assert seen_ndim == [5], "process_latent_in must receive 5D"
+        assert fx.sampling_calls[-1]["x_shape"] == (1, 16, 1, 8, 8), (
+            "the model call must receive the 5D [B,C,1,H,W] tensor"
+        )
+        assert out.dim() == 4, "the adapter must return the squeezed 4D x0"
+        assert out.shape == x_vae.shape
+        assert torch.isfinite(out).all()
+
+    def test_4d_models_unaffected_by_bridge(self, monkeypatch):
+        """latent_dimensions=2 never unsqueezes — the bridge is inert."""
+        fx = _install_fake_comfy(monkeypatch)
+        model = _mock_flow_model()
+        adapter = hfn._make_predict_x0(
+            model, COND_POS, COND_NEG, cfg_scale=1.0, latent_dimensions=2)
+        torch.manual_seed(0)
+        adapter(torch.randn(1, 4, 8, 8), sigma=0.6)
+        assert fx.sampling_calls[-1]["x_shape"] == (1, 4, 8, 8)
+
     def test_conds_processed_once_per_shape(self, monkeypatch):
         """process_conds is cached per latent shape (stage-stable)."""
         fx = _install_fake_comfy(monkeypatch)
