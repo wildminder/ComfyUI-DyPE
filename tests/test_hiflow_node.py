@@ -112,8 +112,31 @@ def _mock_flow_model(latent_dimensions=2, prediction_mixin="CONST"):
     model.model.model_sampling = ms
     model.model.latent_format = types.SimpleNamespace(
         latent_dimensions=latent_dimensions, latent_channels=16)
-    model.model.process_latent_in = lambda t: (t - 0.1159) * 0.3611
-    model.model.process_latent_out = lambda t: (t / 0.3611) + 0.1159
+    if latent_dimensions == 3:
+        # Wan21-faithful conversions (v2.14.1): [1,C,1,1,1] mean/std
+        # stats — a 4D tensor against them BROADCASTS SILENTLY to
+        # [B,C,C,H,W] garbage (the real Krea2 T=16 crash), so the mock
+        # must replicate the shape hazard exactly, not just the math.
+        _mean = torch.zeros(1, 16, 1, 1, 1)
+        _std = torch.ones(1, 16, 1, 1, 1)
+
+        def _wan21_in(t):
+            assert t.dim() == 5, (
+                "process_latent_in must receive the 5D [B,C,1,H,W] tensor"
+            )
+            return (t - _mean) / _std
+
+        def _wan21_out(t):
+            assert t.dim() == 5, (
+                "process_latent_out must receive the 5D tensor"
+            )
+            return t * _std + _mean
+
+        model.model.process_latent_in = _wan21_in
+        model.model.process_latent_out = _wan21_out
+    else:
+        model.model.process_latent_in = lambda t: (t - 0.1159) * 0.3611
+        model.model.process_latent_out = lambda t: (t / 0.3611) + 0.1159
     model.model_options = {}
     model.load_device = torch.device("cpu")
     model.pre_run = lambda: None
@@ -960,8 +983,8 @@ class TestHiFlowDocs:
         readme = (pathlib.Path(__file__).parent.parent
                   / "README.md").read_text(encoding="utf-8")
         m = re.search(r'^version = "([^"]+)"', pyproject, re.MULTILINE)
-        assert m and m.group(1) == "2.14.0"
-        assert "### v2.14.0" in readme
+        assert m and m.group(1) == "2.14.1"
+        assert "### v2.14.1" in readme
 
     def test_workflow_json_parses_and_uses_known_nodes(self):
         import json

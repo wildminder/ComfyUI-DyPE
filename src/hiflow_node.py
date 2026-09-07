@@ -447,11 +447,41 @@ class HiFlowNode(io.ComfyNode):
         # Latent-format conversions for the cascade's img2img noising (the
         # model-space mix, v2.12.1). None for models without them -> the
         # cascade falls back to the plain VAE-space mix.
+        # For 3D-format models (Wan21) the conversions are WRAPPED to be
+        # NDIM-TRANSPARENT (v2.14.1): the cascade mixes 4D core tensors,
+        # but Wan21's mean/std stats are [1,C,1,1,1] — calling the raw
+        # conversion on 4D BROADCASTS SILENTLY to [B,C,C,H,W] garbage
+        # (reads as T=channels; the real-model Krea2 crash "Expected size
+        # 1 but got size 16"), and returning a 5D tensor from the wrapper
+        # re-triggers the same broadcast in the cascade's sigma-mix (4D
+        # noise + 5D content). The wrapper therefore unsqueezes, converts
+        # in true 5D model space, and squeezes back — the cascade's mix
+        # runs on 4D tensors with correctly-normalized VALUES (Wan21's
+        # per-channel stats commute with the singleton-T squeeze).
         inner_model = model.model
-        inner_model_process_latent_in = getattr(
-            inner_model, "process_latent_in", None)
-        inner_model_process_latent_out = getattr(
-            inner_model, "process_latent_out", None)
+        _raw_in = getattr(inner_model, "process_latent_in", None)
+        _raw_out = getattr(inner_model, "process_latent_out", None)
+        if latent_dimensions == 3:
+            def inner_model_process_latent_in(t):
+                was_4d = t.dim() == 4
+                if was_4d:
+                    t = t.unsqueeze(2)  # [B, C, 1, H, W]
+                t = _raw_in(t) if _raw_in is not None else t
+                if was_4d and t.dim() == 5:
+                    t = t.squeeze(2)
+                return t
+
+            def inner_model_process_latent_out(t):
+                was_4d = t.dim() == 4
+                if was_4d:
+                    t = t.unsqueeze(2)  # [B, C, 1, H, W]
+                t = _raw_out(t) if _raw_out is not None else t
+                if was_4d and t.dim() == 5:
+                    t = t.squeeze(2)
+                return t
+        else:
+            inner_model_process_latent_in = _raw_in
+            inner_model_process_latent_out = _raw_out
 
         # Channel handling for empty latents (EmptyLatentImage may produce 4
         # channels for a 16-channel model) — the PixelRush convention.

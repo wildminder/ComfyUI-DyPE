@@ -365,6 +365,9 @@ Restart ComfyUI. No further dependency installation is required.
 
 ## ▓ Changelog
 
+### v2.14.1 — 2026-09-07
+- **Fixed HiFlow Krea2/Qwen-Image noising crash** (user-reported `torch.cat` size mismatch, "Expected size 1 but got size 16"): the v2.12.1 model-space noising called the model's `process_latent_in` on the 4D core tensor, but Wan21's per-channel mean/std stats are shaped `[1,C,1,1,1]` — a 4D tensor against 5D stats **broadcasts silently to `[B,C,C,H,W]` garbage** (the model reads T=16=channels). The node now wraps the noising conversions ndim-transparently: unsqueeze → convert in true 5D model space → squeeze back, so the cascade's σ-mix runs on 4D tensors with correctly-normalized values. The node-test mock now uses Wan21-faithful stats (replicating the broadcast hazard — the earlier affine mock masked the bug class).
+
 ### v2.14.0 — 2026-09-07
 - **HiFlow: 3D-latent image model support — Krea2 and Qwen-Image work now** (plan 2026-09-07, user-reported Krea2 "does not support 3D-latent (video) models" rejection). These models are *image* models with a 5D Wan21-style latent layout `[B,C,1,H,W]` (Qwen VAE) — the old gate conflated 5D tensors with video. The gate now accepts `latent_dimensions=3` image models and rejects only actual multi-frame (T>1) input; the node bridges 5D↔4D around the 4D core (the PixelRush convention): latents squeeze on entry and re-expand on output, the model-call adapter unsqueezes before `process_latent_in` (Wan21's per-channel mean/std stats broadcast on 5D only), and the VAE adapters speak the Qwen-VAE `latent_dim=3` boundary (decode frame-slices the `[B,T,H,W,3]` image; encode lets the VAE do its own `not_video` unsqueeze). Qwen-Image gains real (previously gate-blocked) support from the same fix; Anima inherits it, untested on real runs.
 
