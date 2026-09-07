@@ -437,6 +437,75 @@ class TestVaeAdapters:
         img = dec({"samples": torch.randn(1, 4, 8, 8)})
         assert img.ndim == 4
 
+    @staticmethod
+    def _fake_3d_vae(latent_channels=16):
+        """Fake Qwen-VAE (latent_dim=3, not_video): decode takes 5D latents
+        and returns [B,T,H,W,3] channels-last; encode takes channels-last
+        and returns 5D latents [B,C,T,h,w] — the REAL sd.py shapes
+        (:1209 decode, :1338 encode with the not_video unsqueeze)."""
+        calls = {"decode_shapes": [], "encode_shapes": []}
+
+        def decode(z):
+            calls["decode_shapes"].append(tuple(z.shape))
+            b, c, t, h, w = z.shape
+            assert t == 1, "image models decode T=1 latents"
+            # The raw decoder emits channels-FIRST pixels [B,3,T,H,W];
+            # VAE.decode's final movedim(1,-1) (sd.py:1283) yields [B,T,H,W,3].
+            pixels = torch.randn(b, 3, t, h * 16, w * 16)
+            return pixels.movedim(1, -1)
+
+        def encode(im):
+            # sd.py:1342 — encode does movedim(-1,1) then, being not_video,
+            # unsqueezes the 4D channels-first image to 5D itself.
+            calls["encode_shapes"].append(tuple(im.shape))
+            assert im.shape[-1] == 3, "channels-last input expected"
+            b = im.shape[0]
+            lat = torch.randn(b, latent_channels, 1,
+                              im.shape[-3] // 16, im.shape[-2] // 16)
+            return lat
+
+        vae = types.SimpleNamespace(
+            decode=decode, encode=encode, latent_dim=3,
+            downscale_ratio=(lambda a: max(0, (a + 15) // 16), 16, 16),
+        )
+        return vae, calls
+
+    def test_3d_vae_decode_unsqueezes_and_slices_frame(self):
+        """Krea2 plan S4: decode unsqueezes the 4D latent to 5D before
+        vae.decode and slices the 5D image to its first frame -> [B,H,W,3]."""
+        vae, calls = self._fake_3d_vae()
+        dec, _ = hfn._make_vae_adapters(vae, torch.device("cpu"))
+        img = dec(torch.randn(1, 16, 8, 8))
+        assert calls["decode_shapes"] == [(1, 16, 1, 8, 8)], (
+            "the raw vae.decode must receive the 5D latent"
+        )
+        assert img.shape == (1, 128, 128, 3), (
+            "first temporal frame of the 5D channels-last image"
+        )
+
+    def test_3d_vae_encode_slices_to_4d(self):
+        """Krea2 plan S4: encode feeds the channels-last 4D image (the VAE
+        itself unsqueezes) and slices the 5D latent to 4D for the core."""
+        vae, calls = self._fake_3d_vae()
+        _, enc = hfn._make_vae_adapters(vae, torch.device("cpu"))
+        lat = enc(torch.randn(1, 128, 128, 3))
+        assert calls["encode_shapes"] == [(1, 128, 128, 3)], (
+            "encode must receive the channels-last image (the VAE "
+            "unsqueezes internally — sd.py:1342-1346)"
+        )
+        assert lat.shape == (1, 16, 8, 8), "4D latent for the core"
+
+    def test_3d_vae_roundtrip_end_to_end(self):
+        """decode -> [B,H,W,3] -> encode -> 4D: the full anchor/pixel path
+        works on a 3D-format VAE."""
+        vae, calls = self._fake_3d_vae()
+        dec, enc = hfn._make_vae_adapters(vae, torch.device("cpu"))
+        lat_in = torch.randn(1, 16, 8, 8)
+        lat_out = enc(dec(lat_in))
+        assert lat_out.shape == lat_in.shape
+        assert len(calls["decode_shapes"]) == 1
+        assert len(calls["encode_shapes"]) == 1
+
 
 @pytest.mark.unit
 class TestSharpen:
@@ -462,6 +531,17 @@ class TestSharpen:
         # exact, not an approximation).
         out_cf = hfn._sharpen(img.movedim(-1, 1), alpha=1.0)
         assert torch.allclose(out, out_cf.movedim(1, -1), atol=1e-6)
+
+    def test_5d_image_sliced_to_first_frame(self):
+        """Krea2 plan S4 backstop: a 5D decode output [B,T,H,W,3] slices to
+        its first frame — matching the 4D channels-last path exactly."""
+        img4 = torch.zeros(1, 16, 16, 3)
+        img4[0, 8, 8, 0] = 1.0
+        img5 = img4.unsqueeze(1)  # [B, 1, H, W, 3]
+        out5 = hfn._sharpen(img5, alpha=1.0)
+        assert out5.shape == img4.shape, "must return the 4D frame"
+        out4 = hfn._sharpen(img4, alpha=1.0)
+        assert torch.allclose(out5, out4, atol=1e-6)
 
     def test_unsharp_formula_on_impulse(self):
         """A delta impulse sharpens toward (alpha+1)*I at the peak (blur

@@ -183,7 +183,7 @@ def _make_predict_x0(
 
 
 # ---------------------------------------------------------------------------
-# VAE adapters (2D only — the gate rejects 3D-latent models)
+# VAE adapters (image latents; the gate rejects multi-frame T>1 input)
 # ---------------------------------------------------------------------------
 
 def _make_vae_adapters(vae, device):
@@ -203,28 +203,42 @@ def _make_vae_adapters(vae, device):
     (the old PixelRush-style convention) made VAE.encode move the WIDTH
     axis into the channel slot — spatial dims corrupted, encoder conv
     crashed ("Kernel size can't be greater than actual input size").
+
+    3D-FORMAT VAEs (Krea2 plan S4, Qwen-VAE ``latent_dim=3``): decode gets
+    the 5D [B,C,1,h,w] latent it expects (unsqueeze a 4D input) and returns
+    a 5D image [B,T,H,W,3] — take the first temporal frame. encode takes
+    the channels-last 4D image and unsqueezes to 5D ITSELF (``not_video``
+    branch, sd.py:1342-1346 — the adapters must not assume the video-VAE
+    batch trick) and returns a 5D latent [B,C,T,h,w] — take [:, :, 0] for
+    the 4D core.
     """
 
+    latent_dim = getattr(vae, "latent_dim", 2)
+
     def vae_decode(latent: torch.Tensor) -> torch.Tensor:
-        """latent [B,C,h,w] -> image [B, H, W, 3] (ComfyUI decode layout)."""
+        """latent [B,C,h,w] (or 5D [B,C,1,h,w]) -> image [B, H, W, 3]."""
         if isinstance(latent, dict):
             latent = latent["samples"]
         latent = latent.to(device)
+        if latent_dim == 3 and latent.dim() == 4:
+            latent = latent.unsqueeze(2)  # [B, C, 1, h, w]
         decoded = vae.decode(latent)
         if isinstance(decoded, dict):
             decoded = decoded["samples"]
         if decoded.ndim == 5:
-            decoded = decoded[:, 0]
+            decoded = decoded[:, 0]     # first temporal frame [B, H, W, 3]
         elif decoded.ndim == 3:
             decoded = decoded.unsqueeze(0)
         return decoded  # [B, H, W, 3] channels-last, untouched
 
     def vae_encode(image: torch.Tensor) -> torch.Tensor:
-        """image [B, H, W, 3] -> latent [B, C, h, w] (ComfyUI encode layout)."""
+        """image [B, H, W, 3] -> latent [B, C, h, w] (4D for the core)."""
         image = image.to(device)
         encoded = vae.encode(image)
         if isinstance(encoded, dict):
             encoded = encoded["samples"]
+        if latent_dim == 3 and encoded.ndim == 5:
+            encoded = encoded[:, :, 0]  # first temporal frame -> 4D
         return encoded
 
     return vae_decode, vae_encode
@@ -236,8 +250,13 @@ def _sharpen(image: torch.Tensor, alpha: float = 1.0) -> torch.Tensor:
     The reference (utils.gaussian_blur_image_sharpening) sharpens the
     pixel-space upscaled image before re-encoding (pixel mode only). The
     image arrives channels-LAST ([B, H, W, 3] — the ComfyUI VAE boundary);
-    gaussian_blur_2d needs channels-first, so convert around the blur.
+    gaussian_blur_2d needs channels-first, so convert around the blur. A 5D
+    decode output ([B,T,H,W,3], 3D-format VAEs) is sliced to its first
+    frame first — the adapters normally hand 4D, this is the defensive
+    backstop (Krea2 plan S4).
     """
+    if image.dim() == 5:
+        image = image[:, 0]
     channels_last = image.dim() == 4 and image.shape[-1] == 3
     if channels_last:
         image = image.movedim(-1, 1)
