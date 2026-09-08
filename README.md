@@ -81,7 +81,7 @@ Two families: **model patches** alter how your own KSampler run attends (no imag
 
 Dynamic Position Extrapolation ([paper](https://arxiv.org/abs/2411.17087), [code](https://github.com/guyyariv/DyPE)). Adjusts positional encodings at each denoising step to match the current stage of generation — low-frequency structure early, fine detail later. Training-free, no additional sampling cost.
 
-**Usage:** Load model → add `DyPE for FLUX` (under `model_patches/unet`) → connect `MODEL` → set `width`/`height` to match your latent → connect to KSampler.
+**Usage:** Load model → add `DyPE` (under `WMNodes/image`) → connect `MODEL` → set `width`/`height` to match your latent → connect to KSampler.
 
 <details>
 <summary><b>Inputs & Parameters</b></summary>
@@ -364,6 +364,9 @@ Restart ComfyUI. No further dependency installation is required.
 <p align="right"><a href="#readme-top" title="back to top">⟔ ▲ ⟓</a></p>
 
 ## ▓ Changelog
+
+### v2.15.0 — 2026-09-08
+- **Restructured the pack layout + unified the node category.** All node definitions now live in a dedicated `nodes/` folder (`nodes/dype.py`, `sega.py`, `spa.py`, `hap.py`, `hap_calibrate.py`, `freescale.py`, `pixelrush.py`, `hiflow.py`); `src/` holds engines/implementation only and the pack `__init__.py` just registers the extension. All 8 nodes moved to the single **`WMNodes/image`** menu category (previously split across two menu paths). No node ids, inputs, defaults, or behavior changed — workflows keep loading. Also merges PR #41 (FreeScale fp16 antialiased-bicubic crash fix).
 
 ### v2.14.1 — 2026-09-07
 - **Fixed HiFlow Krea2/Qwen-Image noising crash** (user-reported `torch.cat` size mismatch, "Expected size 1 but got size 16"): the v2.12.1 model-space noising called the model's `process_latent_in` on the 4D core tensor, but Wan21's per-channel mean/std stats are shaped `[1,C,1,1,1]` — a 4D tensor against 5D stats **broadcasts silently to `[B,C,C,H,W]` garbage** (the model reads T=16=channels). The node now wraps the noising conversions ndim-transparently: unsqueeze → convert in true 5D model space → squeeze back, so the cascade's σ-mix runs on 4D tensors with correctly-normalized values. The node-test mock now uses Wan21-faithful stats (replicating the broadcast hazard — the earlier affine mock masked the bug class).

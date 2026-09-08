@@ -1,4 +1,4 @@
-"""Tests for src/hiflow_node.py — node adapters (Tier 2).
+"""Tests for nodes/hiflow.py — node adapters (Tier 2).
 
 Step 6 of plan 2026-09-03: flow-model gate + the sampling_function-based
 x0 adapter. The conftest mock-comfy does not provide comfy.samplers /
@@ -14,7 +14,7 @@ import types
 import pytest
 import torch
 
-import src.hiflow_node as hfn
+import nodes.hiflow as hfn
 
 # ---------------------------------------------------------------------------
 # Fake comfy runtime modules
@@ -290,11 +290,11 @@ class TestPredictX0:
         """The adapter must go through sampling_function, never call
         diffusion_model directly (the D3 seam)."""
         import pathlib
-        content = (pathlib.Path(__file__).parent.parent / "src"
-                   / "hiflow_node.py").read_text(encoding="utf-8")
+        content = (pathlib.Path(__file__).parent.parent / "nodes"
+                   / "hiflow.py").read_text(encoding="utf-8")
         assert "sampling_function" in content
         assert "diffusion_model(" not in content, (
-            "hiflow_node must not bypass sampling_function"
+            "hiflow node module must not bypass sampling_function"
         )
 
 
@@ -906,8 +906,7 @@ class TestExecuteWiring:
 class TestHiFlowNodeSchema:
     def _src(self):
         import pathlib
-        return (pathlib.Path(__file__).parent.parent / "src"
-                / "hiflow_node.py").read_text(encoding="utf-8")
+        return (pathlib.Path(__file__).parent.parent / "nodes" / "hiflow.py").read_text(encoding="utf-8")
 
     def test_schema_inputs_and_paper_defaults(self):
         src = self._src()
@@ -956,7 +955,7 @@ class TestHiFlowNodeSchema:
         )
 
     def test_category_matches_cascade_family(self):
-        assert 'category="image/upscaling"' in self._src()
+        assert 'category="WMNodes/image"' in self._src()
 
     def test_validate_inputs_none_passes(self):
         assert hfn.HiFlowNode.validate_inputs(scale_factor=None) is True
@@ -983,8 +982,8 @@ class TestHiFlowDocs:
         readme = (pathlib.Path(__file__).parent.parent
                   / "README.md").read_text(encoding="utf-8")
         m = re.search(r'^version = "([^"]+)"', pyproject, re.MULTILINE)
-        assert m and m.group(1) == "2.14.1"
-        assert "### v2.14.1" in readme
+        assert m and m.group(1) == "2.15.0"
+        assert "### v2.15.0" in readme
 
     def test_workflow_json_parses_and_uses_known_nodes(self):
         import json

@@ -16,7 +16,10 @@ import types
 
 import pytest
 
-_INIT = pathlib.Path(__file__).parent.parent / "__init__.py"
+_ENTRY = pathlib.Path(__file__).parent.parent / "__init__.py"
+# Class-body source moved to nodes/spa.py (2026-09-08 layout plan);
+# the entry keeps registration only.
+_INIT = pathlib.Path(__file__).parent.parent / "nodes" / "spa.py"
 
 
 class _MockModel:
@@ -104,7 +107,7 @@ class TestSpaNodeSchema:
         assert "class SPA" in _INIT.read_text(encoding="utf-8")
 
     def test_node_registered(self):
-        content = _INIT.read_text(encoding="utf-8")
+        content = _ENTRY.read_text(encoding="utf-8")
         assert "return [DyPE_FLUX, SEGA, SPA" in content
 
     def test_imports_apply_spa(self):
@@ -117,8 +120,7 @@ class TestSpaNodeSchema:
         because the node re-wrapped all ValueErrors)."""
         content = _INIT.read_text(encoding="utf-8")
         start = content.index("class SPA(io.ComfyNode):")
-        end = content.index("class DyPEExtension")
-        spa_section = content[start:end]
+        spa_section = content[start:]  # node module ends after the class
         # Pre-parses the filter in its own try/except.
         assert "parse_layer_filter(spa_layer_filter)" in spa_section
         assert "invalid spa_layer_filter" in spa_section
@@ -140,7 +142,7 @@ class TestSpaNodeSchema:
 
     def test_category_and_output(self):
         content = _INIT.read_text(encoding="utf-8")
-        assert "model_patches/position_encoding" in content
+        assert "WMNodes/image" in content
         assert "io.Model.Output" in content
 
     def test_has_spa_start_sigma_input(self):
@@ -161,8 +163,7 @@ class TestSpaNodeSchema:
         """
         content = _INIT.read_text(encoding="utf-8")
         start = content.index("class SPA(io.ComfyNode):")
-        end = content.index("class DyPEExtension")
-        spa_section = content[start:end]
+        spa_section = content[start:]  # node module ends after the class
         assert '"method"' not in spa_section, (
             "SPA node still exposes a 'method' input — it is a no-op for SPA "
             "and must stay removed")

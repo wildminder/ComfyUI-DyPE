@@ -8,7 +8,7 @@ import torch
 @pytest.mark.unit
 class TestFreeScaleNodeSchema:
     def _read_source(self):
-        return (pathlib.Path(__file__).parent.parent / "src" / "freescale_node.py").read_text(encoding="utf-8")
+        return (pathlib.Path(__file__).parent.parent / "nodes" / "freescale.py").read_text(encoding="utf-8")
 
     def test_node_class_exists(self):
         content = self._read_source()
@@ -27,7 +27,7 @@ class TestFreeScaleNodeSchema:
 
     def test_node_category(self):
         content = self._read_source()
-        assert "image/upscaling" in content
+        assert "WMNodes/image" in content
 
     def test_node_defaults_match_paper(self):
         content = self._read_source()
@@ -44,7 +44,7 @@ class TestFreeScaleNodeSchema:
 
     def test_imports_freescale(self):
         content = (pathlib.Path(__file__).parent.parent / "__init__.py").read_text(encoding="utf-8")
-        assert "freescale_node" in content or "FreeScaleNode" in content
+        assert "FreeScaleNode" in content
 
 
 @pytest.mark.unit
@@ -52,7 +52,7 @@ class TestFreeScaleAttentionPatching:
     """Tests for the attention patching functions."""
 
     def _read_source(self):
-        return (pathlib.Path(__file__).parent.parent / "src" / "freescale_node.py").read_text(encoding="utf-8")
+        return (pathlib.Path(__file__).parent.parent / "nodes" / "freescale.py").read_text(encoding="utf-8")
 
     def test_has_patch_scale_attention(self):
         content = self._read_source()
@@ -108,7 +108,7 @@ class TestFreeScaleVAEAdapters5D:
     """Tests for VAE adapter 5D latent handling (Krea2/Qwen/Anima)."""
 
     def _read_source(self):
-        return (pathlib.Path(__file__).parent.parent / "src" / "freescale_node.py").read_text(encoding="utf-8")
+        return (pathlib.Path(__file__).parent.parent / "nodes" / "freescale.py").read_text(encoding="utf-8")
 
     def test_vae_decode_accepts_5d_latent(self):
         """vae_decode should handle 5D [B,C,T,H,W] input from sampler output."""
@@ -199,7 +199,7 @@ class TestFreeScaleVAEAdaptersFunctional:
         """vae_decode should call process_latent_out on 5D tensor, not 4D."""
         import sys
         sys.path.insert(0, str(pathlib.Path(__file__).parent.parent))
-        from src.freescale_node import _make_vae_adapters
+        from nodes.freescale import _make_vae_adapters
 
         vae = self._make_mock_vae_3d()
         model = self._make_mock_model_3d()
@@ -217,7 +217,7 @@ class TestFreeScaleVAEAdaptersFunctional:
         """vae_decode should add temporal dim to 4D before process_latent_out."""
         import sys
         sys.path.insert(0, str(pathlib.Path(__file__).parent.parent))
-        from src.freescale_node import _make_vae_adapters
+        from nodes.freescale import _make_vae_adapters
 
         vae = self._make_mock_vae_3d()
         model = self._make_mock_model_3d()
@@ -235,7 +235,7 @@ class TestFreeScaleVAEAdaptersFunctional:
         """vae_encode should return 5D latent for 3D latent models."""
         import sys
         sys.path.insert(0, str(pathlib.Path(__file__).parent.parent))
-        from src.freescale_node import _make_vae_adapters
+        from nodes.freescale import _make_vae_adapters
 
         vae = self._make_mock_vae_3d()
         model = self._make_mock_model_3d()
@@ -255,7 +255,7 @@ class TestFreeScaleVAEAdaptersFunctional:
         """vae_encode should call process_latent_in on 5D tensor."""
         import sys
         sys.path.insert(0, str(pathlib.Path(__file__).parent.parent))
-        from src.freescale_node import _make_vae_adapters
+        from nodes.freescale import _make_vae_adapters
 
         vae = self._make_mock_vae_3d()
         model = self._make_mock_model_3d()
@@ -273,7 +273,7 @@ class TestFreeScaleVAEAdaptersFunctional:
         """Verify 5D handling doesn't corrupt batch dimension (the Krea2 bug)."""
         import sys
         sys.path.insert(0, str(pathlib.Path(__file__).parent.parent))
-        from src.freescale_node import _make_vae_adapters
+        from nodes.freescale import _make_vae_adapters
 
         vae = self._make_mock_vae_3d()
         model = self._make_mock_model_3d()

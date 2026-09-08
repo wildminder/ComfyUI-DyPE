@@ -12,7 +12,7 @@ import sys
 import pytest
 
 from src.hap import ScopePlan
-from src.hap_calib_node import resolve_output_dir, write_scope_plan
+from nodes.hap_calibrate import resolve_output_dir, write_scope_plan
 
 
 def _tiny_plan_dict():

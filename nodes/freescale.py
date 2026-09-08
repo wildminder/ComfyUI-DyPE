@@ -17,9 +17,14 @@ import torch
 import torch.nn.functional as F
 from comfy_api.latest import io
 
-from .freescale import (
-    forward_noise,
-)
+try:
+    from ..src.freescale import (
+        forward_noise,
+    )
+except ImportError:  # flat repo layout (tests / CLI)
+    from src.freescale import (
+        forward_noise,
+    )
 
 logger = logging.getLogger("ComfyUI-DyPE")
 
@@ -267,7 +272,7 @@ class FreeScaleNode(io.ComfyNode):
         return io.Schema(
             node_id="FreeScale",
             display_name="FreeScale",
-            category="image/upscaling",
+            category="WMNodes/image",
             description="Tuning-free higher-resolution generation via scale fusion. Works with SDXL, Flux, and other models.",
             inputs=[
                 io.Model.Input("model", tooltip="The diffusion model."),
@@ -417,10 +422,14 @@ class FreeScaleNode(io.ComfyNode):
 
             # 1. VAE decode → bicubic upscale → VAE encode
             image = vae_decode(z)
+            orig_dtype = image.dtype
             image_up = F.interpolate(
-                image, size=(res_h, res_w),
-                mode="bicubic", align_corners=False, antialias=True,
-            )
+                image.float(),                          # cast to float32
+                size=(res_h, res_w),
+                mode="bicubic",
+                align_corners=False,
+                antialias=True,
+            ).to(orig_dtype)                            # restore original dtype
             z_up = vae_encode(image_up)
 
             # 2. Noise level at timestep K.  The actual noising is performed

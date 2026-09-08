@@ -52,7 +52,7 @@ from src.hap_calib import calibrate_scope_plan, collect_scope_scores
 # owns the list; the CLI re-imports it so the two never drift.
 # Re-exported on purpose — tests/test_hap_calib_spec.py::TestCliSingleSource
 # asserts ``mod.DEFAULT_PROMPTS is DEFAULT_CALIBRATION_PROMPTS``.
-from src.hap_calib_node import DEFAULT_CALIBRATION_PROMPTS as DEFAULT_PROMPTS  # noqa: F401
+from nodes.hap_calibrate import DEFAULT_CALIBRATION_PROMPTS as DEFAULT_PROMPTS  # noqa: F401
 
 
 def _ensure_mock_attention_module():
@@ -191,7 +191,7 @@ def run_real(args) -> dict:  # pragma: no cover - requires ComfyUI venv + GPU
     This is a documented manual step (plan §6, checklist A5) and is not run in
     CI.  It loads the checkpoint via ComfyUI's standard loader, builds
     conditioning from the calibration prompts, then delegates to the SAME
-    orchestrator the in-graph node uses (:func:`src.hap_calib_node.
+    orchestrator the in-graph node uses (:func:`nodes.hap_calibrate.
     run_hap_calibration`) so the CLI and the node can never drift.
     """
     try:
@@ -205,7 +205,7 @@ def run_real(args) -> dict:  # pragma: no cover - requires ComfyUI venv + GPU
             f"{exc!r}"
         ) from exc
 
-    from src.hap_calib_node import (
+    from nodes.hap_calibrate import (
         CalibrationSpec,
         resolve_prompts,
         run_hap_calibration,

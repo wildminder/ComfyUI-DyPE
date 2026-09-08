@@ -16,7 +16,8 @@ import pytest
 
 from src.hap import ScopePlan, apply_hap_to_model, restore_hap_attention_hook
 
-_INIT = pathlib.Path(__file__).parent.parent / "__init__.py"
+_ENTRY = pathlib.Path(__file__).parent.parent / "__init__.py"
+_HAP = pathlib.Path(__file__).parent.parent / "nodes" / "hap.py"
 _SHIPPED_PLAN = pathlib.Path(__file__).parent.parent / "configs" / "scope_plan_flux.json"
 
 
@@ -153,13 +154,15 @@ class TestApplyHap:
 @pytest.mark.unit
 class TestHapNodeSchema:
     def _content(self):
-        return _INIT.read_text(encoding="utf-8")
+        # HAP class body moved to nodes/hap.py (2026-09-08 layout plan);
+        # registration pins still read the entry.
+        return _HAP.read_text(encoding="utf-8")
 
     def test_hap_node_class_defined(self):
         assert "class HAP(io.ComfyNode):" in self._content()
 
     def test_hap_node_registered(self):
-        assert "return [DyPE_FLUX, SEGA, SPA, HAP," in self._content()
+        assert "return [DyPE_FLUX, SEGA, SPA, HAP," in _ENTRY.read_text(encoding="utf-8")
 
     def test_hap_imports(self):
         content = self._content()
@@ -184,9 +187,8 @@ class TestHapNodeSchema:
     def test_hap_category_and_output(self):
         content = self._content()
         start = content.index("class HAP(io.ComfyNode):")
-        end = content.index("class DyPEExtension")
-        section = content[start:end]
-        assert "model_patches/position_encoding" in section
+        section = content[start:]  # node module ends after the class
+        assert "WMNodes/image" in section
         assert "io.Model.Output" in section
 
 

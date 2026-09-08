@@ -38,7 +38,7 @@ from src.spa_context import (
     set_spa_step_gate,
 )
 
-_INIT = pathlib.Path(__file__).parent.parent / "__init__.py"
+_NODES = pathlib.Path(__file__).parent.parent / "nodes"
 
 
 # ---------------------------------------------------------------------------
@@ -353,7 +353,11 @@ def _tiny_plan():
 @pytest.mark.unit
 class TestNodeKnobs:
     def _content(self):
-        return _INIT.read_text(encoding="utf-8")
+        # SPA and HAP node classes live in separate modules since the
+        # 2026-09-08 layout plan; join them for cross-class section checks.
+        spa = (_NODES / "spa.py").read_text(encoding="utf-8")
+        hap = (_NODES / "hap.py").read_text(encoding="utf-8")
+        return spa + "\n" + hap
 
     def test_spa_schema_has_proportional_input(self):
         content = self._content()
@@ -362,18 +366,18 @@ class TestNodeKnobs:
         assert '"proportional_attention"' in content[start:end]
 
     def test_hap_schema_has_proportional_input(self):
-        content = self._content()
-        start = content.index("class HAP(io.ComfyNode):")
-        end = content.index("class DyPEExtension")
-        assert '"proportional_attention"' in content[start:end]
+        hap_src = (_NODES / "hap.py").read_text(encoding="utf-8")
+        start = hap_src.index("class HAP(io.ComfyNode):")
+        assert '"proportional_attention"' in hap_src[start:]
 
     def test_proportional_default_off_both_nodes(self):
-        content = self._content()
-        for cls_start, cls_end in (
-            ("class SPA(io.ComfyNode):", "class HAP(io.ComfyNode):"),
-            ("class HAP(io.ComfyNode):", "class DyPEExtension"),
+        for cls_start, cls_end, src in (
+            ("class SPA(io.ComfyNode):", "class HAP(io.ComfyNode):", self._content()),
+            ("class HAP(io.ComfyNode):", None, (_NODES / "hap.py").read_text(encoding="utf-8")),
         ):
-            section = content[content.index(cls_start):content.index(cls_end)]
+            section = src[src.index(cls_start):]
+            if cls_end is not None:
+                section = section[:section.index(cls_end)]
             idx = section.index('"proportional_attention"')
             assert "default=False" in section[idx:idx + 200]
 

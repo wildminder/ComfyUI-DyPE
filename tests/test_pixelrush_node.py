@@ -8,26 +8,26 @@ import torch
 @pytest.mark.unit
 class TestPixelRushNodeSchema:
     def test_node_class_exists(self):
-        content = (pathlib.Path(__file__).parent.parent / "src" / "pixelrush_node.py").read_text(encoding="utf-8")
+        content = (pathlib.Path(__file__).parent.parent / "nodes" / "pixelrush.py").read_text(encoding="utf-8")
         assert "class PixelRushNode" in content
 
     def test_node_has_inputs(self):
-        content = (pathlib.Path(__file__).parent.parent / "src" / "pixelrush_node.py").read_text(encoding="utf-8")
+        content = (pathlib.Path(__file__).parent.parent / "nodes" / "pixelrush.py").read_text(encoding="utf-8")
         for inp in ["model", "vae", "positive", "negative", "latent_image", "cfg",
                      "num_cascade_stages", "k_timestep", "noise_lambda", "overlap"]:
             assert inp in content, f"PixelRush node should have input: {inp}"
 
     def test_node_has_output(self):
-        content = (pathlib.Path(__file__).parent.parent / "src" / "pixelrush_node.py").read_text(encoding="utf-8")
+        content = (pathlib.Path(__file__).parent.parent / "nodes" / "pixelrush.py").read_text(encoding="utf-8")
         assert "io.Latent.Output" in content
 
     def test_node_category(self):
-        content = (pathlib.Path(__file__).parent.parent / "src" / "pixelrush_node.py").read_text(encoding="utf-8")
-        assert "image/upscaling" in content
+        content = (pathlib.Path(__file__).parent.parent / "nodes" / "pixelrush.py").read_text(encoding="utf-8")
+        assert "WMNodes/image" in content
 
     def test_noise_injection_default_slerp(self):
         """Node must expose the noise_injection mode with slerp default."""
-        content = (pathlib.Path(__file__).parent.parent / "src" / "pixelrush_node.py").read_text(encoding="utf-8")
+        content = (pathlib.Path(__file__).parent.parent / "nodes" / "pixelrush.py").read_text(encoding="utf-8")
         assert "noise_injection" in content, (
             "Node must pass noise_injection into PixelRushConfig"
         )
@@ -36,7 +36,7 @@ class TestPixelRushNodeSchema:
         )
 
     def test_node_defaults_match_paper(self):
-        content = (pathlib.Path(__file__).parent.parent / "src" / "pixelrush_node.py").read_text(encoding="utf-8")
+        content = (pathlib.Path(__file__).parent.parent / "nodes" / "pixelrush.py").read_text(encoding="utf-8")
         assert "default=0.95" in content  # noise_lambda
         assert "default=0.50" in content  # overlap
         assert "default=249" in content  # k_timestep
@@ -48,7 +48,7 @@ class TestPixelRushNodeSchema:
 
     def test_sigma_max_allows_paper_default(self):
         """The corrected default sigma=24 must be reachable from the UI."""
-        content = (pathlib.Path(__file__).parent.parent / "src" / "pixelrush_node.py").read_text(encoding="utf-8")
+        content = (pathlib.Path(__file__).parent.parent / "nodes" / "pixelrush.py").read_text(encoding="utf-8")
         assert "max=128.0" in content, (
             "gaussian_sigma max must be 128 (old max=20 blocked the paper default 24)"
         )
@@ -57,7 +57,7 @@ class TestPixelRushNodeSchema:
         """Every schema input name must be an execute() parameter and vice
         versa (no drift; catches removed inputs like gaussian_kernel_size)."""
         import re
-        content = (pathlib.Path(__file__).parent.parent / "src" / "pixelrush_node.py").read_text(encoding="utf-8")
+        content = (pathlib.Path(__file__).parent.parent / "nodes" / "pixelrush.py").read_text(encoding="utf-8")
         # Schema input names — match calls across line breaks:
         # io.<Type>.Input(\s*"<name>"
         pattern = re.compile(r'io\.\w+\.Input\(\s*"([^"]+)"')
@@ -86,7 +86,7 @@ class TestPixelRushNodeSchema:
 
     def test_imports_pixelrush(self):
         content = (pathlib.Path(__file__).parent.parent / "__init__.py").read_text(encoding="utf-8")
-        assert "pixelrush_node" in content or "PixelRushNode" in content
+        assert "PixelRushNode" in content
 
 
 @pytest.mark.unit
@@ -98,7 +98,7 @@ class TestPredictEpsConditioningPipeline:
     """
 
     def _read_source(self):
-        return (pathlib.Path(__file__).parent.parent / "src" / "pixelrush_node.py").read_text(encoding="utf-8")
+        return (pathlib.Path(__file__).parent.parent / "nodes" / "pixelrush.py").read_text(encoding="utf-8")
 
     def test_uses_convert_cond(self):
         """convert_cond must be called to convert tuple conditioning to dict format."""
@@ -204,7 +204,7 @@ class TestPixelRush5DLatentHandling:
     """
 
     def _read_source(self):
-        return (pathlib.Path(__file__).parent.parent / "src" / "pixelrush_node.py").read_text(encoding="utf-8")
+        return (pathlib.Path(__file__).parent.parent / "nodes" / "pixelrush.py").read_text(encoding="utf-8")
 
     def test_execute_uses_process_latent_in(self):
         """execute must call process_latent_in to convert initial latent to model format."""
@@ -362,7 +362,7 @@ class TestPixelRushVAEAdaptersFunctional:
         """vae_decode should call process_latent_out on 5D tensor, not 4D."""
         import sys
         sys.path.insert(0, str(pathlib.Path(__file__).parent.parent))
-        from src.pixelrush_node import _make_vae_adapters
+        from nodes.pixelrush import _make_vae_adapters
 
         vae = self._make_mock_vae_3d()
         model = self._make_mock_model_3d()
@@ -378,7 +378,7 @@ class TestPixelRushVAEAdaptersFunctional:
         """vae_decode should add temporal dim to 4D before process_latent_out."""
         import sys
         sys.path.insert(0, str(pathlib.Path(__file__).parent.parent))
-        from src.pixelrush_node import _make_vae_adapters
+        from nodes.pixelrush import _make_vae_adapters
 
         vae = self._make_mock_vae_3d()
         model = self._make_mock_model_3d()
@@ -394,7 +394,7 @@ class TestPixelRushVAEAdaptersFunctional:
         """vae_encode should return 5D latent for 3D latent models."""
         import sys
         sys.path.insert(0, str(pathlib.Path(__file__).parent.parent))
-        from src.pixelrush_node import _make_vae_adapters
+        from nodes.pixelrush import _make_vae_adapters
 
         vae = self._make_mock_vae_3d()
         model = self._make_mock_model_3d()
@@ -412,7 +412,7 @@ class TestPixelRushVAEAdaptersFunctional:
         """vae_encode should call process_latent_in on 5D tensor."""
         import sys
         sys.path.insert(0, str(pathlib.Path(__file__).parent.parent))
-        from src.pixelrush_node import _make_vae_adapters
+        from nodes.pixelrush import _make_vae_adapters
 
         vae = self._make_mock_vae_3d()
         model = self._make_mock_model_3d()
@@ -430,7 +430,7 @@ class TestPixelRushVAEAdaptersFunctional:
         sys.path.insert(0, str(pathlib.Path(__file__).parent.parent))
         import torch.nn.functional as F
 
-        from src.pixelrush_node import _make_vae_adapters
+        from nodes.pixelrush import _make_vae_adapters
 
         vae = self._make_mock_vae_3d()
         model = self._make_mock_model_3d()
@@ -507,7 +507,7 @@ class TestPixelRushProgressBar:
     """Tests for progress bar integration in PixelRush node."""
 
     def _read_source(self):
-        return (pathlib.Path(__file__).parent.parent / "src" / "pixelrush_node.py").read_text(encoding="utf-8")
+        return (pathlib.Path(__file__).parent.parent / "nodes" / "pixelrush.py").read_text(encoding="utf-8")
 
     def test_execute_creates_progress_bar(self):
         """execute must create a comfy.utils.ProgressBar."""
@@ -662,7 +662,7 @@ class TestPixelRushInferenceBugFix:
     """
 
     def _read_source(self):
-        return (pathlib.Path(__file__).parent.parent / "src" / "pixelrush_node.py").read_text(encoding="utf-8")
+        return (pathlib.Path(__file__).parent.parent / "nodes" / "pixelrush.py").read_text(encoding="utf-8")
 
     # --- Bug 2: timestep → sigma conversion ---
 
@@ -842,7 +842,7 @@ class TestPixelRushInferenceBugFixFunctional:
         sys.path.insert(0, str(pathlib.Path(__file__).parent.parent))
         import types
 
-        from src.pixelrush_node import _make_alpha_bar_at
+        from nodes.pixelrush import _make_alpha_bar_at
 
         model = types.SimpleNamespace()
         model.model = types.SimpleNamespace()
@@ -872,7 +872,7 @@ class TestPixelRushInferenceBugFixFunctional:
         sys.path.insert(0, str(pathlib.Path(__file__).parent.parent))
         import types
 
-        from src.pixelrush_node import _make_alpha_bar_at
+        from nodes.pixelrush import _make_alpha_bar_at
 
         model = types.SimpleNamespace()
         model.model = types.SimpleNamespace()
@@ -1003,7 +1003,7 @@ class TestPixelRushPredictionTypeDetection:
     def test_detect_const_prediction_type(self):
         import sys
         sys.path.insert(0, str(pathlib.Path(__file__).parent.parent))
-        from src.pixelrush_node import _detect_prediction_type
+        from nodes.pixelrush import _detect_prediction_type
 
         ms = self._make_mock_model_sampling("const")
         assert _detect_prediction_type(ms) == "const"
@@ -1011,7 +1011,7 @@ class TestPixelRushPredictionTypeDetection:
     def test_detect_eps_prediction_type(self):
         import sys
         sys.path.insert(0, str(pathlib.Path(__file__).parent.parent))
-        from src.pixelrush_node import _detect_prediction_type
+        from nodes.pixelrush import _detect_prediction_type
 
         ms = self._make_mock_model_sampling("eps")
         assert _detect_prediction_type(ms) == "eps"
@@ -1019,7 +1019,7 @@ class TestPixelRushPredictionTypeDetection:
     def test_detect_v_prediction_type(self):
         import sys
         sys.path.insert(0, str(pathlib.Path(__file__).parent.parent))
-        from src.pixelrush_node import _detect_prediction_type
+        from nodes.pixelrush import _detect_prediction_type
 
         ms = self._make_mock_model_sampling("v_prediction")
         assert _detect_prediction_type(ms) == "v_prediction"
@@ -1031,7 +1031,7 @@ class TestPixelRushPredictionTypeDetection:
         """
         import sys
         sys.path.insert(0, str(pathlib.Path(__file__).parent.parent))
-        from src.pixelrush_node import _make_model_output_to_eps
+        from nodes.pixelrush import _make_model_output_to_eps
 
         ms = self._make_mock_model_sampling("const")
         converter = _make_model_output_to_eps(ms, "const")
@@ -1057,7 +1057,7 @@ class TestPixelRushPredictionTypeDetection:
         """
         import sys
         sys.path.insert(0, str(pathlib.Path(__file__).parent.parent))
-        from src.pixelrush_node import _make_model_output_to_eps
+        from nodes.pixelrush import _make_model_output_to_eps
 
         ms = self._make_mock_model_sampling("const")
         converter = _make_model_output_to_eps(ms, "const")
@@ -1077,7 +1077,7 @@ class TestPixelRushPredictionTypeDetection:
         """For EPS, raw output IS epsilon (identity)."""
         import sys
         sys.path.insert(0, str(pathlib.Path(__file__).parent.parent))
-        from src.pixelrush_node import _make_model_output_to_eps
+        from nodes.pixelrush import _make_model_output_to_eps
 
         ms = self._make_mock_model_sampling("eps")
         converter = _make_model_output_to_eps(ms, "eps")
@@ -1095,7 +1095,7 @@ class TestPixelRushPredictionTypeDetection:
         """For CONST/flow, x0 = (x_t - sigma*eps) / (1 - sigma)."""
         import sys
         sys.path.insert(0, str(pathlib.Path(__file__).parent.parent))
-        from src.pixelrush_node import _make_eps_to_x0
+        from nodes.pixelrush import _make_eps_to_x0
 
         ms = self._make_mock_model_sampling("const")
         converter = _make_eps_to_x0(ms, "const")
@@ -1115,7 +1115,7 @@ class TestPixelRushPredictionTypeDetection:
         """For EPS, x0 = x_t - sigma*eps."""
         import sys
         sys.path.insert(0, str(pathlib.Path(__file__).parent.parent))
-        from src.pixelrush_node import _make_eps_to_x0
+        from nodes.pixelrush import _make_eps_to_x0
 
         ms = self._make_mock_model_sampling("eps")
         converter = _make_eps_to_x0(ms, "eps")
@@ -1132,7 +1132,7 @@ class TestPixelRushPredictionTypeDetection:
 
     def test_source_uses_prediction_type_detection(self):
         """Source must detect prediction type and convert model output."""
-        content = (pathlib.Path(__file__).parent.parent / "src" / "pixelrush_node.py").read_text(encoding="utf-8")
+        content = (pathlib.Path(__file__).parent.parent / "nodes" / "pixelrush.py").read_text(encoding="utf-8")
         assert "_detect_prediction_type" in content, (
             "predict_eps must detect the model's prediction type"
         )
@@ -1146,7 +1146,7 @@ class TestPixelRushPredictionTypeDetection:
 
     def test_source_uses_noise_scaling_for_forward(self):
         """Source must use model's noise_scaling for the forward step."""
-        content = (pathlib.Path(__file__).parent.parent / "src" / "pixelrush_node.py").read_text(encoding="utf-8")
+        content = (pathlib.Path(__file__).parent.parent / "nodes" / "pixelrush.py").read_text(encoding="utf-8")
         assert "_make_forward_step" in content, (
             "Node must create a forward_step adapter using noise_scaling"
         )
@@ -1156,7 +1156,7 @@ class TestPixelRushPredictionTypeDetection:
 
     def test_source_uses_eps_to_x0_for_reverse(self):
         """Source must use eps_to_x0 for the reverse step."""
-        content = (pathlib.Path(__file__).parent.parent / "src" / "pixelrush_node.py").read_text(encoding="utf-8")
+        content = (pathlib.Path(__file__).parent.parent / "nodes" / "pixelrush.py").read_text(encoding="utf-8")
         assert "_make_reverse_step" in content, (
             "Node must create a reverse_step adapter using eps_to_x0"
         )
@@ -1210,7 +1210,7 @@ class TestPixelRushKTimestepScaling:
         """For FLUX (0-1 range), k_timestep=249 should scale to ~0.249."""
         import sys
         sys.path.insert(0, str(pathlib.Path(__file__).parent.parent))
-        from src.pixelrush_node import _scale_k_timestep
+        from nodes.pixelrush import _scale_k_timestep
 
         model = self._make_mock_model("01")
         scaled = _scale_k_timestep(model, 249)
@@ -1222,7 +1222,7 @@ class TestPixelRushKTimestepScaling:
         """For EPS (0-999 range), k_timestep=249 should be unchanged."""
         import sys
         sys.path.insert(0, str(pathlib.Path(__file__).parent.parent))
-        from src.pixelrush_node import _scale_k_timestep
+        from nodes.pixelrush import _scale_k_timestep
 
         model = self._make_mock_model("0999")
         scaled = _scale_k_timestep(model, 249)
@@ -1234,7 +1234,7 @@ class TestPixelRushKTimestepScaling:
         """For FLUX, k_timestep=50 should scale to ~0.05."""
         import sys
         sys.path.insert(0, str(pathlib.Path(__file__).parent.parent))
-        from src.pixelrush_node import _scale_k_timestep
+        from nodes.pixelrush import _scale_k_timestep
 
         model = self._make_mock_model("01")
         scaled = _scale_k_timestep(model, 50)
@@ -1244,7 +1244,7 @@ class TestPixelRushKTimestepScaling:
 
     def test_source_uses_scale_k_timestep(self):
         """Source must use _scale_k_timestep in execute."""
-        content = (pathlib.Path(__file__).parent.parent / "src" / "pixelrush_node.py").read_text(encoding="utf-8")
+        content = (pathlib.Path(__file__).parent.parent / "nodes" / "pixelrush.py").read_text(encoding="utf-8")
         assert "_scale_k_timestep(" in content, (
             "execute must call _scale_k_timestep to scale k_timestep to model range"
         )
@@ -1261,7 +1261,7 @@ class TestPipelineSpaceConvention:
     """
 
     def _read_source(self):
-        return (pathlib.Path(__file__).parent.parent / "src" / "pixelrush_node.py").read_text(encoding="utf-8")
+        return (pathlib.Path(__file__).parent.parent / "nodes" / "pixelrush.py").read_text(encoding="utf-8")
 
     @staticmethod
     def _strip_docstrings_and_comments(content):
@@ -1282,7 +1282,7 @@ class TestPipelineSpaceConvention:
 
     def test_no_operate_in_vae_space_flag(self):
         """The flag must be gone from code (docstrings may mention removal)."""
-        for rel in ("src/pixelrush_node.py", "src/pixelrush.py"):
+        for rel in ("nodes/pixelrush.py", "src/pixelrush.py"):
             content = (pathlib.Path(__file__).parent.parent / rel).read_text(encoding="utf-8")
             code = self._strip_docstrings_and_comments(content)
             assert "operate_in_vae_space" not in code, (
@@ -1374,7 +1374,7 @@ class TestAdapterSpaceConversion:
         def process_latent_out(t):
             return t / scale
 
-        from src.pixelrush_node import _make_forward_step, _make_reverse_step
+        from nodes.pixelrush import _make_forward_step, _make_reverse_step
         forward = _make_forward_step(model, process_latent_in, process_latent_out)
         reverse = _make_reverse_step(model, process_latent_in, process_latent_out)
         return forward, reverse, process_latent_in, scale
@@ -1440,7 +1440,7 @@ class TestPrepareInitialLatent:
     def _import_helper(self):
         import sys
         sys.path.insert(0, str(pathlib.Path(__file__).parent.parent))
-        from src.pixelrush_node import _prepare_initial_latent
+        from nodes.pixelrush import _prepare_initial_latent
         return _prepare_initial_latent
 
     def test_never_applies_process_latent_in(self):
@@ -1537,7 +1537,7 @@ class TestEmptyConditioningCFG:
         def mk(marker):
             return {"c_crossattn": _torch.tensor([[marker]])}
 
-        from src.pixelrush_node import _make_predict_eps
+        from nodes.pixelrush import _make_predict_eps
         return _make_predict_eps(
             model,
             [mk(1.0)] if positive else [],
@@ -1593,7 +1593,7 @@ class TestRefinerModelInput:
     """
 
     def _read_source(self):
-        return (pathlib.Path(__file__).parent.parent / "src" / "pixelrush_node.py").read_text(encoding="utf-8")
+        return (pathlib.Path(__file__).parent.parent / "nodes" / "pixelrush.py").read_text(encoding="utf-8")
 
     def test_schema_has_optional_refiner_model(self):
         content = self._read_source()

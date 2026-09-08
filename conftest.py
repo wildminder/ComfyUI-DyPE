@@ -15,8 +15,10 @@ _PROJECT_ROOT = os.path.dirname(os.path.abspath(__file__))
 if _PROJECT_ROOT not in sys.path:
     sys.path.insert(0, _PROJECT_ROOT)
 
-# Tell pytest to not try to import the root __init__.py or src/ as test modules
-collect_ignore = ["__init__.py", "src"]
+# Tell pytest to not try to import the root __init__.py, src/ or nodes/ as
+# test modules (they are regular packages, imported via the namespace trick
+# below / the repo-root sys.path entry).
+collect_ignore = ["__init__.py", "src", "nodes"]
 
 # Pre-register the root package in sys.modules so pytest doesn't try to
 # import __init__.py (which has relative imports that fail outside ComfyUI).

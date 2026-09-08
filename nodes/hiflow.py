@@ -18,9 +18,14 @@ from typing import Callable
 import torch
 from comfy_api.latest import io
 
-from .freescale import gaussian_blur_2d
-from .hiflow import HiFlowConfig, hiflow_cascade
-from .pixelrush_node import _detect_prediction_type
+try:
+    from ..src.freescale import gaussian_blur_2d
+    from ..src.hiflow import HiFlowConfig, hiflow_cascade
+except ImportError:  # flat repo layout (tests / CLI)
+    from src.freescale import gaussian_blur_2d
+    from src.hiflow import HiFlowConfig, hiflow_cascade
+
+from .pixelrush import _detect_prediction_type
 
 logger = logging.getLogger("ComfyUI-DyPE")
 
@@ -306,7 +311,7 @@ class HiFlowNode(io.ComfyNode):
         return io.Schema(
             node_id="HiFlow",
             display_name="HiFlow",
-            category="image/upscaling",
+            category="WMNodes/image",
             description=(
                 "Training-free high-resolution upscaling for rectified-flow "
                 "models (FLUX, Qwen-Image, ...) via flow-aligned guidance. "
@@ -540,7 +545,10 @@ class HiFlowNode(io.ComfyNode):
             )
 
         # Progress: base transitions + per-stage transitions (upper bound).
-        from .hiflow import _stage_latent_sizes
+        try:
+            from ..src.hiflow import _stage_latent_sizes
+        except ImportError:
+            from src.hiflow import _stage_latent_sizes
         sizes = _stage_latent_sizes(
             initial_latent.shape[-2], initial_latent.shape[-1],
             float(scale_factor), _downscale_ratio(vae),
