@@ -17,9 +17,14 @@ import torch
 import torch.nn.functional as F
 from comfy_api.latest import io
 
-from .freescale import (
-    forward_noise,
-)
+try:
+    from ..src.freescale import (
+        forward_noise,
+    )
+except ImportError:  # flat repo layout (tests / CLI)
+    from src.freescale import (
+        forward_noise,
+    )
 
 logger = logging.getLogger("ComfyUI-DyPE")
 
@@ -267,7 +272,7 @@ class FreeScaleNode(io.ComfyNode):
         return io.Schema(
             node_id="FreeScale",
             display_name="FreeScale",
-            category="image/upscaling",
+            category="WMNodes/image",
             description="Tuning-free higher-resolution generation via scale fusion. Works with SDXL, Flux, and other models.",
             inputs=[
                 io.Model.Input("model", tooltip="The diffusion model."),

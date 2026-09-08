@@ -13,7 +13,10 @@ import logging
 import torch
 from comfy_api.latest import io
 
-from .pixelrush import PixelRushConfig, pixelrush_cascade
+try:
+    from ..src.pixelrush import PixelRushConfig, pixelrush_cascade
+except ImportError:  # flat repo layout (tests / CLI)
+    from src.pixelrush import PixelRushConfig, pixelrush_cascade
 
 logger = logging.getLogger("ComfyUI-DyPE")
 
@@ -509,7 +512,7 @@ class PixelRushNode(io.ComfyNode):
         return io.Schema(
             node_id="PixelRush",
             display_name="PixelRush",
-            category="image/upscaling",
+            category="WMNodes/image",
             description="Cascade-based high-resolution generation via partial DDIM inversion + patch denoising. Works with SDXL, SD1.5, and other models.",
             inputs=[
                 io.Model.Input("model", tooltip="The diffusion model."),
@@ -690,7 +693,10 @@ class PixelRushNode(io.ComfyNode):
 
         # Pre-compute total patches across all cascade stages for the progress bar.
         # Each stage doubles the latent spatial dimensions.
-        from .pixelrush import patch_positions
+        try:
+            from ..src.pixelrush import patch_positions
+        except ImportError:
+            from src.pixelrush import patch_positions
 
         total_patches = 0
         stage_patch_counts = []

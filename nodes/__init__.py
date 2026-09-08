@@ -4,10 +4,6 @@ Every ComfyUI-facing node class (``io.ComfyNode`` schema + execute wiring)
 lives in this package; engines/implementation live in ``src/``. This
 ``__init__`` re-exports the full node surface so the pack entry point and
 tests can import everything from one place.
-
-Transitional note: the four cascade/calibration node classes still live in
-``src/*_node.py`` until their move lands (S2/S3); their re-exports below
-switch to local ``nodes/`` modules as each move lands.
 """
 
 from .dype import DyPE_FLUX
@@ -15,16 +11,9 @@ from .sega import SEGA
 from .spa import SPA
 from .hap import HAP
 from .hap_calibrate import HAPCalibrate
-
-# Transitional re-exports (S3 moves each module into nodes/):
-try:  # loaded as pack package (ComfyUI loader)
-    from ..src.hiflow_node import HiFlowNode
-    from ..src.pixelrush_node import PixelRushNode
-    from ..src.freescale_node import FreeScaleNode
-except ImportError:  # flat repo layout (tests / CLI)
-    from src.hiflow_node import HiFlowNode
-    from src.pixelrush_node import PixelRushNode
-    from src.freescale_node import FreeScaleNode
+from .pixelrush import PixelRushNode
+from .freescale import FreeScaleNode
+from .hiflow import HiFlowNode
 
 __all__ = [
     "DyPE_FLUX",
@@ -32,7 +21,7 @@ __all__ = [
     "SPA",
     "HAP",
     "HAPCalibrate",
-    "HiFlowNode",
     "PixelRushNode",
     "FreeScaleNode",
+    "HiFlowNode",
 ]
