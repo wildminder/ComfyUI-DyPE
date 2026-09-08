@@ -719,14 +719,24 @@ def collect_scope_scores_for_model(
     """
     import importlib
 
-    from .hap_calib import (
+    try:
+        from ..src.hap_calib import (
         _chunk_row_scores,
         calibration_cost_table,
         chunked_attention,
-    )
+        )
+    except ImportError:
+        from src.hap_calib import (
+        _chunk_row_scores,
+        calibration_cost_table,
+        chunked_attention,
+        )
 
     # Determine patch targets.
-    from .spa import _spa_patch_targets, _spa_resolve_type
+    try:
+        from ..src.spa import _spa_patch_targets, _spa_resolve_type
+    except ImportError:
+        from src.spa import _spa_patch_targets, _spa_resolve_type
 
     if model_type == "auto":
         try:
@@ -778,7 +788,10 @@ def collect_scope_scores_for_model(
         Mirrors the pre-checkpointing convention: HRDiT wrapper counter minus one
         when a wrapper is live, else the sequential call index.
         """
-        from .spa_context import get_hrdit_layer_idx
+        try:
+            from ..src.spa_context import get_hrdit_layer_idx
+        except ImportError:
+            from src.spa_context import get_hrdit_layer_idx
         cur = get_hrdit_layer_idx()
         return (cur - 1) if cur > 0 else call_counter[0]
 
@@ -1328,8 +1341,14 @@ def run_hap_calibration(
     Raises:
         RuntimeError: if HAP is already active on the model (D11 guard).
     """
-    from .hap import ScopePlan, flops_ratio
-    from .hap_calib import calibrate_scope_plan
+    try:
+        from ..src.hap import ScopePlan, flops_ratio
+    except ImportError:
+        from src.hap import ScopePlan, flops_ratio
+    try:
+        from ..src.hap_calib import calibrate_scope_plan
+    except ImportError:
+        from src.hap_calib import calibrate_scope_plan
 
     spec.validate()
 
@@ -1518,7 +1537,10 @@ def write_scope_plan(
         ValueError: if ``name`` contains path separators or the round-trip
             validation fails.
     """
-    from .hap import ScopePlan
+    try:
+        from ..src.hap import ScopePlan
+    except ImportError:
+        from src.hap import ScopePlan
 
     if os.sep in name or "/" in name or "\\" in name:
         raise ValueError(
@@ -1547,7 +1569,7 @@ def _define_hap_calibrate_schema():
     return io.Schema(
         node_id="HAPCalibrate",
         display_name="HAP Calibrate (HRDiT)",
-        category="model_patches/position_encoding",
+        category="WMNodes/image",
         description=(
             "Calibrates a per-head HAP scope plan for this model + resolution. "
             "Runs one denoising step per calibration prompt, collects attention "

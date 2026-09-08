@@ -14,15 +14,14 @@ from .dype import DyPE_FLUX
 from .sega import SEGA
 from .spa import SPA
 from .hap import HAP
+from .hap_calibrate import HAPCalibrate
 
-# Transitional re-exports (S2/S3 move each module into nodes/):
+# Transitional re-exports (S3 moves each module into nodes/):
 try:  # loaded as pack package (ComfyUI loader)
-    from ..src.hap_calib_node import HAPCalibrate
     from ..src.hiflow_node import HiFlowNode
     from ..src.pixelrush_node import PixelRushNode
     from ..src.freescale_node import FreeScaleNode
 except ImportError:  # flat repo layout (tests / CLI)
-    from src.hap_calib_node import HAPCalibrate
     from src.hiflow_node import HiFlowNode
     from src.pixelrush_node import PixelRushNode
     from src.freescale_node import FreeScaleNode

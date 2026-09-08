@@ -10,7 +10,7 @@ import sys
 import pytest
 import torch
 
-from src.hap_calib_node import make_calibration_loss
+from nodes.hap_calibrate import make_calibration_loss
 
 # ---------------------------------------------------------------------------
 # T1.1 — output_norm

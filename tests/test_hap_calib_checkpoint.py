@@ -10,11 +10,11 @@ backward-replay layer-key scheme.
 
 Tested here (all CPU-safe, no real model / no CUDA required):
 
-- :func:`src.hap_calib_node._find_block_list` — generic block detection
+- :func:`nodes.hap_calibrate._find_block_list` — generic block detection
   (single list, multi-list Flux-style, identity dedup, empty).
-- :func:`src.hap_calib_node._install_block_checkpointing` /
+- :func:`nodes.hap_calibrate._install_block_checkpointing` /
   :func:`_uninstall_block_checkpointing` — wrap + restore block forwards.
-- :func:`src.hap_calib_node._flush_gpu_allocator` — no-op safe without CUDA.
+- :func:`nodes.hap_calibrate._flush_gpu_allocator` — no-op safe without CUDA.
 - **Correctness (the critical test):** ``collect_scope_scores_for_model`` on a
   block-structured toy DiT (checkpointing auto-active) produces scores IDENTICAL
   to (a) the same collector with checkpointing disabled and (b) a dense
@@ -33,7 +33,7 @@ import types
 import pytest
 import torch
 
-from src import hap_calib_node as hcn
+import nodes.hap_calibrate as hcn
 
 # ---------------------------------------------------------------------------
 # Toy block-structured DiT (real nn.Module blocks so checkpointing activates)

@@ -9,7 +9,7 @@ import os
 
 import pytest
 
-from src.hap_calib_node import (
+from nodes.hap_calibrate import (
     DEFAULT_CALIBRATION_PROMPTS,
     CalibrationSpec,
     resolve_prompts,
@@ -162,7 +162,7 @@ class TestResolvePrompts:
 class TestCliSingleSource:
     def test_cli_imports_default_prompts(self):
         """The CLI script re-imports DEFAULT_CALIBRATION_PROMPTS from
-        src.hap_calib_node (single source, no drift)."""
+        nodes.hap_calibrate (single source, no drift)."""
         import importlib.util
 
         root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))

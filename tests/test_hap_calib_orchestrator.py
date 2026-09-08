@@ -19,9 +19,9 @@ import types
 import pytest
 import torch
 
-import src.hap_calib_node as hcn
+import nodes.hap_calibrate as hcn
 from src.hap import ScopePlan, flops_ratio
-from src.hap_calib_node import (
+from nodes.hap_calibrate import (
     CalibrationSpec,
     format_summary,
     run_hap_calibration,
@@ -274,7 +274,7 @@ class TestPurgeBetweenPrompts:
     def test_schema_has_purge_input_with_default_false(self):
         """The node schema exposes purge_between_prompts defaulting to False."""
         src = (
-            pathlib.Path(__file__).parent.parent / "src" / "hap_calib_node.py"
+            pathlib.Path(__file__).parent.parent / "nodes" / "hap_calibrate.py"
         ).read_text(encoding="utf-8")
         assert '"purge_between_prompts"' in src
         assert "purge_between_prompts: bool = False" in src

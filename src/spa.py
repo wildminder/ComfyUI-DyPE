@@ -1031,7 +1031,7 @@ def _make_hrdit_wrapper(orig, is_masked: bool):
                 # so it NEEDS the flattened layout.  The pre-fix wrapper returned
                 # the head-format output as-is, crashing the elementwise multiply.
                 #
-                # Mirror the calibration path EXACTLY (hap_calib_node.py:919-923):
+                # Mirror the calibration path EXACTLY (nodes/hap_calibrate.py — calibration path):
                 #   skip_output_reshape=True  -> head format (B, H, T, D) as-is
                 #   skip_output_reshape=False -> flatten to (B, T, H*D)
                 # This fixes both the direct HAP path and the SPA-averaged path

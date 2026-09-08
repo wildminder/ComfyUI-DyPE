@@ -1,7 +1,7 @@
 """Tests for the HAPCalibrate node (plan P5: T5.1-T5.5).
 
 The node *wiring* (schema, inputs, registration) is covered by text-checks
-that read ``__init__.py`` / ``src/hap_calib_node.py`` directly — the same
+that read ``__init__.py`` / ``nodes/hap_calibrate.py`` directly — the same
 pattern as ``tests/test_hap_node.py``.  Functional behaviour is exercised via
 ``HAPCalibrate.execute`` with an injected forward (monkeypatched
 ``run_hap_calibration``).
@@ -15,12 +15,12 @@ import pathlib
 
 import pytest
 
-import src.hap_calib_node as hcn
-from src.hap_calib_node import HAPCalibrate
+import nodes.hap_calibrate as hcn
+from nodes.hap_calibrate import HAPCalibrate
 
 _ROOT = pathlib.Path(__file__).parent.parent
 _INIT = _ROOT / "__init__.py"
-_NODE_SRC = _ROOT / "src" / "hap_calib_node.py"
+_NODE_SRC = _ROOT / "nodes" / "hap_calibrate.py"
 
 
 # ---------------------------------------------------------------------------
@@ -46,7 +46,7 @@ class TestSchemaInputs:
         src = _NODE_SRC.read_text(encoding="utf-8")
         assert 'node_id="HAPCalibrate"' in src
         assert 'display_name="HAP Calibrate (HRDiT)"' in src
-        assert 'category="model_patches/position_encoding"' in src
+        assert 'category="WMNodes/image"' in src
 
     def test_outputs_present(self):
         src = _NODE_SRC.read_text(encoding="utf-8")

@@ -18,8 +18,8 @@ import sys
 import pytest
 import torch
 
-import src.hap_calib_node as hcn
-from src.hap_calib_node import (
+import nodes.hap_calibrate as hcn
+from nodes.hap_calibrate import (
     CalibrationSpec,
     calibration_forward,
     collect_scope_scores_for_model,
