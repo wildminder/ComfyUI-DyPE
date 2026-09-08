@@ -40,7 +40,7 @@ from src.spa_context import (
     set_spa_step_gate,
 )
 
-_INIT = pathlib.Path(__file__).parent.parent / "__init__.py"
+_NODES = pathlib.Path(__file__).parent.parent / "nodes"
 
 
 # ---------------------------------------------------------------------------
@@ -373,19 +373,19 @@ def _make_flux_patcher():
 @pytest.mark.unit
 class TestFilterNodeKnobs:
     def _content(self):
-        return _INIT.read_text(encoding="utf-8")
+        # SPA node class lives in nodes/spa.py since the 2026-09-08 layout
+        # plan; HAP section checks read nodes/hap.py.
+        return (_NODES / "spa.py").read_text(encoding="utf-8")
 
     def test_schema_has_filter_input(self):
-        content = self._content()
-        start = content.index("class SPA(io.ComfyNode):")
-        end = content.index("class HAP(io.ComfyNode):")
-        assert '"spa_layer_filter"' in content[start:end]
+        # SPA node module ends after the class (2026-09-08 layout plan).
+        section = self._content()[self._content().index("class SPA(io.ComfyNode):"):]
+        assert '"spa_layer_filter"' in section
 
     def test_schema_filter_default_empty(self):
         content = self._content()
         start = content.index("class SPA(io.ComfyNode):")
-        end = content.index("class HAP(io.ComfyNode):")
-        section = content[start:end]
+        section = content[start:]
         idx = section.index('"spa_layer_filter"')
         assert 'default=""' in section[idx:idx + 200]
 

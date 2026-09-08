@@ -178,16 +178,22 @@ class TestExecuteErrors:
 @pytest.mark.unit
 class TestRegistration:
     def test_imported_in_init(self):
+        """Entry imports node classes from the .nodes package (layout plan
+        2026-09-08); HAPCalibrate itself still lives in the (pre-move)
+        node module re-exported by nodes/__init__."""
         src = _INIT.read_text(encoding="utf-8")
-        assert "from .src.hap_calib_node import HAPCalibrate" in src
+        assert "from .nodes import" in src
+        nodes_init = (_ROOT / "nodes" / "__init__.py").read_text(encoding="utf-8")
+        assert "HAPCalibrate" in nodes_init
 
     def test_listed_in_node_list(self):
         src = _INIT.read_text(encoding="utf-8")
         assert "HAPCalibrate" in src.split("get_node_list")[1]
 
     def test_hap_node_accepts_scope_plan_input(self):
-        """The HAP node gained the optional SCOPE_PLAN input (plan P4.3)."""
-        src = _INIT.read_text(encoding="utf-8")
+        """The HAP node gained the optional SCOPE_PLAN input (plan P4.3).
+        HAP class body lives in nodes/hap.py (layout plan 2026-09-08)."""
+        src = (_ROOT / "nodes" / "hap.py").read_text(encoding="utf-8")
         assert 'io.Custom("SCOPE_PLAN").Input(' in src
         assert '"scope_plan"' in src
         # execute prefers the linked plan.

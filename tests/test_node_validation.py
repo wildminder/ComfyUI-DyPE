@@ -205,5 +205,5 @@ class TestNodeValidateInputsWiring:
         """HAP has NO width/height inputs by design — no graph-I/O validation
         is added there (plan W5.2 decision).  This replaces the pre-W5 guard
         that forbade validate_inputs entirely."""
-        content = (pathlib.Path(__file__).parent.parent / "__init__.py").read_text(encoding="utf-8")
+        content = (pathlib.Path(__file__).parent.parent / "nodes" / "hap.py").read_text(encoding="utf-8")
         assert "class HAP(" in content
