@@ -14,8 +14,10 @@ import torch
 from comfy_api.latest import io
 
 try:
+    from ..src.effective_sampling import effective_model_sampling
     from ..src.pixelrush import PixelRushConfig, pixelrush_cascade
-except ImportError:  # flat repo layout (tests / CLI)
+except ImportError:
+    from src.effective_sampling import effective_model_sampling
     from src.pixelrush import PixelRushConfig, pixelrush_cascade
 
 logger = logging.getLogger("ComfyUI-DyPE")
@@ -31,7 +33,7 @@ def _scale_k_timestep(model, k_timestep):
     Returns the scaled k_timestep (0-1 range for flow models, unchanged for EPS).
     """
     try:
-        ms = model.model.model_sampling
+        ms = effective_model_sampling(model)
         sigma_max = ms.sigma_max
         timestep_at_max = ms.timestep(sigma_max)
         if timestep_at_max <= 1.0 + 1e-3:
@@ -175,7 +177,7 @@ def _make_predict_eps(model, positive, negative, cfg_scale, latent_dimensions=2)
     model.pre_run()
 
     # Detect prediction type and create conversion functions
-    model_sampling = model.model.model_sampling
+    model_sampling = effective_model_sampling(model)
     prediction_type = _detect_prediction_type(model_sampling)
     model_output_to_eps = _make_model_output_to_eps(model_sampling, prediction_type)
     logger.info("PixelRush: detected model prediction type '%s'", prediction_type)
@@ -226,7 +228,7 @@ def _make_predict_eps(model, positive, negative, cfg_scale, latent_dimensions=2)
         # The timestep is a value in the model's internal timestep space,
         # NOT an index into the sigmas array (which has only ~20 entries).
         ts_tensor = torch.tensor([float(timestep)], device=device)
-        sigma_val = model.model.model_sampling.sigma(ts_tensor).item()
+        sigma_val = model_sampling.sigma(ts_tensor).item()
         # Clamp to small minimum to avoid division-by-zero in epsilon extraction
         # (timestep=0 gives sigma=0, which would make eps = (x - x0) / 0 = NaN)
         sigma_val = max(sigma_val, 1e-6)
@@ -258,7 +260,7 @@ def _make_predict_eps(model, positive, negative, cfg_scale, latent_dimensions=2)
             # Replicate _apply_model's logic but skip calculate_denoised to get
             # the raw model_output (velocity for CONST, epsilon for EPS, etc.)
             m = model.model
-            ms = m.model_sampling
+            ms = model_sampling
             xc = ms.calculate_input(sigma, p.input_x)
             if c.get('c_concat') is not None:
                 xc = torch.cat([xc] + [comfy.model_management.cast_to_device(
@@ -348,7 +350,7 @@ def _make_forward_step(model, process_latent_in=None, process_latent_out=None):
     this fix the noise component arrived scaled by the format factor
     (7.7x too small for SDXL) and the input SNR did not match sigma.
     """
-    ms = model.model.model_sampling
+    ms = effective_model_sampling(model)
     if process_latent_in is None:
         process_latent_in = lambda t: t
     if process_latent_out is None:
@@ -374,7 +376,7 @@ def _make_reverse_step(model, process_latent_in=None, process_latent_out=None):
     recovers x0, and converts the result back to VAE space. The two
     conversions cancel exactly on a forward/reverse round trip.
     """
-    ms = model.model.model_sampling
+    ms = effective_model_sampling(model)
     prediction_type = _detect_prediction_type(ms)
     eps_to_x0 = _make_eps_to_x0(ms, prediction_type)
     if process_latent_in is None:
@@ -392,7 +394,7 @@ def _make_reverse_step(model, process_latent_in=None, process_latent_out=None):
 
 def _make_sigma_at(model):
     """Create a sigma_at adapter: timestep (0-999) -> sigma float."""
-    ms = model.model.model_sampling
+    ms = effective_model_sampling(model)
 
     def sigma_at(timestep):
         ts_tensor = torch.tensor([float(timestep)], device=model.load_device
@@ -411,7 +413,7 @@ def _make_alpha_bar_at(model):
 
     Returns a callable: alpha_bar_at(timestep) -> float
     """
-    model_sampling = model.model.model_sampling
+    model_sampling = effective_model_sampling(model)
 
     def alpha_bar_at(timestep: int) -> float:
         # Convert timestep to sigma using the model's internal conversion
