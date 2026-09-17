@@ -1000,3 +1000,130 @@ class TestHiFlowDocs:
         unknown = types - core - {"HiFlow"}
         assert not unknown, f"workflow references unknown nodes: {unknown}"
         assert "HiFlow" in types
+
+
+# ---------------------------------------------------------------------------
+# Effective-sampling determinism (v2.16.0, plan S2)
+# ---------------------------------------------------------------------------
+
+class _PatcherFacade:
+    """Wraps a _mock_flow_model with ModelPatcher semantics.
+
+    Provides get_model_object (object_patches -> object_patches_backup ->
+    live attr — the real ModelPatcher order, model_patcher.py:758-768) and
+    delegates the patcher-level attributes the node layer touches.
+    """
+
+    def __init__(self, inner, object_patches=None, object_patches_backup=None):
+        self.model = inner.model
+        self.model_options = inner.model_options
+        self.load_device = inner.load_device
+        self.pre_run = inner.pre_run
+        self.object_patches = dict(object_patches or {})
+        self.object_patches_backup = dict(object_patches_backup or {})
+
+    def get_model_object(self, name):
+        if name in self.object_patches:
+            return self.object_patches[name]
+        if name in self.object_patches_backup:
+            return self.object_patches_backup[name]
+        return getattr(self.model, name)
+
+
+def _install_recording_calculate_sigmas(monkeypatch):
+    """Fake comfy.samplers.calculate_sigmas that records the ms object."""
+    used = []
+    fake_samplers = types.ModuleType("comfy.samplers")
+
+    def calculate_sigmas(ms, scheduler, steps):
+        used.append(ms)
+        return torch.linspace(1.0, 0.0, steps + 1)
+
+    fake_samplers.calculate_sigmas = calculate_sigmas
+    monkeypatch.setitem(sys.modules, "comfy.samplers", fake_samplers)
+    comfy_mod = sys.modules.get("comfy")
+    if comfy_mod is not None:
+        monkeypatch.setattr(
+            comfy_mod, "samplers", fake_samplers, raising=False)
+    return used
+
+
+@pytest.mark.unit
+class TestEffectiveSamplingDeterminism:
+    """S2 (v2.16.0): the schedule, the timestep conversion and the flow gate
+    must follow the graph's OWN patch chain — never a model_sampling leaked
+    onto the shared BaseModel by a previous run's patch node."""
+
+    def _patched_patcher(self, live_leak, patch_ms):
+        model = _mock_flow_model()
+        return _PatcherFacade(
+            model, object_patches={"model_sampling": patch_ms}), model
+
+    def test_base_sigmas_follow_own_patch_not_leak(self, monkeypatch):
+        used = _install_recording_calculate_sigmas(monkeypatch)
+        patch_ms = type(
+            "PatchedSampling", (), {"timestep": lambda self, s: s * 1000})()
+        leak_ms = type("LeakedSampling", (), {})()
+        patcher, _ = self._patched_patcher(leak_ms, patch_ms)
+        hfn._base_sigmas(patcher, steps=8)
+        assert used[-1] is patch_ms, (
+            "schedule must derive from the patcher's own object patch, not "
+            "the leaked live attribute"
+        )
+
+    def test_base_sigmas_use_backup_original_when_unpatched(self, monkeypatch):
+        used = _install_recording_calculate_sigmas(monkeypatch)
+        orig_ms = type("OrigSampling", (), {})()
+        leak_ms = type("LeakedSampling", (), {})()
+        model = _mock_flow_model()
+        model.model.model_sampling = leak_ms
+        patcher = _PatcherFacade(
+            model, object_patches_backup={"model_sampling": orig_ms})
+        hfn._base_sigmas(patcher, steps=8)
+        assert used[-1] is orig_ms, (
+            "an unpatched patcher must resolve the backup original, not the "
+            "leak"
+        )
+
+    def test_base_sigmas_fall_back_to_live_when_nothing_else(self, monkeypatch):
+        used = _install_recording_calculate_sigmas(monkeypatch)
+        model = _mock_flow_model()  # SimpleNamespace: no get_model_object
+        hfn._base_sigmas(model, steps=8)
+        assert used[-1] is model.model.model_sampling
+
+    def test_flow_gate_not_flipped_by_leaked_live(self):
+        # A leaked EPS-family sampling on the BaseModel must not make the
+        # gate reject a flow model whose OWN patch is CONST.
+        patch_ms = type(
+            "PatchedConst", (type("CONST", (), {}),), {})()
+        leak_ms = type(
+            "LeakedEps", (type("EPS", (), {}),), {})()
+        model = _mock_flow_model()
+        model.model.model_sampling = leak_ms
+        patcher = _PatcherFacade(
+            model, object_patches={"model_sampling": patch_ms})
+        family, dims = hfn._require_flow_model(patcher)
+        assert family == "const"
+        assert dims == 2
+
+    def test_predict_x0_timestep_from_resolved_object(self, monkeypatch):
+        """The adapter's timestep conversion uses the SAME resolved object
+        as the schedule (identity between schedule and conversion)."""
+        fx = _install_fake_comfy(monkeypatch)
+        patch_ms = type(
+            "PatchedSampling", (), {"timestep": lambda self, s: s * 2000.0})()
+        leak_ms = type(
+            "LeakedSampling", (), {"timestep": lambda self, s: s * 1000.0})()
+        model = _mock_flow_model()
+        model.model.model_sampling = leak_ms
+        patcher = _PatcherFacade(
+            model, object_patches={"model_sampling": patch_ms})
+        adapter = hfn._make_predict_x0(
+            patcher, COND_POS, COND_NEG, cfg_scale=3.5)
+        x = torch.zeros(1, 16, 8, 8)
+        adapter(x, 0.5)
+        recorded_timestep = fx.sampling_calls[-1]["timestep"]
+        assert float(recorded_timestep.flatten()[0]) == pytest.approx(1000.0), (
+            "timestep must come from the patch object (0.5 * 2000), not the "
+            "leaked live attr (0.5 * 1000)"
+        )

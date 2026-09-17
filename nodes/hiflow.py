@@ -19,9 +19,11 @@ import torch
 from comfy_api.latest import io
 
 try:
+    from ..src.effective_sampling import effective_model_sampling
     from ..src.freescale import gaussian_blur_2d
     from ..src.hiflow import HiFlowConfig, hiflow_cascade
 except ImportError:  # flat repo layout (tests / CLI)
+    from src.effective_sampling import effective_model_sampling
     from src.freescale import gaussian_blur_2d
     from src.hiflow import HiFlowConfig, hiflow_cascade
 
@@ -49,7 +51,10 @@ def _require_flow_model(model) -> tuple[str, int]:
 
     Returns (detected flow family, latent_dimensions).
     """
-    model_sampling = model.model.model_sampling
+    # Patch-resolved (KSampler semantics, v2.16.0): the live BaseModel attr is
+    # history-dependent under ComfyUI's object-patch lifecycle — a schedule
+    # leaked by a previous run's patch node must not flip this gate.
+    model_sampling = effective_model_sampling(model)
     mro_names = [c.__name__ for c in type(model_sampling).__mro__]
 
     detected = _detect_prediction_type(model_sampling)
@@ -106,6 +111,10 @@ def _make_predict_x0(
     device = model.load_device if hasattr(model, "load_device") \
         else torch.device("cpu")
     inner_model = model.model
+    # ONE patch-resolved sampling object for the whole adapter (v2.16.0): the
+    # sigma schedule (_base_sigmas) and this timestep conversion must come
+    # from the same source, independent of object-patch load history.
+    model_sampling = effective_model_sampling(model)
     process_latent_in = getattr(inner_model, "process_latent_in", None)
     process_latent_out = getattr(inner_model, "process_latent_out", None)
 
@@ -170,7 +179,7 @@ def _make_predict_x0(
 
         conds = _get_conds(tuple(x_vae.shape))
         sigma_t = torch.tensor([float(sigma)], device=device)
-        timestep = inner_model.model_sampling.timestep(sigma_t)
+        timestep = model_sampling.timestep(sigma_t)
 
         x0 = comfy.samplers.sampling_function(
             inner_model, x, timestep,
@@ -277,10 +286,13 @@ def _base_sigmas(model, steps: int) -> torch.Tensor:
 
     Uses comfy.samplers.calculate_sigmas with the "simple" scheduler (index
     sampling of the model's sigmas — no spacing resampling), ending at 0.
+    Resolved through the patcher (v2.16.0) — KSampler semantics: a DyPE/SEGA
+    schedule patch in THIS graph is always honored; a schedule leaked onto the
+    shared BaseModel by a previous run's patch node never is.
     """
     import comfy.samplers
 
-    ms = model.model.model_sampling
+    ms = effective_model_sampling(model)
     sigmas = comfy.samplers.calculate_sigmas(ms, "simple", steps)
     return sigmas.float().cpu()
 
