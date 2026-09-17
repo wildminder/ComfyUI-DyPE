@@ -3,6 +3,8 @@ import math
 
 logger = logging.getLogger("ComfyUI-DyPE")
 from comfy import model_sampling
+
+from .effective_sampling import effective_model_sampling
 from comfy.model_patcher import ModelPatcher
 
 from .models.anima import PosEmbedAnima
@@ -19,6 +21,18 @@ from .sega import compute_axis_spectral_profiles, compute_dynamic_spread, comput
 
 # Namespaced attribute for cache invalidation (stored on ModelPatcher, not raw model)
 _DYPE_PARAMS_ATTR = "_comfyui_dype_params"
+
+
+def _should_patch_schedule(m: ModelPatcher, is_qwen: bool, is_z_image: bool) -> bool:
+    """Whether the DyPE/SEGA noise-schedule patch applies to this model.
+
+    Resolves the sampling through the patcher (v2.16.0): the live BaseModel
+    attribute is history-dependent under ComfyUI's object-patch lifecycle, so
+    a leaked ``*ModelSamplingFlux`` from a PREVIOUS run must not flip this
+    decision. Patch -> backup -> live (KSampler semantics).
+    """
+    return (isinstance(effective_model_sampling(m), model_sampling.ModelSamplingFlux)
+            or is_qwen or is_z_image)
 
 
 def _snap_to_multiple(value: int, multiple: int = 16) -> int:
@@ -143,7 +157,7 @@ def apply_dype_to_model(model: ModelPatcher, model_type: str, width: int, height
 
     if enable_dype and should_patch_schedule and not is_anima:
         try:
-            if isinstance(m.model.model_sampling, model_sampling.ModelSamplingFlux) or is_qwen or is_z_image:
+            if _should_patch_schedule(m, is_qwen, is_z_image):
                 latent_h, latent_w = height // 8, width // 8
                 padded_h, padded_w = math.ceil(latent_h / patch_size) * patch_size, math.ceil(latent_w / patch_size) * patch_size
                 image_seq_len = (padded_h // patch_size) * (padded_w // patch_size)
@@ -257,7 +271,7 @@ def apply_dype_to_model(model: ModelPatcher, model_type: str, width: int, height
         zimage_freq_scale_factor = max(1.0, 1.0 / iso_scale)
         logger.debug(f"DyPE Z-Image: scale hint = {zimage_freq_scale_factor:.4f} (iso_scale={iso_scale:.4f})")
 
-    sigma_max = m.model.model_sampling.sigma_max.item()
+    sigma_max = effective_model_sampling(m).sigma_max.item()
 
     def dype_wrapper_function(model_function, args_dict):
         timestep_tensor = args_dict.get("timestep")
@@ -334,7 +348,7 @@ def apply_sega_to_model(
     # --- Noise schedule patching (same as DyPE, except Anima) ---
     if not is_anima:
         try:
-            if isinstance(m.model.model_sampling, model_sampling.ModelSamplingFlux) or is_qwen or is_z_image:
+            if _should_patch_schedule(m, is_qwen, is_z_image):
                 latent_h, latent_w = height // 8, width // 8
                 padded_h, padded_w = math.ceil(latent_h / patch_size) * patch_size, math.ceil(latent_w / patch_size) * patch_size
                 image_seq_len = (padded_h // patch_size) * (padded_w // patch_size)
@@ -455,7 +469,7 @@ def apply_sega_to_model(
     else:
         zimage_freq_scale_factor = 1.0
 
-    sigma_max = m.model.model_sampling.sigma_max.item()
+    sigma_max = effective_model_sampling(m).sigma_max.item()
 
     # --- SEGA wrapper: computes spectral profiles from latent at each step ---
     def sega_wrapper_function(model_function, args_dict):
