@@ -913,7 +913,7 @@ class TestHiFlowNodeSchema:
         for inp in ["model", "vae", "positive", "negative", "latent_image",
                     "cfg", "steps", "guidance", "steps_per_stage", "tau",
                     "filter_ratio", "alpha_scale", "beta_scale", "upsampling",
-                    "scale_factor"]:
+                    "scale_factor", "sharpen"]:
             assert f'"{inp}"' in src, f"missing schema input {inp}"
         assert "default=3.5" in src     # cfg (FLUX-dev)
         assert "default=30" in src      # steps (paper)
@@ -922,6 +922,7 @@ class TestHiFlowNodeSchema:
         assert "default=0.6" in src     # tau (paper 1K->2K)
         assert "default=0.2" in src     # filter_ratio (repo)
         assert 'default="latent"' in src
+        assert "default=1.0, min=0.0, max=3.0" in src  # sharpen (v2.16.0)
 
     def test_schema_execute_signature_matches(self):
         import re
@@ -1111,3 +1112,94 @@ class TestEffectiveSamplingDeterminism:
             "timestep must come from the patch object (0.5 * 2000), not the "
             "leaked live attr (0.5 * 1000)"
         )
+
+
+# ---------------------------------------------------------------------------
+# Sharpen control + positional-patch warning (v2.16.0, plan S7)
+# ---------------------------------------------------------------------------
+
+@pytest.mark.unit
+class TestSharpenControl:
+    def _two_tone(self, h=32, w=32):
+        img = torch.zeros(1, h, w, 3)
+        img[:, :, w // 2:, :] = 1.0  # hard vertical tone boundary
+        return img
+
+    @staticmethod
+    def _overshoot(out, w=32):
+        # Positive excursion beyond the high tone along the boundary column.
+        return float(out[:, :, w // 2 + 1, :].max() - 1.0)
+
+    def test_default_alpha_matches_reference(self):
+        img = self._two_tone()
+        assert torch.allclose(hfn._sharpen(img), hfn._sharpen(img, alpha=1.0))
+
+    def test_alpha_zero_disables_unsharp(self):
+        img = self._two_tone()
+        out = hfn._sharpen(img, alpha=0.0)
+        assert torch.equal(out, img), "sharpen=0 must return the image unchanged"
+
+    def test_alpha_zero_preserves_5d_backstop_layout(self):
+        img5 = torch.zeros(1, 1, 8, 8, 3)
+        out = hfn._sharpen(img5, alpha=0.0)
+        assert out.shape == img5.shape
+
+    def test_default_sharpen_creates_boundary_overshoot(self):
+        """Quantifies issue 2, factor 2: the reference unsharp pushes the
+        high tone ABOVE its level at the boundary (over-sharpened rims)."""
+        img = self._two_tone()
+        assert self._overshoot(hfn._sharpen(img, alpha=1.0)) > 0.05
+        assert self._overshoot(hfn._sharpen(img, alpha=0.0)) == 0.0
+
+
+@pytest.mark.unit
+class TestPositionalPatchWarning:
+    def _run(self, monkeypatch, scale=2.0, positional=None):
+        FakePBar = _install_fake_pbar_utils(monkeypatch)
+        _install_fake_comfy(monkeypatch)
+        fake_samplers = sys.modules["comfy.samplers"]
+        fake_samplers.calculate_sigmas = (
+            lambda ms, scheduler, steps:
+            torch.cat([torch.linspace(1.0, 0.1, steps), torch.zeros(1)])
+        )
+        model = _mock_flow_model()
+        if positional:
+            model.object_patches = positional
+        vae = types.SimpleNamespace(
+            decode=lambda z: torch.randn(
+                z.shape[0], z.shape[-2] * 8, z.shape[-1] * 8, 3),
+            encode=lambda im: {"samples": torch.randn(
+                1, 16, im.shape[-3] // 8, im.shape[-2] // 8)},
+            downscale_ratio=8,
+        )
+        z = torch.randn(1, 16, 16, 16)
+        hfn.HiFlowNode.execute(
+            model, vae, COND_POS, COND_NEG, {"samples": z},
+            cfg=3.5, steps=4, guidance=4.5, steps_per_stage=2,
+            tau=0.5, filter_ratio=0.2, alpha_scale=1.0, beta_scale=0.5,
+            upsampling="latent", scale_factor=scale, sharpen=0.0,
+            noise_seed=0, denoise=1.0,
+        )
+
+    def test_warns_without_positional_patch(self, monkeypatch, caplog):
+        import logging
+        with caplog.at_level(logging.WARNING, logger="ComfyUI-DyPE"):
+            self._run(monkeypatch, scale=2.0)
+        assert any("positional-embedding patch" in r.message
+                   for r in caplog.records)
+
+    def test_silent_with_dype_patcher(self, monkeypatch, caplog):
+        import logging
+        with caplog.at_level(logging.WARNING, logger="ComfyUI-DyPE"):
+            self._run(
+                monkeypatch, scale=2.0,
+                positional={"diffusion_model.pe_embedder": object()})
+        assert not any("positional-embedding patch" in r.message
+                       for r in caplog.records)
+
+    def test_silent_at_scale_one(self, monkeypatch, caplog):
+        import logging
+        with caplog.at_level(logging.WARNING, logger="ComfyUI-DyPE"):
+            self._run(monkeypatch, scale=1.0)
+        assert not any("positional-embedding patch" in r.message
+                       for r in caplog.records)
