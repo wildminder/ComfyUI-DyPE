@@ -983,8 +983,8 @@ class TestHiFlowDocs:
         readme = (pathlib.Path(__file__).parent.parent
                   / "README.md").read_text(encoding="utf-8")
         m = re.search(r'^version = "([^"]+)"', pyproject, re.MULTILINE)
-        assert m and m.group(1) == "2.15.0"
-        assert "### v2.15.0" in readme
+        assert m and m.group(1) == "2.16.0"
+        assert "### v2.16.0" in readme
 
 
 # ---------------------------------------------------------------------------
@@ -1155,7 +1155,7 @@ class TestSharpenControl:
 @pytest.mark.unit
 class TestPositionalPatchWarning:
     def _run(self, monkeypatch, scale=2.0, positional=None):
-        FakePBar = _install_fake_pbar_utils(monkeypatch)
+        _install_fake_pbar_utils(monkeypatch)
         _install_fake_comfy(monkeypatch)
         fake_samplers = sys.modules["comfy.samplers"]
         fake_samplers.calculate_sigmas = (

@@ -365,6 +365,11 @@ Restart ComfyUI. No further dependency installation is required.
 
 ## ▓ Changelog
 
+### v2.16.0 — 2026-09-17
+- **Fixed run-to-run result drift** (user-reported: identical parameters produced different results with Krea 2 turbo unless model and node caches were cleared first). HiFlow, PixelRush, and FreeScale now derive their sigma schedules and timestep conversions from the graph's **own model patch** instead of the shared model's live state, which ComfyUI can leave patched by a previous run's node combination. The DyPE/SEGA schedule-patch decision is equally history-independent, and HiFlow/PixelRush log a console warning when a stale patch from a previous run is detected.
+- **HiFlow: new `sharpen` input** (default `1.0` = previous behavior). Controls the unsharp mask applied to the pixel round-tripped stage anchor; set `0` to disable — recommended for turbo/low-step models that show jagged, over-sharpened tone boundaries.
+- **HiFlow warns** when upscaling far beyond the base resolution without a positional-embedding patch (jagged aliasing is likely there — chain DyPE for >2× upscales).
+
 ### v2.15.0 — 2026-09-08
 - **Restructured the pack layout + unified the node category.** All node definitions now live in a dedicated `nodes/` folder (`nodes/dype.py`, `sega.py`, `spa.py`, `hap.py`, `hap_calibrate.py`, `freescale.py`, `pixelrush.py`, `hiflow.py`); `src/` holds engines/implementation only and the pack `__init__.py` just registers the extension. All 8 nodes moved to the single **`WMNodes/image`** menu category (previously split across two menu paths). No node ids, inputs, defaults, or behavior changed — workflows keep loading. Also merges PR #41 (FreeScale fp16 antialiased-bicubic crash fix).
 
