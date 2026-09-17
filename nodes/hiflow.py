@@ -19,11 +19,11 @@ import torch
 from comfy_api.latest import io
 
 try:
-    from ..src.effective_sampling import effective_model_sampling
+    from ..src.effective_sampling import effective_model_sampling, warn_if_stale_leak
     from ..src.freescale import gaussian_blur_2d
     from ..src.hiflow import HiFlowConfig, hiflow_cascade
 except ImportError:  # flat repo layout (tests / CLI)
-    from src.effective_sampling import effective_model_sampling
+    from src.effective_sampling import effective_model_sampling, warn_if_stale_leak
     from src.freescale import gaussian_blur_2d
     from src.hiflow import HiFlowConfig, hiflow_cascade
 
@@ -437,6 +437,7 @@ class HiFlowNode(io.ComfyNode):
         # models (Wan21: Krea2, Qwen-Image) pass, multi-frame latents
         # don't (Krea2 plan S2).
         _, latent_dimensions = _require_flow_model(model)
+        warn_if_stale_leak(model, "HiFlow")
 
         if isinstance(latent_image, dict):
             initial_latent = latent_image["samples"]

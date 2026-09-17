@@ -29,6 +29,8 @@ from a PREVIOUS run's patch node that is no longer in the graph.
 
 from __future__ import annotations
 
+import logging
+
 # Function-local classes installed by apply_dype_to_model / apply_sega_to_model
 # (src/patch_utils.py). Matched by __name__: the classes are defined inside the
 # installer functions, so identity comparison across imports is impossible.
@@ -71,3 +73,20 @@ def is_stale_dype_leak(model) -> bool:
         return False
     live = getattr(getattr(model, "model", None), "model_sampling", None)
     return type(live).__name__ in STALE_LEAK_CLASS_NAMES
+
+
+def warn_if_stale_leak(model, node_name: str) -> None:
+    """User-facing signal for the un-healable residual (plan S6).
+
+    Fired by the direct-sampling nodes when the resolved schedule is a stale
+    patch inherited from a run that is no longer in the graph — the exact
+    "identical params, different results until caches are cleared" report.
+    """
+    if is_stale_dype_leak(model):
+        live = getattr(getattr(model, "model", None), "model_sampling", None)
+        logging.getLogger("ComfyUI-DyPE").warning(
+            "%s: model_sampling is a stale patch from a previous run (%s) — "
+            "schedules may not match this workflow. Reload the models (clear "
+            "cache) or add the patch node to this graph.",
+            node_name, type(live).__name__,
+        )

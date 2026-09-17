@@ -14,10 +14,10 @@ import torch
 from comfy_api.latest import io
 
 try:
-    from ..src.effective_sampling import effective_model_sampling
+    from ..src.effective_sampling import effective_model_sampling, warn_if_stale_leak
     from ..src.pixelrush import PixelRushConfig, pixelrush_cascade
 except ImportError:
-    from src.effective_sampling import effective_model_sampling
+    from src.effective_sampling import effective_model_sampling, warn_if_stale_leak
     from src.pixelrush import PixelRushConfig, pixelrush_cascade
 
 logger = logging.getLogger("ComfyUI-DyPE")
@@ -575,6 +575,8 @@ class PixelRushNode(io.ComfyNode):
                 noise_injection="slerp", overlap=0.50, gaussian_sigma=24.0,
                 patch_h=0, patch_w=0, refiner_model=None) -> io.NodeOutput:
         import comfy.utils
+
+        warn_if_stale_leak(model, "PixelRush")
 
         # Get initial latent
         if isinstance(latent_image, dict):

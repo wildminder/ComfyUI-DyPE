@@ -83,3 +83,53 @@ class TestFreeScaleResolvedSigmas:
         model.model = types.SimpleNamespace(model_sampling=live)
         sigmas = effective_model_sampling(model).sigmas
         assert sigmas.numel() == 11
+
+
+@pytest.mark.unit
+class TestStaleLeakWarning:
+    """S6: the direct-sampling nodes warn (not silently drift) when the
+    resolved schedule is a stale patch from a run no longer in the graph."""
+
+    class _FakePatcher:
+        def __init__(self, live, patches=None, backup=None):
+            self.model = types.SimpleNamespace(model_sampling=live)
+            self.object_patches = dict(patches or {})
+            self.object_patches_backup = dict(backup or {})
+
+        def get_model_object(self, name):
+            if name in self.object_patches:
+                return self.object_patches[name]
+            if name in self.object_patches_backup:
+                return self.object_patches_backup[name]
+            return getattr(self.model, name)
+
+    def _leak_patcher(self):
+        leak = type("DypeModelSamplingFlux", (), {})()
+        return self._FakePatcher(leak), leak
+
+    def test_hiflow_helper_warns_on_stale_leak(self, caplog):
+        from src.effective_sampling import warn_if_stale_leak
+        patcher, leak = self._leak_patcher()
+        with caplog.at_level("WARNING", logger="ComfyUI-DyPE"):
+            warn_if_stale_leak(patcher, "HiFlow")
+        assert any("stale patch from a previous run" in r.message
+                   for r in caplog.records)
+        assert any("DypeModelSamplingFlux" in r.message
+                   for r in caplog.records)
+
+    def test_no_warning_on_clean_patcher(self, caplog):
+        from src.effective_sampling import warn_if_stale_leak
+        patcher = self._FakePatcher(
+            type("ModelSamplingContinuousFlow", (), {})())
+        with caplog.at_level("WARNING", logger="ComfyUI-DyPE"):
+            warn_if_stale_leak(patcher, "HiFlow")
+        assert not caplog.records
+
+    def test_no_warning_when_own_patch_present(self, caplog):
+        from src.effective_sampling import warn_if_stale_leak
+        patch_ms = type("DypeModelSamplingFlux", (), {})()
+        patcher = self._FakePatcher(
+            patch_ms, patches={"model_sampling": patch_ms})
+        with caplog.at_level("WARNING", logger="ComfyUI-DyPE"):
+            warn_if_stale_leak(patcher, "PixelRush")
+        assert not caplog.records
