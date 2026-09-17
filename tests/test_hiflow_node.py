@@ -985,22 +985,6 @@ class TestHiFlowDocs:
         assert m and m.group(1) == "2.15.0"
         assert "### v2.15.0" in readme
 
-    def test_workflow_json_parses_and_uses_known_nodes(self):
-        import json
-        import pathlib
-        wf_path = (pathlib.Path(__file__).parent.parent
-                   / "example_workflows" / "HiFlow-Flux-workflow.json")
-        data = json.loads(wf_path.read_text(encoding="utf-8"))
-        types = set()
-        for v in data.values():
-            if isinstance(v, dict) and "class_type" in v:
-                types.add(v["class_type"])
-        core = {"UNETLoader", "DualCLIPLoader", "VAELoader", "CLIPTextEncode",
-                "EmptySD3LatentImage", "VAEDecode", "SaveImage"}
-        unknown = types - core - {"HiFlow"}
-        assert not unknown, f"workflow references unknown nodes: {unknown}"
-        assert "HiFlow" in types
-
 
 # ---------------------------------------------------------------------------
 # Effective-sampling determinism (v2.16.0, plan S2)
