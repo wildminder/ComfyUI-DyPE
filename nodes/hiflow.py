@@ -19,9 +19,11 @@ import torch
 from comfy_api.latest import io
 
 try:
+    from ..src.effective_sampling import effective_model_sampling, warn_if_stale_leak
     from ..src.freescale import gaussian_blur_2d
     from ..src.hiflow import HiFlowConfig, hiflow_cascade
 except ImportError:  # flat repo layout (tests / CLI)
+    from src.effective_sampling import effective_model_sampling, warn_if_stale_leak
     from src.freescale import gaussian_blur_2d
     from src.hiflow import HiFlowConfig, hiflow_cascade
 
@@ -49,7 +51,10 @@ def _require_flow_model(model) -> tuple[str, int]:
 
     Returns (detected flow family, latent_dimensions).
     """
-    model_sampling = model.model.model_sampling
+    # Patch-resolved (KSampler semantics, v2.16.0): the live BaseModel attr is
+    # history-dependent under ComfyUI's object-patch lifecycle — a schedule
+    # leaked by a previous run's patch node must not flip this gate.
+    model_sampling = effective_model_sampling(model)
     mro_names = [c.__name__ for c in type(model_sampling).__mro__]
 
     detected = _detect_prediction_type(model_sampling)
@@ -106,6 +111,10 @@ def _make_predict_x0(
     device = model.load_device if hasattr(model, "load_device") \
         else torch.device("cpu")
     inner_model = model.model
+    # ONE patch-resolved sampling object for the whole adapter (v2.16.0): the
+    # sigma schedule (_base_sigmas) and this timestep conversion must come
+    # from the same source, independent of object-patch load history.
+    model_sampling = effective_model_sampling(model)
     process_latent_in = getattr(inner_model, "process_latent_in", None)
     process_latent_out = getattr(inner_model, "process_latent_out", None)
 
@@ -170,7 +179,7 @@ def _make_predict_x0(
 
         conds = _get_conds(tuple(x_vae.shape))
         sigma_t = torch.tensor([float(sigma)], device=device)
-        timestep = inner_model.model_sampling.timestep(sigma_t)
+        timestep = model_sampling.timestep(sigma_t)
 
         x0 = comfy.samplers.sampling_function(
             inner_model, x, timestep,
@@ -259,7 +268,14 @@ def _sharpen(image: torch.Tensor, alpha: float = 1.0) -> torch.Tensor:
     decode output ([B,T,H,W,3], 3D-format VAEs) is sliced to its first
     frame first — the adapters normally hand 4D, this is the defensive
     backstop (Krea2 plan S4).
+
+    ``alpha`` is the node's ``sharpen`` input (v2.16.0): 1.0 keeps the
+    reference behavior; values <= 0 disable the unsharp entirely (return
+    the image unchanged — recommended for turbo/low-step models that show
+    jagged, over-sharpened tone boundaries).
     """
+    if alpha <= 0.0:
+        return image
     if image.dim() == 5:
         image = image[:, 0]
     channels_last = image.dim() == 4 and image.shape[-1] == 3
@@ -277,10 +293,13 @@ def _base_sigmas(model, steps: int) -> torch.Tensor:
 
     Uses comfy.samplers.calculate_sigmas with the "simple" scheduler (index
     sampling of the model's sigmas — no spacing resampling), ending at 0.
+    Resolved through the patcher (v2.16.0) — KSampler semantics: a DyPE/SEGA
+    schedule patch in THIS graph is always honored; a schedule leaked onto the
+    shared BaseModel by a previous run's patch node never is.
     """
     import comfy.samplers
 
-    ms = model.model.model_sampling
+    ms = effective_model_sampling(model)
     sigmas = comfy.samplers.calculate_sigmas(ms, "simple", steps)
     return sigmas.float().cpu()
 
@@ -390,6 +409,13 @@ class HiFlowNode(io.ComfyNode):
                             "The stage-initialization anchor is always the "
                             "pixel round-trip of the previous final image."),
                 io.Float.Input(
+                    "sharpen", default=1.0, min=0.0, max=3.0, step=0.05,
+                    tooltip="Unsharp strength applied to the pixel "
+                            "round-tripped stage anchor (reference default "
+                            "1.0). Set 0 to disable — recommended for "
+                            "turbo/low-step models that show jagged, "
+                            "over-sharpened tone boundaries."),
+                io.Float.Input(
                     "scale_factor", default=2.0, min=0.25, max=8.0,
                     step=0.05,
                     tooltip="Output scale relative to the input latent: 2 = "
@@ -417,7 +443,7 @@ class HiFlowNode(io.ComfyNode):
     def execute(cls, model, vae, positive, negative, latent_image,
                 cfg=3.5, steps=30, guidance=4.5, steps_per_stage=16,
                 tau=0.6, filter_ratio=0.2, alpha_scale=1.0, beta_scale=0.5,
-                upsampling="latent", scale_factor=2.0,
+                upsampling="latent", scale_factor=2.0, sharpen=1.0,
                 noise_seed=0, denoise=1.0) -> io.NodeOutput:
         import comfy.utils
 
@@ -425,6 +451,7 @@ class HiFlowNode(io.ComfyNode):
         # models (Wan21: Krea2, Qwen-Image) pass, multi-frame latents
         # don't (Krea2 plan S2).
         _, latent_dimensions = _require_flow_model(model)
+        warn_if_stale_leak(model, "HiFlow")
 
         if isinstance(latent_image, dict):
             initial_latent = latent_image["samples"]
@@ -553,6 +580,27 @@ class HiFlowNode(io.ComfyNode):
             initial_latent.shape[-2], initial_latent.shape[-1],
             float(scale_factor), _downscale_ratio(vae),
         )
+        if sizes:
+            vae_ratio = _downscale_ratio(vae)
+            base_px = max(initial_latent.shape[-2], initial_latent.shape[-1])                 * vae_ratio
+            target_px = max(max(t_h, t_w) for t_h, t_w in sizes) * vae_ratio
+            positional_keys = (
+                "diffusion_model.pe_embedder",
+                "diffusion_model.rope_embedder",
+                "diffusion_model.pos_embedder",
+                "diffusion_model.model.pos_embed",
+            )
+            patcher_patches = getattr(model, "object_patches", None) or {}
+            if target_px > base_px * 1.01 and not any(
+                    k in patcher_patches for k in positional_keys):
+                logger.warning(
+                    "HiFlow: upscaling to ~%dpx (base %dpx) without a "
+                    "positional-embedding patch — aliasing and jagged, "
+                    "over-sharpened tone boundaries are likely at "
+                    "resolutions far beyond the model's training size. "
+                    "Consider chaining DyPE before this node.",
+                    target_px, base_px,
+                )
         total = max(1, len(base_sigmas) - 1 + len(sizes) * int(steps_per_stage))
         pbar = comfy.utils.ProgressBar(total)
         counter = {"n": 0}
@@ -570,7 +618,7 @@ class HiFlowNode(io.ComfyNode):
             cfg=cfg_obj,
             vae_decode=vae_decode,
             vae_encode=vae_encode,
-            sharpen=_sharpen,
+            sharpen=lambda image: _sharpen(image, alpha=float(sharpen)),
             vae_downscale=_downscale_ratio(vae),
             progress_callback=progress_callback,
             noise_seed=int(noise_seed),

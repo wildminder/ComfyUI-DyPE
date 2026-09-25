@@ -18,10 +18,12 @@ import torch.nn.functional as F
 from comfy_api.latest import io
 
 try:
+    from ..src.effective_sampling import effective_model_sampling
     from ..src.freescale import (
         forward_noise,
     )
 except ImportError:  # flat repo layout (tests / CLI)
+    from src.effective_sampling import effective_model_sampling
     from src.freescale import (
         forward_noise,
     )
@@ -371,7 +373,7 @@ class FreeScaleNode(io.ComfyNode):
             initial_latent = initial_latent.unsqueeze(2)  # [B, C, 1, H, W]
 
         # Get model's sigma schedule for alpha_bar
-        sigmas = model.model.model_sampling.sigmas
+        sigmas = effective_model_sampling(model).sigmas
         alphas_cumprod = 1.0 / (sigmas ** 2 + 1.0)
 
         def alpha_bar_at(timestep: int) -> float:

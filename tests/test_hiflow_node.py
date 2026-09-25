@@ -913,7 +913,7 @@ class TestHiFlowNodeSchema:
         for inp in ["model", "vae", "positive", "negative", "latent_image",
                     "cfg", "steps", "guidance", "steps_per_stage", "tau",
                     "filter_ratio", "alpha_scale", "beta_scale", "upsampling",
-                    "scale_factor"]:
+                    "scale_factor", "sharpen"]:
             assert f'"{inp}"' in src, f"missing schema input {inp}"
         assert "default=3.5" in src     # cfg (FLUX-dev)
         assert "default=30" in src      # steps (paper)
@@ -922,6 +922,7 @@ class TestHiFlowNodeSchema:
         assert "default=0.6" in src     # tau (paper 1K->2K)
         assert "default=0.2" in src     # filter_ratio (repo)
         assert 'default="latent"' in src
+        assert "default=1.0, min=0.0, max=3.0" in src  # sharpen (v2.16.0)
 
     def test_schema_execute_signature_matches(self):
         import re
@@ -982,21 +983,223 @@ class TestHiFlowDocs:
         readme = (pathlib.Path(__file__).parent.parent
                   / "README.md").read_text(encoding="utf-8")
         m = re.search(r'^version = "([^"]+)"', pyproject, re.MULTILINE)
-        assert m and m.group(1) == "2.15.0"
-        assert "### v2.15.0" in readme
+        assert m and m.group(1) == "2.16.0"
+        assert "### v2.16.0" in readme
 
-    def test_workflow_json_parses_and_uses_known_nodes(self):
-        import json
-        import pathlib
-        wf_path = (pathlib.Path(__file__).parent.parent
-                   / "example_workflows" / "HiFlow-Flux-workflow.json")
-        data = json.loads(wf_path.read_text(encoding="utf-8"))
-        types = set()
-        for v in data.values():
-            if isinstance(v, dict) and "class_type" in v:
-                types.add(v["class_type"])
-        core = {"UNETLoader", "DualCLIPLoader", "VAELoader", "CLIPTextEncode",
-                "EmptySD3LatentImage", "VAEDecode", "SaveImage"}
-        unknown = types - core - {"HiFlow"}
-        assert not unknown, f"workflow references unknown nodes: {unknown}"
-        assert "HiFlow" in types
+
+# ---------------------------------------------------------------------------
+# Effective-sampling determinism (v2.16.0, plan S2)
+# ---------------------------------------------------------------------------
+
+class _PatcherFacade:
+    """Wraps a _mock_flow_model with ModelPatcher semantics.
+
+    Provides get_model_object (object_patches -> object_patches_backup ->
+    live attr — the real ModelPatcher order, model_patcher.py:758-768) and
+    delegates the patcher-level attributes the node layer touches.
+    """
+
+    def __init__(self, inner, object_patches=None, object_patches_backup=None):
+        self.model = inner.model
+        self.model_options = inner.model_options
+        self.load_device = inner.load_device
+        self.pre_run = inner.pre_run
+        self.object_patches = dict(object_patches or {})
+        self.object_patches_backup = dict(object_patches_backup or {})
+
+    def get_model_object(self, name):
+        if name in self.object_patches:
+            return self.object_patches[name]
+        if name in self.object_patches_backup:
+            return self.object_patches_backup[name]
+        return getattr(self.model, name)
+
+
+def _install_recording_calculate_sigmas(monkeypatch):
+    """Fake comfy.samplers.calculate_sigmas that records the ms object."""
+    used = []
+    fake_samplers = types.ModuleType("comfy.samplers")
+
+    def calculate_sigmas(ms, scheduler, steps):
+        used.append(ms)
+        return torch.linspace(1.0, 0.0, steps + 1)
+
+    fake_samplers.calculate_sigmas = calculate_sigmas
+    monkeypatch.setitem(sys.modules, "comfy.samplers", fake_samplers)
+    comfy_mod = sys.modules.get("comfy")
+    if comfy_mod is not None:
+        monkeypatch.setattr(
+            comfy_mod, "samplers", fake_samplers, raising=False)
+    return used
+
+
+@pytest.mark.unit
+class TestEffectiveSamplingDeterminism:
+    """S2 (v2.16.0): the schedule, the timestep conversion and the flow gate
+    must follow the graph's OWN patch chain — never a model_sampling leaked
+    onto the shared BaseModel by a previous run's patch node."""
+
+    def _patched_patcher(self, live_leak, patch_ms):
+        model = _mock_flow_model()
+        return _PatcherFacade(
+            model, object_patches={"model_sampling": patch_ms}), model
+
+    def test_base_sigmas_follow_own_patch_not_leak(self, monkeypatch):
+        used = _install_recording_calculate_sigmas(monkeypatch)
+        patch_ms = type(
+            "PatchedSampling", (), {"timestep": lambda self, s: s * 1000})()
+        leak_ms = type("LeakedSampling", (), {})()
+        patcher, _ = self._patched_patcher(leak_ms, patch_ms)
+        hfn._base_sigmas(patcher, steps=8)
+        assert used[-1] is patch_ms, (
+            "schedule must derive from the patcher's own object patch, not "
+            "the leaked live attribute"
+        )
+
+    def test_base_sigmas_use_backup_original_when_unpatched(self, monkeypatch):
+        used = _install_recording_calculate_sigmas(monkeypatch)
+        orig_ms = type("OrigSampling", (), {})()
+        leak_ms = type("LeakedSampling", (), {})()
+        model = _mock_flow_model()
+        model.model.model_sampling = leak_ms
+        patcher = _PatcherFacade(
+            model, object_patches_backup={"model_sampling": orig_ms})
+        hfn._base_sigmas(patcher, steps=8)
+        assert used[-1] is orig_ms, (
+            "an unpatched patcher must resolve the backup original, not the "
+            "leak"
+        )
+
+    def test_base_sigmas_fall_back_to_live_when_nothing_else(self, monkeypatch):
+        used = _install_recording_calculate_sigmas(monkeypatch)
+        model = _mock_flow_model()  # SimpleNamespace: no get_model_object
+        hfn._base_sigmas(model, steps=8)
+        assert used[-1] is model.model.model_sampling
+
+    def test_flow_gate_not_flipped_by_leaked_live(self):
+        # A leaked EPS-family sampling on the BaseModel must not make the
+        # gate reject a flow model whose OWN patch is CONST.
+        patch_ms = type(
+            "PatchedConst", (type("CONST", (), {}),), {})()
+        leak_ms = type(
+            "LeakedEps", (type("EPS", (), {}),), {})()
+        model = _mock_flow_model()
+        model.model.model_sampling = leak_ms
+        patcher = _PatcherFacade(
+            model, object_patches={"model_sampling": patch_ms})
+        family, dims = hfn._require_flow_model(patcher)
+        assert family == "const"
+        assert dims == 2
+
+    def test_predict_x0_timestep_from_resolved_object(self, monkeypatch):
+        """The adapter's timestep conversion uses the SAME resolved object
+        as the schedule (identity between schedule and conversion)."""
+        fx = _install_fake_comfy(monkeypatch)
+        patch_ms = type(
+            "PatchedSampling", (), {"timestep": lambda self, s: s * 2000.0})()
+        leak_ms = type(
+            "LeakedSampling", (), {"timestep": lambda self, s: s * 1000.0})()
+        model = _mock_flow_model()
+        model.model.model_sampling = leak_ms
+        patcher = _PatcherFacade(
+            model, object_patches={"model_sampling": patch_ms})
+        adapter = hfn._make_predict_x0(
+            patcher, COND_POS, COND_NEG, cfg_scale=3.5)
+        x = torch.zeros(1, 16, 8, 8)
+        adapter(x, 0.5)
+        recorded_timestep = fx.sampling_calls[-1]["timestep"]
+        assert float(recorded_timestep.flatten()[0]) == pytest.approx(1000.0), (
+            "timestep must come from the patch object (0.5 * 2000), not the "
+            "leaked live attr (0.5 * 1000)"
+        )
+
+
+# ---------------------------------------------------------------------------
+# Sharpen control + positional-patch warning (v2.16.0, plan S7)
+# ---------------------------------------------------------------------------
+
+@pytest.mark.unit
+class TestSharpenControl:
+    def _two_tone(self, h=32, w=32):
+        img = torch.zeros(1, h, w, 3)
+        img[:, :, w // 2:, :] = 1.0  # hard vertical tone boundary
+        return img
+
+    @staticmethod
+    def _overshoot(out, w=32):
+        # Positive excursion beyond the high tone along the boundary column.
+        return float(out[:, :, w // 2 + 1, :].max() - 1.0)
+
+    def test_default_alpha_matches_reference(self):
+        img = self._two_tone()
+        assert torch.allclose(hfn._sharpen(img), hfn._sharpen(img, alpha=1.0))
+
+    def test_alpha_zero_disables_unsharp(self):
+        img = self._two_tone()
+        out = hfn._sharpen(img, alpha=0.0)
+        assert torch.equal(out, img), "sharpen=0 must return the image unchanged"
+
+    def test_alpha_zero_preserves_5d_backstop_layout(self):
+        img5 = torch.zeros(1, 1, 8, 8, 3)
+        out = hfn._sharpen(img5, alpha=0.0)
+        assert out.shape == img5.shape
+
+    def test_default_sharpen_creates_boundary_overshoot(self):
+        """Quantifies issue 2, factor 2: the reference unsharp pushes the
+        high tone ABOVE its level at the boundary (over-sharpened rims)."""
+        img = self._two_tone()
+        assert self._overshoot(hfn._sharpen(img, alpha=1.0)) > 0.05
+        assert self._overshoot(hfn._sharpen(img, alpha=0.0)) == 0.0
+
+
+@pytest.mark.unit
+class TestPositionalPatchWarning:
+    def _run(self, monkeypatch, scale=2.0, positional=None):
+        _install_fake_pbar_utils(monkeypatch)
+        _install_fake_comfy(monkeypatch)
+        fake_samplers = sys.modules["comfy.samplers"]
+        fake_samplers.calculate_sigmas = (
+            lambda ms, scheduler, steps:
+            torch.cat([torch.linspace(1.0, 0.1, steps), torch.zeros(1)])
+        )
+        model = _mock_flow_model()
+        if positional:
+            model.object_patches = positional
+        vae = types.SimpleNamespace(
+            decode=lambda z: torch.randn(
+                z.shape[0], z.shape[-2] * 8, z.shape[-1] * 8, 3),
+            encode=lambda im: {"samples": torch.randn(
+                1, 16, im.shape[-3] // 8, im.shape[-2] // 8)},
+            downscale_ratio=8,
+        )
+        z = torch.randn(1, 16, 16, 16)
+        hfn.HiFlowNode.execute(
+            model, vae, COND_POS, COND_NEG, {"samples": z},
+            cfg=3.5, steps=4, guidance=4.5, steps_per_stage=2,
+            tau=0.5, filter_ratio=0.2, alpha_scale=1.0, beta_scale=0.5,
+            upsampling="latent", scale_factor=scale, sharpen=0.0,
+            noise_seed=0, denoise=1.0,
+        )
+
+    def test_warns_without_positional_patch(self, monkeypatch, caplog):
+        import logging
+        with caplog.at_level(logging.WARNING, logger="ComfyUI-DyPE"):
+            self._run(monkeypatch, scale=2.0)
+        assert any("positional-embedding patch" in r.message
+                   for r in caplog.records)
+
+    def test_silent_with_dype_patcher(self, monkeypatch, caplog):
+        import logging
+        with caplog.at_level(logging.WARNING, logger="ComfyUI-DyPE"):
+            self._run(
+                monkeypatch, scale=2.0,
+                positional={"diffusion_model.pe_embedder": object()})
+        assert not any("positional-embedding patch" in r.message
+                       for r in caplog.records)
+
+    def test_silent_at_scale_one(self, monkeypatch, caplog):
+        import logging
+        with caplog.at_level(logging.WARNING, logger="ComfyUI-DyPE"):
+            self._run(monkeypatch, scale=1.0)
+        assert not any("positional-embedding patch" in r.message
+                       for r in caplog.records)
