@@ -34,7 +34,7 @@ Training-free methods that push pre-trained DiT models far beyond their native r
 
 ### ❖ Highlights
 
-* **Multi-Architecture** — FLUX, Nunchaku, Qwen Image, Krea-2, Z-Image, Anima/Cosmos
+* **Multi-Architecture** — FLUX, Nunchaku, Qwen Image, Qwen Image 2.1, Krea-2, Z-Image, Anima/Cosmos
 * **High-Resolution Generation** — 4096×4096 and beyond
 * **Single-Node Integration** — place after your model loader, done
 * **Full Compatibility** — works with existing workflows, samplers and optimization nodes
@@ -75,6 +75,26 @@ Two families: **model patches** alter how your own KSampler run attends (no imag
 > [!TIP]
 > **Quick picker:** starting from noise → DyPE (or SEGA), add SPA if you see repeated/collapsed structures, add HAP for speed. Starting from an existing image → PixelRush to keep it faithful, FreeScale to re-imagine it at high res (lower its `noise_timestep` for more fidelity), HiFlow for FLUX-family flow models — it reuses the whole base-resolution denoising trajectory as guidance, so structure survives while detail is re-synthesized.
 
+#### Model support
+
+| Architecture | DyPE | SEGA | SPA | HAP | PixelRush / FreeScale / HiFlow |
+|:---|:--:|:--:|:--:|:--:|:--:|
+| FLUX (incl. Nunchaku) | ✅ | ✅ | ✅ | ✅ | ✅ |
+| Qwen-Image 1.0, Krea-2 | ✅ | ✅ | ✅ | ✅ | ✅ |
+| **Qwen-Image 2.1** | ✅ `qwen21` | ✅ `qwen21` | ✅ `qwen21` | ❌ | ✅ |
+| Z-Image, Anima/Cosmos | ✅ | ✅ | ✅ | ✅ | ✅ |
+| SDXL / SD1.5 | — | — | — | — | ✅ (PixelRush) |
+
+A ready-to-run graph: [`example_workflows/DyPE-Qwen21-workflow.json`](example_workflows/DyPE-Qwen21-workflow.json) — loaders → `DyPE_FLUX` (`model_type: qwen21`) → `TextEncodeQwenImage21` → `EmptyQwenImage21LatentImage` → KSampler → decode.
+
+**Qwen-Image 2.1 notes**
+
+* **16× RGBA VAE.** The 2.1 VAE is a Wan-2.2-layout VAE with a **16×** spatial downscale and four output channels. The cascades (PixelRush / FreeScale / HiFlow) are RGB end to end, so they decode, sharpen and re-encode in RGB and **drop the alpha channel** — logged once per session, naming the node. Everything else about the 16× VAE is handled automatically: `latent_dim` is 2, so no temporal dimension is invented. This is core's `comfy.ldm.wan.vae2_2.WanVAE`, not the 2D Qwen VAE — `DYPE_ENABLE_QWEN2D_VAE` has no effect on 2.1.
+* **Noise-schedule shifts.** The `base_shift` / `max_shift` defaults are tuned for Qwen-Image **1.0** (native 1.15). Qwen-Image 2.1 ships with its own native shifts (`base_shift ≈ 0.69`) — if results look over-smoothed or under-noised, set `base_shift` to 2.1's native value first.
+* **`model_type`** — set `qwen21` explicitly on DyPE/SEGA/SPA for 2.1 graphs (`auto` also detects it). The 2.1 latent is 64 channels at 16×, so use this pack's `EmptyQwenImage21LatentImage` node — core's `EmptyQwenImageLayeredLatentImage` is the layered/edit latent (16 channels, 8×, 5-D) and `EmptyLatentImage` is 4 channels at 8×; neither matches.
+* **`qwen` on a 2.1 model resolves to `qwen21`.** Detection checks the class name before the requested string (`src/model_detect.py`), so a 2.1 checkpoint is never treated as 1.0 even if `model_type: qwen` is left selected — the same precedence Krea-2 has.
+* **HAP is not supported on 2.1** and refuses with an actionable error rather than silently doing nothing. Use SPA for spatial-disorder repair, or DyPE/SEGA for extrapolation.
+
 <a id="user-content-dype"></a>
 
 ### ❖ DyPE
@@ -92,6 +112,7 @@ Dynamic Position Extrapolation ([paper](https://arxiv.org/abs/2411.17087), [code
     * **`flux`** — Standard Flux.
     * **`nunchaku`** — Quantized Flux.
     * **`qwen`** — Qwen Image (also used for Krea-2).
+    * **`qwen21`** — Qwen Image 2.1 (64-channel latent, 16× VAE).
     * **`zimage`** — Z-Image (Lumina 2).
     * **`anima`** — Anima/Cosmos.
 * **`base_resolution`** — native training resolution of the model.
@@ -365,6 +386,13 @@ Restart ComfyUI. No further dependency installation is required.
 <p align="right"><a href="#readme-top" title="back to top">⟔ ▲ ⟓</a></p>
 
 ## ▓ Changelog
+
+### v2.17.0 — 2026-10-05
+- **Qwen-Image 2.1 support.** New `model_type: qwen21` for DyPE, SEGA and SPA; `auto` detection recognizes it too. 2.1's latent is 64 channels at a **16×** VAE downscale with `patch_size 1`, and its positional embeddings are built and used in fp32 — the pack now handles both explicitly instead of relying on a 1.0-shaped fallback.
+- **HAP refuses Qwen-Image 2.1 with an actionable error** naming the model, the mechanism (block-causal attention splits each block into per-segment calls: text segments are masked, the image segment is non-square) and the remedy (use SPA, DyPE or SEGA) — rather than silently no-op'ing.
+- **New node `EmptyQwenImage21LatentImage`.** Core ships no text-to-image empty latent for 2.1 (`EmptyQwenImageLayeredLatentImage` is the layered/edit latent: 16 channels, 8×, 5-D; `EmptyLatentImage` is 4 channels at 8×). This one is 64 channels at 16×, with width/height as inputs and snapped to multiples of 16.
+- **Cascades handle the 16× RGBA VAE.** Qwen-Image 2.1's VAE decodes `[B, H, W, 4]`. PixelRush, FreeScale and HiFlow now decode to RGB and re-encode with the VAE's own opaque-alpha pad value, so their channels-first/channels-last layout probes keep working. Alpha is **not** preserved end to end — the drop is logged once per session, naming the node. All other architectures take an unchanged path.
+- **Shipped example workflow** for Qwen-Image 2.1 (loaders → DyPE → text encode → empty latent → KSampler → decode) plus the notes that matter for it: `base_shift`/`max_shift` defaults are tuned for 1.0's native 1.15, not 2.1's ~0.69, and `DYPE_ENABLE_QWEN2D_VAE` does not apply (2.1 is core's `WanVAE`).
 
 ### v2.16.0 — 2026-09-17
 - **Fixed run-to-run result drift** (user-reported: identical parameters produced different results with Krea 2 turbo unless model and node caches were cleared first). HiFlow, PixelRush, and FreeScale now derive their sigma schedules and timestep conversions from the graph's **own model patch** instead of the shared model's live state, which ComfyUI can leave patched by a previous run's node combination. The DyPE/SEGA schedule-patch decision is equally history-independent, and HiFlow/PixelRush log a console warning when a stale patch from a previous run is detected.

@@ -976,6 +976,12 @@ class TestHiFlowDocs:
         assert "user-content-hiflow" in readme
 
     def test_version_bumped(self):
+        """The released version is single-sourced from pyproject.toml and the
+        README changelog leads with it.
+
+        The literal is deliberately NOT repeated here (it broke on every
+        release bump); tests/test_version_sync.py owns the full parity guard.
+        """
         import pathlib
         import re
         pyproject = (pathlib.Path(__file__).parent.parent
@@ -983,8 +989,8 @@ class TestHiFlowDocs:
         readme = (pathlib.Path(__file__).parent.parent
                   / "README.md").read_text(encoding="utf-8")
         m = re.search(r'^version = "([^"]+)"', pyproject, re.MULTILINE)
-        assert m and m.group(1) == "2.16.0"
-        assert "### v2.16.0" in readme
+        assert m, "pyproject.toml has no parseable version"
+        assert f"### v{m.group(1)}" in readme
 
 
 # ---------------------------------------------------------------------------
