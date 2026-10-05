@@ -6,6 +6,7 @@ from src.models.anima import PosEmbedAnima
 from src.models.flux import PosEmbedFlux
 from src.models.nunchaku import PosEmbedNunchaku
 from src.models.qwen import PosEmbedQwen
+from src.models.qwen21 import PosEmbedQwen21
 
 
 @pytest.fixture
@@ -111,6 +112,63 @@ class TestPosEmbedQwen:
         # col1 should be [-sin, cos]
         assert torch.allclose(col1[0], -sin_val, atol=1e-5)
         assert torch.allclose(col1[1], cos_val, atol=1e-5)
+
+
+@pytest.mark.unit
+class TestPosEmbedQwen21:
+    """Qwen-Image-2.1 — same layout as 1.0, but the frequency dtype is pinned."""
+
+    def test_output_shape(self, flux_ids):
+        emb = PosEmbedQwen21(theta=10000, axes_dim=[16, 56, 56], method='ntk')
+        out = emb(flux_ids)
+        # Same layout 1.0 produces: (B, 1, L, D/2, 2, 2), D=128 → D/2=64
+        assert out.shape == (1, 1, 4096, 64, 2, 2)
+
+    def test_rotation_columns(self, small_ids):
+        emb = PosEmbedQwen21(theta=10000, axes_dim=[16, 56, 56], method='ntk')
+        out = emb(small_ids)
+        col0 = out[0, 0, 0, 0, :, 0]
+        col1 = out[0, 0, 0, 0, :, 1]
+        cos_val, sin_val = col0[0], col0[1]
+        assert torch.allclose(col1[0], -sin_val, atol=1e-5)
+        assert torch.allclose(col1[1], cos_val, atol=1e-5)
+
+    def test_inherits_qwen_formatting(self):
+        """No format duplication: the 1.0 formatter is reused verbatim."""
+        assert issubclass(PosEmbedQwen21, PosEmbedQwen)
+        assert (PosEmbedQwen21.format_components
+                is PosEmbedQwen.format_components)
+
+    def test_freqs_dtype_is_fp32_even_for_a_cuda_like_device(self, small_ids):
+        """The value handed to get_components must be fp32, whatever the device.
+
+        CI has no CUDA, so the device branch cannot be exercised directly; the
+        spy below pins the argument instead, and test_forward_has_no_device_
+        branch pins that no device-dependent value can be substituted for it.
+        """
+        seen = {}
+
+        class _Spy(PosEmbedQwen21):
+            def get_components(self, pos, freqs_dtype):
+                seen["dtype"] = freqs_dtype
+                return super().get_components(pos, freqs_dtype)
+
+        _Spy(theta=10000, axes_dim=[16, 56, 56], method='ntk')(small_ids)
+        assert seen["dtype"] is torch.float32
+
+    def test_forward_has_no_device_branch(self):
+        """Re-adding a ``device.type == 'cuda'`` downcast would break 2.1.
+
+        2.1 hands the embedder output straight to its RoPE kernel without a
+        ``.to(x.dtype)`` cast, so a bfloat16 downcast here changes the dtype
+        the model itself sees.
+        """
+        import inspect
+        assert "cuda" not in inspect.getsource(PosEmbedQwen21.forward)
+
+    def test_output_dtype_is_fp32(self, small_ids):
+        out = PosEmbedQwen21(theta=10000, axes_dim=[16, 56, 56], method='ntk')(small_ids)
+        assert out.dtype is torch.float32
 
 
 @pytest.mark.unit

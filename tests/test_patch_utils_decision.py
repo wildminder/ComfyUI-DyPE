@@ -80,3 +80,17 @@ class TestShouldPatchSchedule:
         patcher = _Patcher(_ms("Leaked", FluxLike),
                            backup={"model_sampling": _ms("Orig", ContFlow)})
         assert _should_patch_schedule(patcher, False, False) is False
+
+    def test_characterization_qwen21_force_patches(self):
+        """Qwen-Image-2.1 is force-patched like 1.0, via its own flag.
+
+        2.1's live ``model_sampling`` is a discrete-flow object (its native
+        shift is 0.69 at 1024px), so the ``ModelSamplingFlux`` isinstance test
+        alone leaves it unpatched while 1.0 is patched.  ``is_qwen21`` is what
+        carries it — pinned here so the fourth argument cannot be dropped
+        without the 2.1 schedule silently going missing.
+        """
+        patcher = _Patcher(_ms("DiscreteFlow", ContFlow))
+        assert _should_patch_schedule(patcher, False, False) is False
+        assert _should_patch_schedule(patcher, False, False, True) is True
+        assert _should_patch_schedule(patcher, False, False, False) is False

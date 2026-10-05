@@ -11,10 +11,12 @@ from .models.anima import PosEmbedAnima
 from .models.flux import PosEmbedFlux
 from .models.nunchaku import PosEmbedNunchaku
 from .models.qwen import PosEmbedQwen
+from .models.qwen21 import PosEmbedQwen21
 from .models.sega_anima import SegAPosEmbedAnima
 from .models.sega_flux import SegAPosEmbedFlux
 from .models.sega_nunchaku import SegAPosEmbedNunchaku
 from .models.sega_qwen import SegAPosEmbedQwen
+from .models.sega_qwen21 import SegAPosEmbedQwen21
 from .models.sega_zimage import SegAPosEmbedZImage
 from .models.zimage import PosEmbedZImage
 from .sega import compute_axis_spectral_profiles, compute_dynamic_spread, compute_spectral_energy_profile
@@ -23,16 +25,23 @@ from .sega import compute_axis_spectral_profiles, compute_dynamic_spread, comput
 _DYPE_PARAMS_ATTR = "_comfyui_dype_params"
 
 
-def _should_patch_schedule(m: ModelPatcher, is_qwen: bool, is_z_image: bool) -> bool:
+def _should_patch_schedule(m: ModelPatcher, is_qwen: bool, is_z_image: bool,
+                           is_qwen21: bool = False) -> bool:
     """Whether the DyPE/SEGA noise-schedule patch applies to this model.
 
     Resolves the sampling through the patcher (v2.16.0): the live BaseModel
     attribute is history-dependent under ComfyUI's object-patch lifecycle, so
     a leaked ``*ModelSamplingFlux`` from a PREVIOUS run must not flip this
     decision. Patch -> backup -> live (KSampler semantics).
+
+    ``is_qwen21`` exists because Qwen-Image-2.1 does not necessarily present a
+    ``ModelSamplingFlux`` live attribute (its own native sampling is a
+    discrete-flow shift), so the isinstance test alone would leave it unpatched
+    while 1.0 — same pack, same shift — is force-patched.  Both Qwen families
+    therefore force the patch rather than inferring it from the live attr.
     """
     return (isinstance(effective_model_sampling(m), model_sampling.ModelSamplingFlux)
-            or is_qwen or is_z_image)
+            or is_qwen or is_qwen21 or is_z_image)
 
 
 def _snap_to_multiple(value: int, multiple: int = 16) -> int:
@@ -158,10 +167,15 @@ def apply_dype_to_model(model: ModelPatcher, model_type: str, width: int, height
 
     is_nunchaku = detected_type == "nunchaku"
     is_qwen = detected_type == "qwen"
+    is_qwen21 = detected_type == "qwen21"
     is_z_image = detected_type == "zimage"
     is_anima = detected_type == "anima"
 
-    new_dype_params = (width, height, base_shift, max_shift, method, yarn_alt_scaling, base_resolution, dype_start_sigma, is_nunchaku, is_qwen, is_z_image, is_anima)
+    new_dype_params = (width, height, base_shift, max_shift, method, yarn_alt_scaling, base_resolution, dype_start_sigma, is_nunchaku, is_qwen, is_qwen21, is_z_image, is_anima)
+
+    # Qwen-Image-2.1 takes the same schedule path as 1.0: its explicit 16x VAE
+    # / patch_size=1 geometry (see resolve_model_geometry) reproduces 1.0's
+    # token count exactly, so the shift curve is unchanged by the swap.
 
     should_patch_schedule = True
     if hasattr(m, _DYPE_PARAMS_ATTR):
@@ -174,7 +188,7 @@ def apply_dype_to_model(model: ModelPatcher, model_type: str, width: int, height
 
     if enable_dype and should_patch_schedule and not is_anima:
         try:
-            if _should_patch_schedule(m, is_qwen, is_z_image):
+            if _should_patch_schedule(m, is_qwen, is_z_image, is_qwen21):
                 latent_h, latent_w = height // geo.latent_downscale, width // geo.latent_downscale
                 padded_h, padded_w = math.ceil(latent_h / patch_size) * patch_size, math.ceil(latent_w / patch_size) * patch_size
                 image_seq_len = (padded_h // patch_size) * (padded_w // patch_size)
@@ -257,6 +271,10 @@ def apply_dype_to_model(model: ModelPatcher, model_type: str, width: int, height
         embedder_cls = PosEmbedNunchaku
     elif is_qwen:
         embedder_cls = PosEmbedQwen
+    elif is_qwen21:
+        # fp32-preserving variant: 2.1 hands the embedder output to its RoPE
+        # kernel without casting back to the activation dtype.
+        embedder_cls = PosEmbedQwen21
     elif is_z_image:
         embedder_cls = PosEmbedZImage
     elif is_anima:
@@ -356,6 +374,7 @@ def apply_sega_to_model(
 
     is_nunchaku = detected_type == "nunchaku"
     is_qwen = detected_type == "qwen"
+    is_qwen21 = detected_type == "qwen21"
     is_z_image = detected_type == "zimage"
     is_anima = detected_type == "anima"
 
@@ -365,7 +384,7 @@ def apply_sega_to_model(
     # --- Noise schedule patching (same as DyPE, except Anima) ---
     if not is_anima:
         try:
-            if _should_patch_schedule(m, is_qwen, is_z_image):
+            if _should_patch_schedule(m, is_qwen, is_z_image, is_qwen21):
                 latent_h, latent_w = height // geo.latent_downscale, width // geo.latent_downscale
                 padded_h, padded_w = math.ceil(latent_h / patch_size) * patch_size, math.ceil(latent_w / patch_size) * patch_size
                 image_seq_len = (padded_h // patch_size) * (padded_w // patch_size)
@@ -437,6 +456,8 @@ def apply_sega_to_model(
         sega_embedder_cls = SegAPosEmbedNunchaku
     elif is_qwen:
         sega_embedder_cls = SegAPosEmbedQwen
+    elif is_qwen21:
+        sega_embedder_cls = SegAPosEmbedQwen21
     elif is_z_image:
         sega_embedder_cls = SegAPosEmbedZImage
     elif is_anima:

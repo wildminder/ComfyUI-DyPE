@@ -14,12 +14,13 @@ class SegAPosEmbedQwen(SegAPosEmbed):
     This broadcasts correctly against input (B, H, L, D/2, 1, 2).
     """
 
-    def forward(self, ids: torch.Tensor) -> torch.Tensor:
-        pos = ids.float()
-        freqs_dtype = torch.bfloat16 if pos.device.type == "cuda" else torch.float32
+    def format_components(self, components, ids: torch.Tensor) -> torch.Tensor:
+        """Build the ``D/2`` rotation matrices from raw (cos, sin) components.
 
-        components = self.get_components(pos, freqs_dtype)
-
+        Split out of :meth:`forward` so the Qwen-Image-2.1 adapter can reuse
+        this exact formatting with a different frequency dtype instead of
+        copying it.
+        """
         emb_parts = []
         for cos, sin in components:
             # cos: (B, L, D) (interleaved [c0, c0, c1, c1...])
@@ -43,3 +44,8 @@ class SegAPosEmbedQwen(SegAPosEmbed):
 
         out = emb.unsqueeze(1).to(ids.device)  # (B, 1, L, Total_D/2, 2, 2)
         return out
+
+    def forward(self, ids: torch.Tensor) -> torch.Tensor:
+        pos = ids.float()
+        freqs_dtype = torch.bfloat16 if pos.device.type == 'cuda' else torch.float32
+        return self.format_components(self.get_components(pos, freqs_dtype), ids)

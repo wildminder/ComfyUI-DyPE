@@ -6,6 +6,7 @@ from src.models.sega_anima import SegAPosEmbedAnima
 from src.models.sega_flux import SegAPosEmbedFlux
 from src.models.sega_nunchaku import SegAPosEmbedNunchaku
 from src.models.sega_qwen import SegAPosEmbedQwen
+from src.models.sega_qwen21 import SegAPosEmbedQwen21
 from src.models.sega_zimage import SegAPosEmbedZImage
 
 
@@ -101,6 +102,73 @@ class TestSegAPosEmbedQwen:
         ids = _make_flux_ids(128, 128)
         out = emb(ids)
         assert out.shape[0] == 128 * 128
+
+
+# ---------------------------------------------------------------------------
+# SegAPosEmbedQwen21
+# ---------------------------------------------------------------------------
+
+@pytest.mark.unit
+class TestSegAPosEmbedQwen21:
+    """Qwen-Image-2.1 — 1.0's layout and axis order, fp32 frequencies."""
+
+    def test_output_shape(self):
+        emb = SegAPosEmbedQwen21(theta=10000, axes_dim=[16, 56, 56])
+        ids = _make_flux_ids(32, 32)
+        out = emb(ids)
+        L = 32 * 32
+        assert out.shape[0] == L
+        assert out.shape[1] == 1
+        assert out.shape[2] == 64  # (16 + 56 + 56) / 2
+        assert out.shape[3] == 2
+        assert out.shape[4] == 2
+
+    def test_no_nan(self):
+        emb = SegAPosEmbedQwen21(theta=10000, axes_dim=[16, 56, 56])
+        out = emb(_make_flux_ids(32, 32))
+        assert not torch.isnan(out).any()
+
+    def test_inherits_qwen_formatting(self):
+        """No format duplication: the 1.0 formatter is reused verbatim."""
+        from src.sega_base import SegAPosEmbed
+        assert issubclass(SegAPosEmbedQwen21, SegAPosEmbedQwen)
+        assert isinstance(SegAPosEmbedQwen21(theta=10000, axes_dim=[16, 56, 56]),
+                          SegAPosEmbed)
+        assert (SegAPosEmbedQwen21.format_components
+                is SegAPosEmbedQwen.format_components)
+
+    def test_freqs_dtype_is_fp32(self):
+        """freqs_dtype does not survive into the output (rope.py promotes back),
+        so the argument itself is the observable."""
+        seen = []
+        original = SegAPosEmbedQwen21.get_components
+
+        def spy(self, pos, freqs_dtype):
+            seen.append(freqs_dtype)
+            return original(self, pos, freqs_dtype)
+
+        SegAPosEmbedQwen21.get_components = spy
+        try:
+            out = SegAPosEmbedQwen21(theta=10000, axes_dim=[16, 56, 56])(_make_flux_ids(8, 8))
+        finally:
+            SegAPosEmbedQwen21.get_components = original
+        assert seen == [torch.float32]
+        assert out.dtype is torch.float32
+
+    def test_matches_qwen_1_0_on_cpu(self):
+        """On CPU both adapters are fp32, so 2.1 must equal 1.0 numerically."""
+        ids = _make_flux_ids(8, 8)
+        out10 = SegAPosEmbedQwen(theta=10000, axes_dim=[16, 56, 56])(ids)
+        out21 = SegAPosEmbedQwen21(theta=10000, axes_dim=[16, 56, 56])(ids)
+        assert torch.allclose(out10, out21, atol=0)
+
+    def test_with_spectral_data(self):
+        emb = SegAPosEmbedQwen21(theta=10000, axes_dim=[16, 56, 56],
+                                 training_res_pixels=1024)
+        emb.set_spectral_data(torch.rand(16) * 10 + 1, torch.rand(16) * 10 + 1,
+                              0.8, target_res_h=4096, target_res_w=4096)
+        out = emb(_make_flux_ids(32, 32))
+        assert out.shape[0] == 32 * 32
 
 
 # ---------------------------------------------------------------------------

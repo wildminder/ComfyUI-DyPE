@@ -57,6 +57,29 @@ def _make_mock_qwen_model():
     return m
 
 
+def _make_mock_qwen21_model():
+    """Create a mock Qwen-Image-2.1 model for SEGA testing.
+
+    2.1 has no ``patch_size`` (one token per latent position) and a 16x VAE;
+    the inherited ``patch_size = 2`` here only feeds this mock, the real
+    geometry comes from ``tests/_qwen21_fixtures.py``.
+    """
+    try:
+        from comfy.model_patcher import ModelPatcher
+    except ImportError:
+        ModelPatcher = MockModelPatcher
+
+    m = ModelPatcher()
+    dm = _MockDiffusionModel("QwenImage21Transformer2DModel")
+    m.model.diffusion_model = dm
+
+    m.model.model_sampling = types.SimpleNamespace()
+    m.model.model_sampling.sigma_max = torch.tensor(1.0)
+    m.model.model_config = types.SimpleNamespace()
+
+    return m
+
+
 @pytest.mark.unit
 class TestApplySegaToModel:
     def test_flux_model_detected(self):
@@ -115,6 +138,28 @@ class TestApplySegaToModel:
         result = apply_sega_to_model(m, "flux", 1000, 1000)
         # The wrapper should still work — snapping happens internally
         assert result is not None
+
+
+@pytest.mark.unit
+class TestApplySegaQwen21:
+    """2.1 gets the fp32-preserving adapter through a real ModelPatcher."""
+
+    def test_qwen21_detected_and_installed(self):
+        from src.models.sega_qwen21 import SegAPosEmbedQwen21
+        result = apply_sega_to_model(_make_mock_qwen21_model(), "qwen21", 2048, 2048)
+        embedder = result._object_patches["diffusion_model.pe_embedder"]
+        assert isinstance(embedder, SegAPosEmbedQwen21)
+
+    def test_qwen21_embedder_output_is_fp32(self):
+        result = apply_sega_to_model(_make_mock_qwen21_model(), "qwen21", 2048, 2048)
+        embedder = result._object_patches["diffusion_model.pe_embedder"]
+        ids = torch.arange(64, dtype=torch.float32).unsqueeze(-1).repeat(1, 3)
+        assert embedder(ids).dtype is torch.float32
+
+    def test_qwen21_schedule_is_patched(self):
+        """2.1 follows 1.0 down the schedule path (see test_dype_qwen21)."""
+        result = apply_sega_to_model(_make_mock_qwen21_model(), "qwen21", 2048, 2048)
+        assert "model_sampling" in result._object_patches
 
 
 @pytest.mark.unit
