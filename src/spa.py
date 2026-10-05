@@ -1096,6 +1096,15 @@ def _make_hrdit_wrapper(orig, is_masked: bool):
                         mask is not None, _is_target_segment, _end, ctx.total_len,
                     )
                 spa_active = False
+            elif heads is None:
+                # The head split needs ``heads``; every 2.1 call site passes it
+                # positionally, so this is unreachable today — decline rather
+                # than raise ``int(None)`` if that ever stops being true.
+                logger.debug(
+                    "SPA (qwen21 causal_prefix): no head count on this call -> "
+                    "plain attention."
+                )
+                spa_active = False
             else:
                 # The rotations cover the FULL sequence; select this segment's
                 # rows before rotating so each pass matches the tensor it is
