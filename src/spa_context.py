@@ -47,6 +47,14 @@ class SPAContext:
     # the position ids at registration time (tokens with row==col==0).  ``None``
     # = unknown (HAP falls back to ``HapContext.text_len``).
     text_len: Optional[int] = None
+    # Qwen-Image-2.1 joint mode: the FULL sequence length the registered
+    # rotations cover, recorded at registration from ``ids.shape[1]``.  Recorded
+    # HERE (not recovered from ``base_pe`` at call time) because on a cached
+    # prefill step the model has already sliced ``pe`` down to the target rows,
+    # so the PE length would under-report the sequence the segments index into.
+    # ``None`` = unknown; the ``causal_prefix`` mode declines its slicing path
+    # when it is unset.
+    total_len: Optional[int] = None
 
 
 # Module-global, process-safe activation slot. Default ``None`` == no SPA hook.
@@ -100,6 +108,19 @@ _HRDIT_PROPORTIONAL: "contextvars.ContextVar" = contextvars.ContextVar("hrdit_pr
 # layer counter still advances (alignment is sacred) and HAP dispatch is NOT
 # gated by this filter (reference semantics: the filter affects SPA alone).
 _SPA_LAYER_FILTER: "contextvars.ContextVar" = contextvars.ContextVar("spa_layer_filter", default=None)
+
+# Joint-mode slot (Qwen-Image-2.1 ``causal_prefix``): the unet wrapper sets this
+# from ``m._spa_joint_mode`` for the duration of a forward, exactly like
+# ``_SPA_STEP_GATE`` / ``_SPA_LAYER_FILTER``.  ``"joint"`` (default) == the one
+# attention call per block that every other backend makes; ``"causal_prefix"`` ==
+# Qwen-Image-2.1's block-causal attention, which splits each block into SEVERAL
+# ``optimized_attention`` calls (one per text/image/reference chunk).  In that
+# mode only the image TARGET segment runs the averaged passes, and it is the
+# only call that advances the per-forward layer counter — otherwise one counter
+# slot per block would be burned by the text chunks and ``spa_layer_filter``
+# plus the HAP ordinal would desync from the model's block order.
+_SPA_JOINT_MODE: "contextvars.ContextVar" = contextvars.ContextVar(
+    "spa_joint_mode", default="joint")
 
 
 def get_spa_context() -> Optional[SPAContext]:
@@ -208,3 +229,21 @@ def get_spa_layer_filter():
 def set_spa_layer_filter(f) -> None:
     """Set (or clear with ``None``) the per-layer SPA filter for this forward."""
     _SPA_LAYER_FILTER.set(f)
+
+
+# --- Joint mode (Qwen-Image-2.1 ``causal_prefix``) ---------------------------
+
+#: Default joint mode: one attention call per block (every backend but 2.1).
+SPA_JOINT_MODE_JOINT = "joint"
+#: Qwen-Image-2.1 block-causal mode: one attention call per SEQUENCE SEGMENT.
+SPA_JOINT_MODE_CAUSAL_PREFIX = "causal_prefix"
+
+
+def get_spa_joint_mode() -> str:
+    """Return the active joint mode (``"joint"`` or ``"causal_prefix"``)."""
+    return _SPA_JOINT_MODE.get()
+
+
+def set_spa_joint_mode(mode: Optional[str]) -> None:
+    """Set the joint mode for this forward (``None``/unknown -> ``"joint"``)."""
+    _SPA_JOINT_MODE.set(mode or SPA_JOINT_MODE_JOINT)
