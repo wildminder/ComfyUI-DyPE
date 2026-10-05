@@ -30,6 +30,13 @@ import pytest
 import src.patch_utils as patch_utils_mod
 import src.spa as spa_mod
 
+from _qwen21_fixtures import (
+    QWEN10_CLASS_NAME,
+    QWEN21_CLASS_NAME,
+    make_qwen10_dm,
+    make_qwen21_dm,
+)
+
 
 # ---------------------------------------------------------------------------
 # Mock diffusion-model shapes (detection only needs class name + attr probes)
@@ -76,6 +83,7 @@ def _nunchaku_dm():
 _SHAPES = {
     "flux": lambda: _make_dm(None),
     "qwen": lambda: _make_dm("QwenImageDiT"),
+    "qwen21": make_qwen21_dm,
     "zimage": _zimage_dm,
     "anima": _anima_dm,
     "krea2": lambda: _make_dm("SingleStreamDiT"),
@@ -194,7 +202,7 @@ def detections(monkeypatch):
 # ---------------------------------------------------------------------------
 
 _FAMILIES = ["dype", "sega", "spa", "hap"]
-_SHAPE_NAMES = ["flux", "qwen", "zimage", "anima", "krea2", "nunchaku"]
+_SHAPE_NAMES = ["flux", "qwen", "qwen21", "zimage", "anima", "krea2", "nunchaku"]
 
 
 @pytest.mark.unit
@@ -250,3 +258,72 @@ class TestDetectionParity:
         assert resolve_model_type(dm, "nunchaku") == "nunchaku"
         with pytest.raises(ValueError, match="not a compatible"):
             resolve_model_type(types.SimpleNamespace(), "auto")
+
+
+# ---------------------------------------------------------------------------
+# Qwen-Image-2.1 — the canonical "qwen21" key
+# ---------------------------------------------------------------------------
+
+@pytest.mark.unit
+class TestQwen21Detection:
+    def test_qwen21_resolved_as_qwen21_everywhere(self, detections):
+        """All four entry points resolve 2.1 to its OWN key, not to "qwen"."""
+        results = {f: detections(f, "qwen21") for f in _FAMILIES}
+        assert all(r == "qwen21" for r in results.values()), (
+            f"Qwen-Image-2.1 detection diverges across families: {results}"
+        )
+
+    def test_qwen21_not_claimed_by_generic_qwenimage_probe(self):
+        """REGRESSION GUARD: the class name CONTAINS "QwenImage", so the
+        substring probe would return "qwen" (1.0) for 2.1 unless an explicit
+        class-name check runs first.  1.0 has a 8x VAE + patchify, 2.1 has
+        16x + none — routing one as the other silently mis-sizes the grid."""
+        from src.model_detect import resolve_model_type
+
+        dm = make_qwen21_dm()
+        assert "QwenImage" in type(dm).__name__
+        got = resolve_model_type(dm, "auto")
+        assert got == "qwen21", (
+            f"Qwen-Image-2.1 resolved to {got!r}; the generic "
+            f'"QwenImage" in class_name probe claimed it for 1.0'
+        )
+        assert got != "qwen"
+
+    def test_qwen_image_1_0_still_resolves_to_qwen(self):
+        """Guard against over-matching: 1.0 must keep the "qwen" key."""
+        from src.model_detect import resolve_model_type
+
+        assert resolve_model_type(make_qwen10_dm(), "auto") == "qwen"
+        assert resolve_model_type(make_qwen10_dm(), "auto") != "qwen21"
+        # And the other classic 1.0-shaped class names too.
+        assert resolve_model_type(_make_dm("QwenImageDiT"), "auto") == "qwen"
+
+    def test_qwen21_explicit_requested_overrides_class_name(self):
+        """``requested == "qwen21"`` forces the key for a model whose class
+        name does not name it — the escape hatch for shapes detection cannot
+        recognise (e.g. a repackaged 2.1 checkpoint)."""
+        from src.model_detect import resolve_model_type
+
+        dm = _make_dm("SomeRepackagedDiT")
+        assert resolve_model_type(dm, "qwen21") == "qwen21"
+        assert resolve_model_type(dm, "auto") != "qwen21"
+
+    def test_qwen21_class_name_is_never_downgraded_to_qwen(self):
+        """The inverse guard, and the SAME precedence Krea-2 already has:
+        class-name checks run BEFORE ``requested``, so no requested string
+        can route a 2.1 model through the 1.0 code path."""
+        from src.model_detect import resolve_model_type
+
+        dm = make_qwen21_dm()
+        for requested in ("auto", "qwen", "flux", "anima", "krea2"):
+            assert resolve_model_type(dm, requested) == "qwen21", (
+                f"requested={requested!r} downgraded Qwen-Image-2.1 away "
+                f"from its own key"
+            )
+
+    def test_spa_resolve_type_delegates_for_qwen21(self):
+        """T1.2: SPA (and HAP, which imports it at call time) inherits the key
+        for free through the shared adapter — no second detector copy."""
+        dm = make_qwen21_dm()
+        assert spa_mod._spa_resolve_type("auto", dm) == "qwen21"
+        assert spa_mod._spa_resolve_type("qwen21", dm) == "qwen21"

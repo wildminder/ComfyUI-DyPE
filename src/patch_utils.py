@@ -75,6 +75,10 @@ class ModelGeometry:
     derived_base_patches: int        # base grid side in patches
     derived_base_seq_len: int        # base sequence length (patches^2, or h*w)
     detected: str                    # from resolve_model_type
+    # VAE spatial downscale factor (pixels per latent side).  Appended last
+    # WITH a default so every existing construction keeps working: 8 for every
+    # architecture the pack has shipped, 16 for Qwen-Image-2.1.
+    latent_downscale: int = 8
 
 
 def resolve_model_geometry(m: ModelPatcher, model_type: str,
@@ -98,12 +102,24 @@ def resolve_model_geometry(m: ModelPatcher, model_type: str,
             base_patch_h_tokens = int(axes_lens[1])
             base_patch_w_tokens = int(axes_lens[2])
 
+    # Qwen-Image-2.1 has no patchify (one token per latent position) and a
+    # 16x VAE; every other supported architecture has patch_size=2 over an 8x
+    # VAE.  These two facts previously "cancelled" against each other
+    # (H/8/2 == H/16) so the token math was accidentally right while
+    # ``patch_size`` was read from an attribute that does not exist on 2.1.
+    # Both are now explicit instead of accidental.
+    latent_downscale = 16 if detected == "qwen21" else 8
+
     patch_size = 2
     try:
         if detected == "nunchaku":
             patch_size = dm.model.config.patch_size
         elif detected == "anima":
             patch_size = dm.patch_spatial
+        elif detected == "qwen21":
+            # No patchify — read it from nowhere; the branch exists so the
+            # AttributeError below does NOT fire and log a misleading warning.
+            patch_size = 1
         else:
             patch_size = dm.patch_size
     except (AttributeError, TypeError) as e:
@@ -113,7 +129,7 @@ def resolve_model_geometry(m: ModelPatcher, model_type: str,
         derived_base_patches = max(base_patch_h_tokens, base_patch_w_tokens)
         derived_base_seq_len = base_patch_h_tokens * base_patch_w_tokens
     else:
-        derived_base_patches = (base_resolution // 8) // 2
+        derived_base_patches = (base_resolution // latent_downscale) // patch_size
         derived_base_seq_len = derived_base_patches * derived_base_patches
 
     return ModelGeometry(
@@ -123,6 +139,7 @@ def resolve_model_geometry(m: ModelPatcher, model_type: str,
         derived_base_patches=derived_base_patches,
         derived_base_seq_len=derived_base_seq_len,
         detected=detected,
+        latent_downscale=latent_downscale,
     )
 
 
@@ -158,7 +175,7 @@ def apply_dype_to_model(model: ModelPatcher, model_type: str, width: int, height
     if enable_dype and should_patch_schedule and not is_anima:
         try:
             if _should_patch_schedule(m, is_qwen, is_z_image):
-                latent_h, latent_w = height // 8, width // 8
+                latent_h, latent_w = height // geo.latent_downscale, width // geo.latent_downscale
                 padded_h, padded_w = math.ceil(latent_h / patch_size) * patch_size, math.ceil(latent_w / patch_size) * patch_size
                 image_seq_len = (padded_h // patch_size) * (padded_w // patch_size)
 
@@ -349,7 +366,7 @@ def apply_sega_to_model(
     if not is_anima:
         try:
             if _should_patch_schedule(m, is_qwen, is_z_image):
-                latent_h, latent_w = height // 8, width // 8
+                latent_h, latent_w = height // geo.latent_downscale, width // geo.latent_downscale
                 padded_h, padded_w = math.ceil(latent_h / patch_size) * patch_size, math.ceil(latent_w / patch_size) * patch_size
                 image_seq_len = (padded_h // patch_size) * (padded_w // patch_size)
 

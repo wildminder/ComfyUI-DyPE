@@ -299,3 +299,42 @@ class TestPerAxisTheta:
         pos = self._make_pos(8, 8)
         components = emb.get_components(pos, torch.float32)
         assert len(components) == 3
+
+
+@pytest.mark.unit
+class TestDefaultBasePatchGrid:
+    """The default ``base_patch_grid`` heuristic in ``src/base.py`` is a THIRD
+    hardcoded ``(base_resolution // 8) // 2`` — the same cancellation as the
+    ``patch_size``/``//8`` pair in ``resolve_model_geometry``.
+
+    For Qwen-Image-2.1 (16x VAE, no patchify) that heuristic still evaluates
+    to the CORRECT 64-token base grid, by accident rather than by design.
+    It is deliberately left unchanged (changing it would be churn with no
+    behavioural effect) and pinned here instead: if the heuristic is ever
+    "fixed" the base grid for every architecture moves, and this test fails
+    first.
+    """
+
+    def test_qwen21_base_patch_grid_is_64(self):
+        """2.1 at base_resolution=1024 -> (64, 64), matching its real
+        1024/16/1 = 64 latent grid side."""
+        emb = ConcreteEmbed(
+            theta=10000, axes_dim=[16, 56, 56], base_resolution=1024)
+        assert emb.base_patch_grid == (64, 64)
+        assert emb.base_patches == 64
+        # The correct 2.1 value, derived from its own geometry rather than
+        # from the heuristic.
+        assert emb.base_patch_grid == ((1024 // 16) // 1,) * 2
+
+    def test_explicit_base_patch_grid_overrides_heuristic(self):
+        emb = ConcreteEmbed(theta=10000, axes_dim=[16, 56, 56], base_resolution=1024)
+        int_form = ConcreteEmbed(
+            theta=10000, axes_dim=[16, 56, 56], base_resolution=1024,
+            base_patch_grid=32)
+        tuple_form = ConcreteEmbed(
+            theta=10000, axes_dim=[16, 56, 56], base_resolution=1024,
+            base_patch_grid=(48, 32))
+        assert int_form.base_patch_grid == (32, 32)
+        assert tuple_form.base_patch_grid == (48, 32)
+        assert tuple_form.base_patches == 48
+        assert emb.base_patch_grid != int_form.base_patch_grid
