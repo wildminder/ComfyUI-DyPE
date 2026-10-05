@@ -16,10 +16,12 @@ from comfy_api.latest import io
 try:
     from ..src.effective_sampling import effective_model_sampling, warn_if_stale_leak
     from ..src.pixelrush import PixelRushConfig, pixelrush_cascade
+    from ..src.prefix_cache import disable_prefix_kv_cache
     from ..src.vae_channels import pad_to_vae_channels, strip_alpha_channel
 except ImportError:
     from src.effective_sampling import effective_model_sampling, warn_if_stale_leak
     from src.pixelrush import PixelRushConfig, pixelrush_cascade
+    from src.prefix_cache import disable_prefix_kv_cache
     from src.vae_channels import pad_to_vae_channels, strip_alpha_channel
 
 logger = logging.getLogger("ComfyUI-DyPE")
@@ -587,6 +589,10 @@ class PixelRushNode(io.ComfyNode):
         import comfy.utils
 
         warn_if_stale_leak(model, "PixelRush")
+
+        # Cascade stages change the latent shape, which is part of 2.1's prefix
+        # K/V cache key — see src/prefix_cache.py.
+        model = disable_prefix_kv_cache(model)
 
         # Get initial latent
         if isinstance(latent_image, dict):

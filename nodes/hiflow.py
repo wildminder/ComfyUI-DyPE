@@ -22,11 +22,13 @@ try:
     from ..src.effective_sampling import effective_model_sampling, warn_if_stale_leak
     from ..src.freescale import gaussian_blur_2d
     from ..src.hiflow import HiFlowConfig, hiflow_cascade
+    from ..src.prefix_cache import disable_prefix_kv_cache
     from ..src.vae_channels import pad_to_vae_channels, strip_alpha_channel
 except ImportError:  # flat repo layout (tests / CLI)
     from src.effective_sampling import effective_model_sampling, warn_if_stale_leak
     from src.freescale import gaussian_blur_2d
     from src.hiflow import HiFlowConfig, hiflow_cascade
+    from src.prefix_cache import disable_prefix_kv_cache
     from src.vae_channels import pad_to_vae_channels, strip_alpha_channel
 
 from .pixelrush import _detect_prediction_type
@@ -461,6 +463,12 @@ class HiFlowNode(io.ComfyNode):
         # don't (Krea2 plan S2).
         _, latent_dimensions = _require_flow_model(model)
         warn_if_stale_leak(model, "HiFlow")
+
+        # Qwen-Image-2.1 keys its prefix K/V cache on the latent shape, so each
+        # cascade stage adds a slot and the upstream LRU eviction then raises on
+        # a tensor-valued dict comparison.  A cascade invalidates that cache
+        # anyway — see src/prefix_cache.py.
+        model = disable_prefix_kv_cache(model)
 
         if isinstance(latent_image, dict):
             initial_latent = latent_image["samples"]

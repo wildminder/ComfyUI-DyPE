@@ -22,12 +22,14 @@ try:
     from ..src.freescale import (
         forward_noise,
     )
+    from ..src.prefix_cache import disable_prefix_kv_cache
     from ..src.vae_channels import pad_to_vae_channels, strip_alpha_channel
 except ImportError:  # flat repo layout (tests / CLI)
     from src.effective_sampling import effective_model_sampling
     from src.freescale import (
         forward_noise,
     )
+    from src.prefix_cache import disable_prefix_kv_cache
     from src.vae_channels import pad_to_vae_channels, strip_alpha_channel
 
 logger = logging.getLogger("ComfyUI-DyPE")
@@ -330,6 +332,11 @@ class FreeScaleNode(io.ComfyNode):
         import comfy.model_management
         import comfy.samplers
         import comfy.utils
+
+        # FreeScale re-noises and resamples at the target resolution, so the
+        # latent shape changes under 2.1's prefix K/V cache key — see
+        # src/prefix_cache.py.
+        model = disable_prefix_kv_cache(model)
 
         # Get initial latent
         if isinstance(latent_image, dict):

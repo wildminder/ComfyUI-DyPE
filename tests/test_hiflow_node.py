@@ -140,6 +140,22 @@ def _mock_flow_model(latent_dimensions=2, prediction_mixin="CONST"):
     model.model_options = {}
     model.load_device = torch.device("cpu")
     model.pre_run = lambda: None
+
+    def _clone(_self=model):
+        """Mirror ModelPatcher.clone(): a new patcher with copied model_options.
+
+        The cascade nodes clone before writing run-scoped options (Qwen-Image 2.1's
+        prefix K/V cache — see src/prefix_cache.py), so the mock has to model the
+        copy or it stops representing the production path.
+        """
+        out = types.SimpleNamespace(**vars(_self))
+        out.model_options = {
+            k: (v.copy() if isinstance(v, dict) else v)
+            for k, v in _self.model_options.items()
+        }
+        return out
+
+    model.clone = _clone
     return model
 
 
