@@ -1,22 +1,38 @@
-"""Tests for SPA model adapters (FLUX / Qwen / Z-Image / Nunchaku).
+"""Tests for SPA model adapters (FLUX / Qwen / Qwen-2.1 / Z-Image / Nunchaku).
 
 These verify that each SPA embedder produces the *same output format* as its
 DyPE counterpart, that ``forward`` returns the **base** RoPE (not the averaged
 variant RoPE — the root-cause bug is removed), and that it registers the ``N``
 bundled variant RoPEs in the process-scoped :class:`SPAContext` for the attention
 hook.  Pure unit tests — no ComfyUI runtime required.
+
+Qwen-Image-2.1 (``PosEmbedSPAQwen21``) runs the SAME battery with no
+modification: the parametrization is the proof that the MRO wiring is right
+(``SPABasePosEmbed.forward`` registers the variants, ``format_components``
+resolves through ``PosEmbedQwen21`` -> ``PosEmbedQwen``).  Its dtype override is
+the one intentional deviation and is asserted separately at the bottom.
 """
+import types
+
 import pytest
 import torch
 
 from src.models.spa_flux import PosEmbedSPAFlux
 from src.models.spa_nunchaku import PosEmbedSPANunchaku
 from src.models.spa_qwen import PosEmbedSPAQwen
+from src.models.spa_qwen21 import PosEmbedSPAQwen21
 from src.models.spa_zimage import PosEmbedSPAZImage
-from src.spa import build_bundle_id_variants, get_spa_context
+from src.spa import _spa_restore_installed, build_bundle_id_variants, get_spa_context
+from src.spa_context import set_spa_context
 
-_ADAPTERS = [PosEmbedSPAFlux, PosEmbedSPAQwen, PosEmbedSPAZImage, PosEmbedSPANunchaku]
-_ADAPTER_NAMES = ["flux", "qwen", "zimage", "nunchaku"]
+_ADAPTERS = [
+    PosEmbedSPAFlux,
+    PosEmbedSPAQwen,
+    PosEmbedSPAQwen21,
+    PosEmbedSPAZImage,
+    PosEmbedSPANunchaku,
+]
+_ADAPTER_NAMES = ["flux", "qwen", "qwen21", "zimage", "nunchaku"]
 
 
 def _make_flux_ids(H=64, W=64, B=1):
@@ -120,3 +136,157 @@ class TestPosEmbedSPAAdapters:
         # at least one variant pe differs from the base pe (bundling changed coords)
         diff = torch.stack([(vp - ctx.base_pe).abs().max() for vp in ctx.variant_pes])
         assert diff.max() > 1e-4
+
+
+@pytest.mark.unit
+class TestPosEmbedSPAQwen21Specifics:
+    """The one intentional deviation from the 1.0 adapter: fp32 frequencies.
+
+    2.1 hands ``pe`` straight to its own fused RoPE kernel with no
+    ``.to(x.dtype)`` cast (1.0 casts), so a bfloat16 PE would silently change
+    the dtype the model's kernel receives.
+    """
+
+    def test_output_matches_the_qwen_1_0_adapter_bit_for_bit(self):
+        """Negative control: the fp32 pin changes the DTYPE RULE, not the math."""
+        ids = _make_flux_ids(32, 32)
+        qwen21 = _make_emb(PosEmbedSPAQwen21, enable_spa=True, bundle_size=3)(ids)
+        set_spa_context(None)
+        qwen10 = _make_emb(PosEmbedSPAQwen, enable_spa=True, bundle_size=3)(ids)
+        assert qwen21.shape == qwen10.shape
+        assert torch.equal(qwen21, qwen10)
+
+    def test_freqs_dtype_is_float32_even_on_cuda(self):
+        """``_freqs_dtype`` is fp32 regardless of device — including CUDA.
+
+        The device is faked (no GPU required in CI); what is asserted is the
+        DECISION the adapter makes, which is the only thing that differs from
+        the base rule.
+        """
+        emb = _make_emb(PosEmbedSPAQwen21, bundle_size=1)
+        cuda = torch.zeros(1, device="meta")
+        assert emb._freqs_dtype(cuda) == torch.float32
+
+    @pytest.mark.parametrize("bundle_size", [1, 3])
+    def test_both_forward_paths_use_float32(self, bundle_size):
+        """``bundle_size=1`` hits forward's early return; 3 bundles.
+
+        The finished PE is up-cast by ``format_components`` regardless, so its
+        dtype proves nothing — the observed quantity is the ``freqs_dtype``
+        handed to ``_spa_components``.
+        """
+        emb = _make_emb(PosEmbedSPAQwen21, bundle_size=bundle_size)
+        seen = []
+        original = emb._spa_components
+
+        def spy(pos, freqs_dtype):
+            seen.append(freqs_dtype)
+            return original(pos, freqs_dtype)
+
+        emb._spa_components = spy
+        emb(_make_flux_ids(96, 96))
+        assert seen and all(dt == torch.float32 for dt in seen)
+
+    def test_registers_total_len_for_the_causal_prefix_mode(self):
+        """``total_len`` is what the shared wrapper's segment gate keys on."""
+        emb = _make_emb(PosEmbedSPAQwen21, enable_spa=True, bundle_size=3)
+        emb(_make_flux_ids(128, 128))
+        ctx = get_spa_context()
+        assert ctx is not None
+        assert ctx.total_len == 128 * 128
+        set_spa_context(None)
+
+
+# ---------------------------------------------------------------------------
+# apply_spa_to_model wiring: which adapter, which joint mode
+# ---------------------------------------------------------------------------
+
+class QwenImage21Transformer2DModel:  # noqa: N801 - detection reads this exact name
+    def __init__(self):
+        self.pe_embedder = types.SimpleNamespace(theta=10000, axes_dim=[16, 56, 56])
+
+
+class _FluxDiT:  # negative control (detected as FLUX via ``pe_embedder``)
+    def __init__(self):
+        self.pe_embedder = types.SimpleNamespace(theta=10000, axes_dim=[16, 56, 56])
+
+
+class _MockPatcher:
+    """Minimal ModelPatcher stand-in for ``apply_spa_to_model``."""
+
+    def __init__(self, dm):
+        self.model = types.SimpleNamespace(diffusion_model=dm)
+        self._object_patches = {}
+        self._unet_wrapper = None
+
+    def clone(self):
+        new = _MockPatcher(self.model.diffusion_model)
+        new._object_patches = dict(self._object_patches)
+        return new
+
+    def add_object_patch(self, path, obj):
+        self._object_patches[path] = obj
+
+    def set_model_unet_function_wrapper(self, fn):
+        self._unet_wrapper = fn
+
+
+def _patched_embedder(m):
+    """The embedder ``apply_spa_to_model`` installed (its only object patch)."""
+    (obj,) = m._object_patches.values()
+    return obj
+
+
+@pytest.mark.mock_integration
+class TestApplySpaToModelQwen21:
+    """``apply_spa_to_model`` must pick the 2.1 adapter AND its joint mode.
+
+    Both halves matter: the adapter class decides the RoPE format and the fp32
+    frequency rule, the joint-mode attr decides how the shared attention wrapper
+    treats the per-block segment calls.  A model patched with the 1.0 adapter (or
+    left in the default joint mode) still "works" — it is silently wrong.
+    """
+
+    def _apply(self, dm, **kw):
+        from src.spa import apply_spa_to_model
+
+        m = apply_spa_to_model(_MockPatcher(dm), "auto", 1024, 1024, **kw)
+        try:
+            return m, _patched_embedder(m)
+        finally:
+            _spa_restore_installed(m)  # never leak a patched symbol
+
+    def test_installs_the_qwen21_embedder_and_joint_mode(self):
+        m, emb = self._apply(QwenImage21Transformer2DModel(), bundle_size=3)
+        assert isinstance(emb, PosEmbedSPAQwen21)
+        assert emb._rope_fmt == "flux"
+        assert m._spa_joint_mode == "causal_prefix"
+
+    def test_installs_on_the_pe_embedder_path(self):
+        """2.1's embedder attribute is ``pe_embedder`` (same as 1.0)."""
+        m = _MockPatcher(QwenImage21Transformer2DModel())
+        from src.spa import apply_spa_to_model
+
+        out = apply_spa_to_model(m, "auto", 1024, 1024, bundle_size=3)
+        try:
+            assert "diffusion_model.pe_embedder" in out._object_patches
+        finally:
+            _spa_restore_installed(out)
+
+    def test_other_backends_keep_the_joint_mode(self):
+        """Negative control: the mode is never left stale from a previous apply."""
+        _, emb = self._apply(_FluxDiT(), bundle_size=3)
+        assert isinstance(emb, PosEmbedSPAFlux)
+        assert not isinstance(emb, PosEmbedSPAQwen21)
+
+    def test_joint_mode_is_reset_for_a_non_qwen21_reapply(self):
+        """A clone carrying ``causal_prefix`` onto another backend is corrected."""
+        from src.spa import apply_spa_to_model
+
+        src = _MockPatcher(_FluxDiT())
+        src._spa_joint_mode = "causal_prefix"  # as if it had been applied to 2.1
+        out = apply_spa_to_model(src, "auto", 1024, 1024, bundle_size=3)
+        try:
+            assert out._spa_joint_mode == "joint"
+        finally:
+            _spa_restore_installed(out)

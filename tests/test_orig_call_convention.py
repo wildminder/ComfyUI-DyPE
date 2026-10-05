@@ -18,6 +18,8 @@ Markers: @pytest.mark.unit / @pytest.mark.mock_integration
 """
 
 import inspect
+import sys
+import types
 
 import pytest
 import torch
@@ -30,8 +32,14 @@ from src.spa_context import (
     set_hap_context,
     set_hrdit_layer_idx,
     set_spa_context,
+    set_spa_joint_mode,
     set_spa_step_gate,
 )
+
+try:
+    from tests._hrdit_fixtures import make_recording_orig
+except ImportError:  # namespace-package import fallback
+    from _hrdit_fixtures import make_recording_orig
 
 #: Canonical real-ComfyUI attention parameter order (attention_pytorch).
 CANONICAL_PARAMS = (
@@ -67,6 +75,7 @@ def _clean_state():
     set_hap_context(None)
     set_spa_context(None)
     set_spa_step_gate(True)
+    set_spa_joint_mode(None)
     set_hrdit_layer_idx(0)
     hap.HapRuntime.reset()
 
@@ -316,3 +325,201 @@ class TestSpaActiveConvention:
         # Output is finite and shaped correctly (averaged plain attention).
         assert out.shape == q.shape
         assert torch.isfinite(out).all()
+
+
+# ---------------------------------------------------------------------------
+# Qwen-Image-2.1 conventions (its OWN bound symbol) + the prefill-cache path
+# ---------------------------------------------------------------------------
+
+#: Small-but-real 2.1 geometry: 2 text tokens + a 2x2 image grid, 4 heads of
+#: dim 8 -> head-FLATTENED width 32 and rotations over P = D // 2 = 4.
+QWEN21_TEXT_LEN = 2
+QWEN21_TOTAL_LEN = QWEN21_TEXT_LEN + 4
+QWEN21_HEADS = 4
+QWEN21_HEAD_DIM = 8
+
+
+def _qwen21_orig(record):
+    """A 2.1-shaped ``orig``: head-flattened in, ComfyUI's head split inside.
+
+    Built ON TOP of the mandated :func:`make_recording_orig` factory (the real
+    ComfyUI signature is still asserted at construction time).  The shim adds
+    only the two conventions 2.1 relies on and the factory does not model: the
+    ``not skip_reshape`` head split that ``attention_pytorch`` performs on
+    ``(B, N, H*D)`` inputs, and the flatten-back matching
+    ``skip_output_reshape=False``.  The 8 recorded slots are captured BEFORE the
+    split, so they describe the convention as the caller sent it.
+    """
+    base = make_recording_orig(record=record)
+
+    def orig(q, k, v, heads, mask=None, attn_precision=None,
+             skip_reshape=False, skip_output_reshape=False, **kwargs):
+        if not skip_reshape:
+            d = q.shape[-1] // heads
+            q = q.reshape(q.shape[0], q.shape[1], heads, d).transpose(1, 2)
+            k = k.reshape(k.shape[0], k.shape[1], heads, d).transpose(1, 2)
+            v = v.reshape(v.shape[0], v.shape[1], heads, d).transpose(1, 2)
+        out = base(q, k, v, heads, mask, attn_precision,
+                   skip_reshape, skip_output_reshape, **kwargs)
+        if not skip_output_reshape:
+            b, h, n, d = out.shape
+            out = out.permute(0, 2, 1, 3).reshape(b, n, h * d)
+        return out
+
+    return orig
+
+
+def _qwen21_ctx(total_len=QWEN21_TOTAL_LEN, n_variants=3):
+    """Identity-variant SPA context in 2.1's flux layout, with ``total_len``.
+
+    Identity rotations keep the math plain attention while the PASS COUNT and
+    the segment arithmetic (``end == total_len`` -> target segment) stay
+    observable.
+    """
+    eye = torch.eye(2).expand(1, 1, total_len, QWEN21_HEAD_DIM // 2, 2, 2).clone()
+    return SPAContext(
+        active=True, bundle_size=n_variants, base_pe=eye.clone(),
+        variant_pes=[eye.clone() for _ in range(n_variants)],
+        variant_deltas=[eye.clone() for _ in range(n_variants)],
+        pre_roped=True, fmt="flux", text_len=QWEN21_TEXT_LEN,
+        total_len=total_len,
+    )
+
+
+def _qwen21_qkv(length, seed):
+    """Head-flattened ``(B, N, H*D)`` q/k/v exactly as 2.1 hands them over."""
+    g = torch.Generator().manual_seed(seed)
+    width = QWEN21_HEADS * QWEN21_HEAD_DIM
+    return (
+        torch.randn(1, length, width, generator=g),
+        torch.randn(1, length, width, generator=g),
+        torch.randn(1, length, width, generator=g),
+    )
+
+
+@pytest.fixture
+def qwen21_backend(monkeypatch):
+    """Install the hook on ``comfy.ldm.qwen_image21.model``'s OWN symbol.
+
+    2.1 binds the unmasked ``optimized_attention`` into its own module and
+    never looks at ``comfy.ldm.modules.attention``, so the convention has to be
+    asserted on THAT symbol — a test driving the global module attribute would
+    pass even if 2.1's real call site were left unpatched.  Yields
+    ``(module, calls, patcher)``; uninstalls on teardown.
+    """
+    from src.spa import _spa_restore_installed
+
+    record = []
+    mod = types.ModuleType("comfy.ldm.qwen_image21.model")
+    mod.optimized_attention = _qwen21_orig(record)
+    monkeypatch.setitem(sys.modules, "comfy.ldm.qwen_image21", types.ModuleType("p"))
+    monkeypatch.setitem(sys.modules, "comfy.ldm.qwen_image21.model", mod)
+
+    m = _MockModel()
+    m._object_patches = {}
+    _hrdit_install_hook(m, "qwen21", consumer="spa")
+    try:
+        yield mod, record, m
+    finally:
+        _spa_restore_installed(m)
+
+
+@pytest.mark.mock_integration
+class TestQwen21CallConventions:
+    """2.1's real call convention, as ``build_sequence``/``prefix_cached_attention``
+    emit it (``comfy/ldm/qwen_image21/model.py``).
+    """
+
+    def test_block_causal_text_segment_convention(self, qwen21_backend):
+        """Text segment: ``(..., heads, mask=mask, transformer_options=...,
+        preferred_attention=...)`` — mask as KEYWORD, heads positional slot 4."""
+        mod, record, _ = qwen21_backend
+        to = {"qwen21": True}
+        mask = torch.ones(QWEN21_TEXT_LEN, QWEN21_TEXT_LEN, dtype=torch.bool).tril()
+        q, k, v = _qwen21_qkv(QWEN21_TEXT_LEN, seed=30)
+
+        out = mod.optimized_attention(q, k, v, QWEN21_HEADS, mask=mask,
+                                      transformer_options=to, preferred_attention=None)
+
+        assert len(record) == 1  # a masked text segment declines SPA
+        rec = record[0]
+        assert rec[4] is mask          # slot 5 == mask
+        assert rec[5] is None          # slot 6 == attn_precision (never sent)
+        assert rec[6] is False         # slot 7 == skip_reshape (never sent)
+        assert rec[7] is False         # slot 8 == skip_output_reshape
+        assert out.shape == (1, QWEN21_TEXT_LEN, QWEN21_HEADS * QWEN21_HEAD_DIM)
+
+    def test_block_causal_image_segment_runs_spa_with_the_same_convention(self, qwen21_backend):
+        """Image target segment: mask=None, and EVERY SPA pass forwards the
+        caller's convention unchanged."""
+        mod, record, _ = qwen21_backend
+        set_hrdit_layer_idx(0)
+        set_spa_joint_mode("causal_prefix")
+        ctx = _qwen21_ctx()
+        set_spa_context(ctx)
+        to = {"qwen21": True}
+        q, k, v = _qwen21_qkv(QWEN21_TOTAL_LEN, seed=31)
+        try:
+            out = mod.optimized_attention(q[:, QWEN21_TEXT_LEN:], k, v, QWEN21_HEADS,
+                                          mask=None, transformer_options=to,
+                                          preferred_attention=None)
+        finally:
+            set_spa_context(None)
+            set_spa_joint_mode(None)
+
+        assert len(record) == len(ctx.variant_pes)  # SPA ran, not a silent no-op
+        for rec in record:
+            assert rec[4] is None
+            assert rec[5] is None
+            assert rec[6] is False
+            assert rec[7] is False
+        assert out.shape == (1, QWEN21_TOTAL_LEN - QWEN21_TEXT_LEN,
+                             QWEN21_HEADS * QWEN21_HEAD_DIM)
+
+    def test_prefill_cache_call_convention(self, qwen21_backend):
+        """Cached step: ONE unmasked call, ``q`` target rows over
+        ``k = [cached prefix, target]`` — it lands on the target branch and runs
+        SPA with the same convention.
+
+        ``prefix_cached_attention`` is not special-cased anywhere; the claim that
+        it is compatible is pinned here rather than assumed.
+        """
+        mod, record, _ = qwen21_backend
+        set_hrdit_layer_idx(0)
+        set_spa_joint_mode("causal_prefix")
+        ctx = _qwen21_ctx()
+        set_spa_context(ctx)
+        to = {"qwen21": True}
+        target_q, target_k, target_v = _qwen21_qkv(
+            QWEN21_TOTAL_LEN - QWEN21_TEXT_LEN, seed=32)
+        # ``prefix_cached_attention``: the cached prefix's k/v are concatenated in
+        # front of the step's TARGET-ONLY k/v, so k spans the full sequence.
+        prefix_k, prefix_v = _qwen21_qkv(QWEN21_TEXT_LEN, seed=33)[1:]
+        k = torch.cat([prefix_k, target_k], dim=1)
+        v = torch.cat([prefix_v, target_v], dim=1)
+        try:
+            out = mod.optimized_attention(target_q, k, v, QWEN21_HEADS,
+                                          transformer_options=to,
+                                          preferred_attention=None)
+        finally:
+            set_spa_context(None)
+            set_spa_joint_mode(None)
+
+        assert len(record) == len(ctx.variant_pes)  # ran SPA, did NOT decline
+        for rec in record:
+            assert rec[4] is None       # no mask on the cached path at all
+            assert rec[6] is False      # skip_reshape never sent by 2.1
+            assert rec[7] is False
+            # The recording happens after ``attention_pytorch``'s own head split,
+            # so the layouts are observed in head form: k spans [prefix, target],
+            # q stays target-only.
+            assert rec[1].shape == (1, QWEN21_HEADS, QWEN21_TOTAL_LEN, QWEN21_HEAD_DIM)
+            assert rec[0].shape == (1, QWEN21_HEADS,
+                                    QWEN21_TOTAL_LEN - QWEN21_TEXT_LEN, QWEN21_HEAD_DIM)
+        assert out.shape == target_q.shape
+        assert torch.isfinite(out).all()
+
+    def test_qwen_1_0_masked_target_is_not_patched(self, qwen21_backend):
+        """Negative control: 2.1's own module keeps the 1.0 symbol untouched."""
+        mod, _, _ = qwen21_backend
+        assert not hasattr(mod, "optimized_attention_masked")
