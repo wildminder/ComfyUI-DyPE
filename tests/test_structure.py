@@ -33,12 +33,13 @@ SRC_DIR = PROJECT_ROOT / "src"
 ALL_NODE_CLASSES = [
     "DyPE_FLUX", "SEGA", "SPA", "HAP",
     "HAPCalibrate", "PixelRushNode", "FreeScaleNode", "HiFlowNode",
+    "EmptyQwenImage21LatentImage",
 ]
 
 # Expected node modules once every layout-plan step has landed.
 EXPECTED_NODE_MODULES = [
     "dype", "sega", "spa", "hap",
-    "hap_calibrate", "freescale", "pixelrush", "hiflow",
+    "hap_calibrate", "freescale", "pixelrush", "hiflow", "qwen21_latent",
 ]
 
 _OLD_CATEGORIES = ("model_patches/position_encoding", "image/upscaling")
@@ -112,8 +113,8 @@ class TestStructureGuard:
             "entry __init__.py must not define node classes"
         )
 
-    def test_entry_node_list_is_8_classes(self):
-        """get_node_list() must return exactly the 8 registered classes."""
+    def test_entry_node_list_is_every_registered_class(self):
+        """get_node_list() must return exactly ALL_NODE_CLASSES."""
         src = _entry_src()
         start = src.index("async def get_node_list")
         body = src[start:]
@@ -127,7 +128,7 @@ class TestStructureGuard:
         )
 
     def test_nodes_init_exports_all_classes(self):
-        """import nodes (flat, mock-comfy env) exposes all 8 node classes."""
+        """import nodes (flat, mock-comfy env) exposes every node class."""
         import nodes  # repo root on sys.path via conftest
 
         for cls in ALL_NODE_CLASSES:
@@ -232,8 +233,8 @@ class TestComfyLoaderRegression:
         finally:
             sys.modules.pop(sys_module_name, None)
 
-    def test_entrypoint_returns_8_node_extension(self):
-        """comfy_entrypoint() → get_node_list() yields the 8 node classes
+    def test_entrypoint_returns_every_node(self):
+        """comfy_entrypoint() → get_node_list() yields every node class
         (runtime import through loader mechanics, mock-comfy env)."""
         sys_module_name = str(PROJECT_ROOT).replace(".", "_x_")
         try:

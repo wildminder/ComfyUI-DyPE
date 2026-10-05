@@ -14,6 +14,7 @@ from .hap_calibrate import HAPCalibrate
 from .pixelrush import PixelRushNode
 from .freescale import FreeScaleNode
 from .hiflow import HiFlowNode
+from .qwen21_latent import EmptyQwenImage21LatentImage
 
 __all__ = [
     "DyPE_FLUX",
@@ -24,4 +25,5 @@ __all__ = [
     "PixelRushNode",
     "FreeScaleNode",
     "HiFlowNode",
+    "EmptyQwenImage21LatentImage",
 ]

@@ -22,11 +22,13 @@ try:
     from ..src.freescale import (
         forward_noise,
     )
+    from ..src.vae_channels import pad_to_vae_channels, strip_alpha_channel
 except ImportError:  # flat repo layout (tests / CLI)
     from src.effective_sampling import effective_model_sampling
     from src.freescale import (
         forward_noise,
     )
+    from src.vae_channels import pad_to_vae_channels, strip_alpha_channel
 
 logger = logging.getLogger("ComfyUI-DyPE")
 
@@ -225,6 +227,11 @@ def _make_vae_adapters(vae, device, model=None):
             decoded = decoded[:, 0]
         elif decoded.ndim == 3:
             decoded = decoded.unsqueeze(0)
+        # RGBA VAEs (Qwen-Image 2.1) decode [B, H, W, 4] — drop alpha BEFORE
+        # the layout probe below, which matches on exactly 3 channels and would
+        # otherwise leave a channels-last 4-channel tensor in a
+        # channels-first pipeline.
+        decoded = strip_alpha_channel(decoded, vae, "FreeScale")
         if decoded.dim() == 4 and decoded.shape[-1] == 3:
             decoded = decoded.movedim(-1, 1)
         elif decoded.dim() == 4 and decoded.shape[1] == 3:
@@ -235,6 +242,9 @@ def _make_vae_adapters(vae, device, model=None):
         image = image.to(device)
         if image.dim() == 4 and image.shape[1] == 3:
             image = image.movedim(1, -1)
+        # An RGBA VAE wants four channels; pad with its own opaque-alpha
+        # value (see src/vae_channels.py).
+        image = pad_to_vae_channels(image, vae)
         encoded = vae.encode(image)
         if isinstance(encoded, dict):
             encoded = encoded["samples"]

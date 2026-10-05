@@ -332,6 +332,7 @@ All nodes registered by this pack (V3 schema ids):
 | `PixelRushNode` | PixelRush | Cascade refinement for existing latents. |
 | `FreeScaleNode` | FreeScale | Tuning-free scale-fusion + self-cascade upscaling. |
 | `HiFlowNode` | HiFlow | Trajectory-guided flow upscaling (initialization + direction + acceleration alignment). |
+| `EmptyQwenImage21LatentImage` | Empty Qwen Image 2.1 Latent | Empty 64-channel latent at 16× for Qwen-Image 2.1 text-to-image sampling (core ships none). |
 
 <p align="right"><a href="#readme-top" title="back to top">⟔ ▲ ⟓</a></p>
 

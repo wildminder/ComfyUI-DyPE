@@ -51,6 +51,10 @@ _CORE_NODES = {
     "VAEDecodeTiled", "VAEEncode", "SaveImage", "PreviewImage",
     "ModelSamplingFlux", "ModelSamplingAuraFlow", "LoraLoaderModelOnly",
     "ConditioningZeroOut", "ImageCompare",
+    # Qwen-Image 2.1 (comfy_extras/nodes_qwen.py). TextEncodeQwenImage21 is
+    # the only 2.1 text encoder core ships; there is no core 2.1 t2i
+    # empty-latent node, which is why the pack registers its own.
+    "TextEncodeQwenImage21", "QwenImage21Cache",
     # UI-format-only helper nodes (never in API graphs)
     "Reroute", "PrimitiveNode", "Note", "MarkdownNote",
     # third-party (documented optional dependency)
