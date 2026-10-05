@@ -168,3 +168,4 @@ cython_debug/
 tmp/
 .workbuddy-ai/
 docs/
+.codegraph
