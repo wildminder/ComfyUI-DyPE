@@ -35,6 +35,7 @@ Design decisions implemented here (plan 2026-10-05, D6/D7/D10/D14):
 from __future__ import annotations
 
 import logging
+import math
 
 import torch
 import torch.nn.functional as F
@@ -104,3 +105,177 @@ def haar_lowpass(x: Tensor, level: int = 1) -> Tensor:
     coarse = F.avg_pool2d(padded.to(compute_dtype), kernel_size=k)
     upsampled = coarse.repeat_interleave(k, dim=-2).repeat_interleave(k, dim=-1)
     return upsampled[..., :h, :w].to(x.dtype)
+
+
+# ---------------------------------------------------------------------------
+# Flow sigma schedules + cosine decay (paper §2.2, static time shift)
+# ---------------------------------------------------------------------------
+
+_VALID_SCHEDULES = ("disable", "cosine_decay", "cosine_shift", "constant")
+
+
+def build_flow_sigmas(steps: int, shift: float) -> Tensor:
+    """Descending flow sigma schedule: ``steps`` interior sigmas + trailing 0.
+
+    Flow times ``t`` are evenly spaced on ``[1, 1/steps]`` (the reference's
+    ``np.linspace(1.0, 1/N, N)``, pipeline_flux_imax.py:636) and re-shifted
+    by the static SNR balance
+
+        sigma(t) = shift * t / (1 + (shift - 1) * t)
+
+    — algebraically identical to ComfyUI's ``ModelSamplingFlux.sigma()``
+    (``flux_time_shift(mu, 1.0, t)`` with ``mu = ln(shift)``,
+    comfy/model_sampling.py:417,431-432). So no ``model_sampling`` patch is
+    needed (plan D3): I-Max owns both schedules and the forward path of a
+    CONST flow model never consults the shift.
+
+    ``shift == 1`` is the identity linspace; larger shifts push more steps
+    into the high-noise regime. Returns float32, length ``steps + 1``,
+    ending in an exact ``0.0``.
+    """
+    if steps < 1:
+        raise ValueError(f"steps must be >= 1; got {steps!r}")
+    if shift <= 0.0:
+        raise ValueError(f"shift must be > 0; got {shift!r}")
+    t = torch.linspace(1.0, 1.0 / steps, steps, dtype=torch.float64)
+    sigmas = shift * t / (1.0 + (shift - 1.0) * t)
+    return torch.cat([sigmas.to(torch.float32), torch.zeros(1)])
+
+
+def cosine_factor(step_index: int, total_steps: int) -> float:
+    """Projected-Flow guidance strength over pass B: 1.0 → ~0.
+
+    Literal port of the reference (pipeline_flux_imax.py:808):
+    ``0.5 * (1 + cos(pi * i / N))``. Note the reference form never reaches
+    exactly 0 at the last step — ``cosine_factor(N-1, N) = pi^2/(4N^2)``
+    (≈ 0.006 at the default N=20) — it is "≈ 0", per the plan's own
+    ``# 1.0 → ~0`` contract. ``total_steps == 1`` degenerates to the first
+    step (full guidance on the only transition).
+    """
+    if total_steps < 1:
+        raise ValueError(f"total_steps must be >= 1; got {total_steps!r}")
+    if not 0 <= step_index < total_steps:
+        raise ValueError(
+            f"step_index must be in [0, {total_steps}); got {step_index!r}"
+        )
+    return 0.5 * (1.0 + math.cos(math.pi * step_index / total_steps))
+
+
+# ---------------------------------------------------------------------------
+# Projected Flow in x0 space (plan D6)
+# ---------------------------------------------------------------------------
+
+def projected_flow_x0(
+    x: Tensor,
+    x0: Tensor,
+    guidance: Tensor,
+    sigma: float,
+    cosine: float,
+    schedule: str,
+    dwt_level: int,
+    p_guidance: Tensor | None = None,
+) -> Tensor:
+    """One Projected-Flow correction of the clean prediction x̂₁ (plan D6).
+
+    The reference corrects the VELOCITY (pipeline_flux_imax.py:806-829):
+
+        fp_v = -(G - x_t) / (t/1000 + 1e-6)
+        v'   = v + c * (P(fp_v) - P(v))
+
+    With ``v = (x_t - x̂₁)/σ``, ``v_G = (x_t - G)/σ`` and P linear, the
+    ``P(x_t)`` terms cancel and Euler-stepping with ``v'`` is exactly
+    stepping with the corrected clean prediction returned here
+    (``test_cosine_decay_equals_velocity_space_reference`` pins it):
+
+        cosine_decay : x̂₁' = x̂₁ + c·(P(G) − P(x̂₁))
+        cosine_shift : x̂₁' = x̂₁ − c·(x̂₁ − G) − (1−c)·(P(x̂₁) − P(G))
+        constant     : x̂₁' = x̂₁ + P(G) − P(x̂₁)
+        disable      : x̂₁' = x̂₁
+
+    ``x`` and ``sigma`` are accepted for call-site parity with the
+    reference's velocity-space form — they cancel analytically in x0
+    space. ``p_guidance`` may carry the once-computed ``P(G)`` (it is
+    constant across pass B, so the dual-pass engine computes it a single
+    time); when omitted it is derived from ``guidance`` here. Unknown
+    schedules raise. Returns ``x̂₁'`` in ``x0.dtype``.
+    """
+    if schedule not in _VALID_SCHEDULES:
+        raise ValueError(
+            f"guidance_schedule must be one of {_VALID_SCHEDULES}; "
+            f"got {schedule!r}"
+        )
+    if schedule == "disable":
+        return x0
+    p_x0 = haar_lowpass(x0, dwt_level)
+    p_g = (
+        p_guidance
+        if p_guidance is not None
+        else haar_lowpass(guidance, dwt_level)
+    )
+    if schedule == "cosine_decay":
+        return x0 + cosine * (p_g - p_x0)
+    if schedule == "cosine_shift":
+        return x0 - cosine * (x0 - guidance) - (1.0 - cosine) * (p_x0 - p_g)
+    # "constant" — full-strength pull toward the low-passed guidance.
+    return x0 + p_g - p_x0
+
+
+# ---------------------------------------------------------------------------
+# Low-resolution pass size (plan D10)
+# ---------------------------------------------------------------------------
+
+def _snap(value: float, multiple: int) -> int:
+    """Round HALF-UP to a multiple (Python's round() is banker's)."""
+    return max(multiple, int(math.floor(value / multiple + 0.5)) * multiple)
+
+
+def low_res_size(
+    h: int,
+    w: int,
+    native: int = 1024,
+    multiple: int = 16,
+    scale: float = 1.0,
+) -> tuple[int, int]:
+    """Low-resolution pass size: aspect-preserving, area-normalised (D10).
+
+    The reference divides both sides by ``int(scale_factor + 0.5)``
+    (pipeline_flux_imax.py:627-628) — a rounded integer factor that
+    distorts aspect whenever ``round(s) != s``. The fix keeps the exact
+    area scale and snaps each side independently:
+
+        h_low = snap(h * native / sqrt(h*w))      (round half-up)
+
+    so the low pass preserves the target's aspect ratio and lands at
+    roughly the NATIVE pixel area. ``scale`` multiplies the AREA
+    (each side scales by ``sqrt(scale)``) — ``low_res_scale=0.5`` halves
+    the guidance area.
+
+    ``s = sqrt(h*w)/native <= 1`` (target at/below native): there is
+    nothing to extrapolate — returns the target size unchanged and logs a
+    WARNING (pass A runs at the target resolution). The result never
+    exceeds the target size.
+
+    Units: PIXELS (the caller converts latent dims through its VAE
+    downscale factor; ``multiple=16`` px = one Flux latent row pair).
+    """
+    if h < 1 or w < 1:
+        raise ValueError(f"low_res_size needs positive h, w; got {(h, w)!r}")
+    if native < 1:
+        raise ValueError(f"native must be >= 1; got {native!r}")
+    if multiple < 1:
+        raise ValueError(f"multiple must be >= 1; got {multiple!r}")
+    if scale <= 0.0:
+        raise ValueError(f"scale must be > 0; got {scale!r}")
+
+    if math.sqrt(h * w) / native <= 1.0:
+        logger.warning(
+            "I-Max: target %dx%d px is at/below the native %d px — running "
+            "the low pass at the target resolution (nothing to extrapolate)",
+            w, h, native,
+        )
+        return h, w
+
+    factor = native * math.sqrt(scale) / math.sqrt(h * w)
+    h_low = min(_snap(h * factor, multiple), h)
+    w_low = min(_snap(w * factor, multiple), w)
+    return h_low, w_low
