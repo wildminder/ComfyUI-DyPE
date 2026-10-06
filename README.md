@@ -81,11 +81,9 @@ Two families: **model patches** alter how your own KSampler run attends (no imag
 |:---|:--:|:--:|:--:|:--:|:--:|
 | FLUX (incl. Nunchaku) | ✅ | ✅ | ✅ | ✅ | ✅ |
 | Qwen-Image 1.0, Krea-2 | ✅ | ✅ | ✅ | ✅ | ✅ |
-| **Qwen-Image 2.1** | ✅ `qwen21` | ✅ `qwen21` | ✅ `qwen21` | ❌ | ✅ |
+| Qwen-Image 2.1 | ✅  | ✅ | ✅  | ❌ | ✅ |
 | Z-Image, Anima/Cosmos | ✅ | ✅ | ✅ | ✅ | ✅ |
 | SDXL / SD1.5 | — | — | — | — | ✅ (PixelRush) |
-
-A ready-to-run graph: [`example_workflows/DyPE-Qwen21-workflow.json`](example_workflows/DyPE-Qwen21-workflow.json) — loaders → `DyPE_FLUX` (`model_type: qwen21`) → `TextEncodeQwenImage21` → `EmptyQwenImage21LatentImage` → KSampler → decode.
 
 **Qwen-Image 2.1 notes**
 
@@ -399,6 +397,9 @@ Restart ComfyUI. No further dependency installation is required.
 - **Cascades disable Qwen-Image 2.1's prefix K/V cache.** PixelRush, FreeScale and HiFlow change latent shape between stages, and 2.1's cache is keyed on that shape — so each stage allocates a slot and core's LRU eviction then raises `Boolean value of Tensor with more than one value is ambiguous`. The cache also buys a cascade nothing (the shape change invalidates it), so the three nodes switch it off, overriding a `QwenImage21Cache` node placed upstream.
 - **Shipped example workflow** for Qwen-Image 2.1 (loaders → DyPE → text encode → empty latent → KSampler → decode) plus the notes that matter for it: `base_shift`/`max_shift` defaults are tuned for 1.0's native 1.15, not 2.1's ~0.69, and `DYPE_ENABLE_QWEN2D_VAE` does not apply (2.1 is core's `WanVAE`).
 
+<details>
+<summary><b>v2.16.0</b></summary>
+
 ### v2.16.0 — 2026-09-17
 - **Fixed run-to-run result drift** (user-reported: identical parameters produced different results with Krea 2 turbo unless model and node caches were cleared first). HiFlow, PixelRush, and FreeScale now derive their sigma schedules and timestep conversions from the graph's **own model patch** instead of the shared model's live state, which ComfyUI can leave patched by a previous run's node combination. The DyPE/SEGA schedule-patch decision is equally history-independent, and HiFlow/PixelRush log a console warning when a stale patch from a previous run is detected.
 - **HiFlow: new `sharpen` input** (default `1.0` = previous behavior). Controls the unsharp mask applied to the pixel round-tripped stage anchor; set `0` to disable — recommended for turbo/low-step models that show jagged, over-sharpened tone boundaries.
@@ -502,6 +503,9 @@ Restart ComfyUI. No further dependency installation is required.
 
 ### v1.0.0
 - Initial release: core DyPE for FLUX with `yarn` and `ntk` methods
+
+</details>
+
 
 <p align="right"><a href="#readme-top" title="back to top">⟔ ▲ ⟓</a></p>
 
