@@ -57,6 +57,7 @@ Training-free methods that push pre-trained DiT models far beyond their native r
 | **❖ [PixelRush](#user-content-pixelrush)** | Cascade patch refinement of an existing base image. |
 | **❖ [FreeScale](#user-content-freescale)** | Tuning-free self-cascade upscaling. |
 | **❖ [HiFlow](#user-content-hiflow)** | Trajectory-guided flow upscaling for rectified-flow models (FLUX, Qwen-Image, Krea2, Z-Image, …). |
+| **❖ [I-Max](#user-content-imax)** | Dual-pass resolution extrapolation for FLUX — a native-resolution pass guides the target pass. |
 
 ### Which method when?
 
@@ -71,19 +72,20 @@ Two families: **model patches** alter how your own KSampler run attends (no imag
 | **PixelRush** | Any (SDXL, SD1.5, FLUX, Qwen, …) | Patch-wise low-denoise img2img cascade | ✓ | Faithful upscale + refinement |
 | **FreeScale** | FLUX-family DiTs | Scale-fused attention + self-cascade | ✓ | Regenerative hi-res, mostly new content |
 | **HiFlow** | Flow models (FLUX, Qwen-Image, Krea2, Z-Image, …) | Time-matched reference trajectory guidance | ✓ | Structure-faithful flow upscale |
+| **I-Max** | FLUX | Dual-pass Projected-Flow guidance (low-res pass → target pass) | ✗ | Native high-res generation |
 
 > [!TIP]
-> **Quick picker:** starting from noise → DyPE (or SEGA), add SPA if you see repeated/collapsed structures, add HAP for speed. Starting from an existing image → PixelRush to keep it faithful, FreeScale to re-imagine it at high res (lower its `noise_timestep` for more fidelity), HiFlow for FLUX-family flow models — it reuses the whole base-resolution denoising trajectory as guidance, so structure survives while detail is re-synthesized.
+> **Quick picker:** starting from noise → DyPE (or SEGA), add SPA if you see repeated/collapsed structures, add HAP for speed. Starting from an existing image → PixelRush to keep it faithful, FreeScale to re-imagine it at high res (lower its `noise_timestep` for more fidelity), HiFlow for FLUX-family flow models — it reuses the whole base-resolution denoising trajectory as guidance, so structure survives while detail is re-synthesized. For FLUX at 2K+ from noise, **I-Max** is the dual-pass alternative — it runs its own low-resolution guidance pass instead of patching the sampler.
 
 #### Model support
 
-| Architecture | DyPE | SEGA | SPA | HAP | PixelRush / FreeScale / HiFlow |
-|:---|:--:|:--:|:--:|:--:|:--:|
-| FLUX (incl. Nunchaku) | ✅ | ✅ | ✅ | ✅ | ✅ |
-| Qwen-Image 1.0, Krea-2 | ✅ | ✅ | ✅ | ✅ | ✅ |
-| Qwen-Image 2.1 | ✅  | ✅ | ✅  | ❌ | ✅ |
-| Z-Image, Anima/Cosmos | ✅ | ✅ | ✅ | ✅ | ✅ |
-| SDXL / SD1.5 | — | — | — | — | ✅ (PixelRush) |
+| Architecture | DyPE | SEGA | SPA | HAP | I-Max | PixelRush / FreeScale / HiFlow |
+|:---|:--:|:--:|:--:|:--:|:--:|:--:|
+| FLUX (incl. Nunchaku) | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ |
+| Qwen-Image 1.0, Krea-2 | ✅ | ✅ | ✅ | ✅ | ❌ | ✅ |
+| Qwen-Image 2.1 | ✅  | ✅ | ✅  | ❌ | ❌ | ✅ |
+| Z-Image, Anima/Cosmos | ✅ | ✅ | ✅ | ✅ | ❌ | ✅ |
+| SDXL / SD1.5 | — | — | — | — | — | ✅ (PixelRush) |
 
 **Qwen-Image 2.1 notes**
 
@@ -337,6 +339,38 @@ Training-free high-resolution upscaling for **rectified-flow models** (FLUX, Qwe
 > **HiFlow inherits the reference's structure** — including its mistakes. Generate a good base first; `tau` lower keeps more of it, higher re-imagines. 3D-latent image models (Krea2, Qwen-Image — Wan21 format, Qwen VAE) work as single-frame (T=1) latents; actual multi-frame/video input is rejected.
 <p align="right"><a href="#readme-top" title="back to top">⟔ ▲ ⟓</a></p>
 
+<a id="user-content-imax"></a>
+### ❖ I-Max
+
+Tuning-free resolution extrapolation for **FLUX** ([paper](https://arxiv.org/abs/2410.07536)): instead of patching your sampler, the node runs **two passes itself**. Pass A generates at the native-area low resolution; its result is VAE round-tripped (decode → bicubic → encode) into a fixed guidance latent whose Haar low-pass becomes the target. Pass B generates at the target resolution while its clean predictions are pulled toward that target (Projected Flow, paper §2.2) — and an inference toolkit compensates the resolution gap: an NTK-aware RoPE base multiplier, proportional attention scaling and per-tile text duplication (paper §2.3).
+
+**Usage:** connect `model`, `vae`, `positive`, `negative` and an **empty latent at the TARGET resolution** (e.g. `EmptySD3LatentImage` at 2048×2048) → set `noise_seed` → decode. A content latent + `denoise < 1` runs img2img at the target size. Works out of the box with the shipped [example workflow](example_workflows/imax-flux.json).
+
+<details>
+<summary><b>Inputs & Parameters</b></summary>
+
+| Parameter | Default | Description |
+|:---|:---:|:---|
+| `noise_seed` | 0 | One shared generator: pass A's start noise, then pass B's img2img noise. |
+| `denoise` | 1.0 | Img2img strength for pass B only (ignored for an empty latent — that always runs the full schedule). |
+| `cfg` | 1.0 | CFG for both passes. FLUX-dev: leave at 1.0; auto-skipped when the negative carries no tokens. |
+| `steps_low` / `steps_high` | 30 / 20 | Steps of the low-res guidance pass / the target-resolution pass (paper values). |
+| `guidance_low` / `guidance_high` | 3.5 / 5.0 | FLUX guidance embed written into copies of the conditioning per pass. `0.0` keeps whatever a chained FluxGuidance set. |
+| `time_shift_low` / `time_shift_high` | 3.0 / 6.0 | Static flow shift of each pass's sigma schedule — the node owns both schedules, no `model_sampling` patch is involved. |
+| `ntk_factor` | 10.0 | NTK-aware RoPE base multiplier for the high pass (paper: 10 for Flux.1-dev); `1.0` = plain RoPE. |
+| `dwt_level` | 1 | Haar low-pass level of the guidance projection; higher = coarser guidance detail. |
+| `guidance_schedule` | cosine_decay | Projected-Flow guidance schedule: `cosine_decay` (paper default), `cosine_shift`, `constant`, or `disable` (plain Euler). |
+| `proportional_attention` | True | Scale the attention temperature with the joint sequence length (no-op at/below the native 1024 px). |
+| `text_duplication` | True | Duplicate text tokens per native 1024 px tile to keep the image/text token ratio in distribution. |
+| `low_res_scale` | 1.0 | Scales the low-res pass area (`1.0` = the paper's native-area guidance). |
+
+</details>
+
+> [!NOTE]
+> The node runs its own sampling (both passes) — place it where a `KSampler` would sit, feeding an empty latent at the target size. Non-FLUX models are rejected with an actionable error.
+
+<p align="right"><a href="#readme-top" title="back to top">⟔ ▲ ⟓</a></p>
+
 ## ▓ Node Reference
 
 All nodes registered by this pack (V3 schema ids):
@@ -351,6 +385,7 @@ All nodes registered by this pack (V3 schema ids):
 | `PixelRushNode` | PixelRush | Cascade refinement for existing latents. |
 | `FreeScaleNode` | FreeScale | Tuning-free scale-fusion + self-cascade upscaling. |
 | `HiFlowNode` | HiFlow | Trajectory-guided flow upscaling (initialization + direction + acceleration alignment). |
+| `IMaxNode` (`IMax`) | I-Max | Dual-pass resolution extrapolation for FLUX (Projected-Flow guidance + NTK RoPE + proportional attention). |
 | `EmptyQwenImage21LatentImage` | Empty Qwen Image 2.1 Latent | Empty 64-channel latent at 16× for Qwen-Image 2.1 text-to-image sampling (core ships none). |
 
 <p align="right"><a href="#readme-top" title="back to top">⟔ ▲ ⟓</a></p>
@@ -384,6 +419,10 @@ Restart ComfyUI. No further dependency installation is required.
 <p align="right"><a href="#readme-top" title="back to top">⟔ ▲ ⟓</a></p>
 
 ## ▓ Changelog
+
+### v2.18.0 — 2026-10-06
+- **New `I-Max` node** — tuning-free resolution extrapolation for FLUX (arXiv 2410.07536). The node runs a dual pass itself: a native-area low-resolution pass builds a fixed guidance latent (decode → bicubic → encode → Haar low-pass), and the target-resolution pass runs with **Projected-Flow** guidance pulling every clean prediction toward it (paper §2.2). The resolution gap is compensated in the target pass by an NTK-aware RoPE base multiplier, proportional attention and per-tile text duplication (paper §2.3). I-Max owns both flow schedules (`time_shift_low` / `time_shift_high`) — no `model_sampling` patch, and the target-pass patches ride per-pass model options that leave chained SPA/HAP/DyPE patches untouched. Feed an **empty latent at the target resolution** (`EmptySD3LatentImage`); non-FLUX models are rejected with an actionable error.
+- **Shipped example workflow** [`imax-flux.json`](example_workflows/imax-flux.json): loaders → I-Max → VAEDecode for FLUX-dev.
 
 ### v2.17.1 — 2026-10-06
 - **Fixed the cascade crash on Qwen-Image 2.1** (`Boolean value of Tensor with more than one value is ambiguous`, user-reported on HiFlow): 2.1 keys its prefix K/V cache on the latent shape, so a cascade's shape change allocates a second cache slot and core's LRU eviction then compares two tensor-valued dicts. PixelRush, FreeScale and HiFlow now switch that cache off — it buys a cascade nothing, and the override wins over an upstream `QwenImage21Cache` node.
@@ -516,6 +555,7 @@ Restart ComfyUI. No further dependency installation is required.
 * **The HRDiT team** — [HRDiT](https://arxiv.org/abs/2608.07003) ([code](https://github.com/zylwithxy/HRDiT-HAP)) — basis for SPA & HAP
 * **The PixelRush authors** — [PixelRush](https://arxiv.org/abs/2602.12769)
 * **The HiFlow authors** — [HiFlow](https://arxiv.org/abs/2504.06232) ([code](https://github.com/Bujiazi/HiFlow))
+* **The I-Max authors** — [I-Max](https://arxiv.org/abs/2410.07536) — basis for the I-Max node
 * **Yanhong Zeng et al.** — [FreeScale](https://github.com/ali-vilab/FreeScale) ([paper](https://arxiv.org/abs/2412.09626))
 * **The ComfyUI team** — for the platform
 
