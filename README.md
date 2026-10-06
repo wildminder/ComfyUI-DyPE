@@ -387,6 +387,10 @@ Restart ComfyUI. No further dependency installation is required.
 
 ## ▓ Changelog
 
+### v2.17.1 — 2026-10-06
+- **Fixed the cascade crash on Qwen-Image 2.1** (`Boolean value of Tensor with more than one value is ambiguous`, user-reported on HiFlow): 2.1 keys its prefix K/V cache on the latent shape, so a cascade's shape change allocates a second cache slot and core's LRU eviction then compares two tensor-valued dicts. PixelRush, FreeScale and HiFlow now switch that cache off — it buys a cascade nothing, and the override wins over an upstream `QwenImage21Cache` node.
+- **Hardened the SPA wrapper**: a Qwen-Image 2.1 attention call without a head count now declines to plain attention instead of raising.
+
 ### v2.17.0 — 2026-10-05
 - **Qwen-Image 2.1 support.** New `model_type: qwen21` for DyPE, SEGA and SPA; `auto` detection recognizes it too. 2.1's latent is 64 channels at a **16×** VAE downscale with `patch_size 1`, and its positional embeddings are built and used in fp32 — the pack now handles both explicitly instead of relying on a 1.0-shaped fallback.
 - **HAP refuses Qwen-Image 2.1 with an actionable error** naming the model, the mechanism (block-causal attention splits each block into per-segment calls: text segments are masked, the image segment is non-square) and the remedy (use SPA, DyPE or SEGA) — rather than silently no-op'ing.
