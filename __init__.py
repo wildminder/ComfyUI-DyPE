@@ -8,6 +8,7 @@ from comfy_api.latest import ComfyExtension, io
 
 from .nodes import (
     DyPE_FLUX,
+    EmptyQwenImage21LatentImage,
     FreeScaleNode,
     HAP,
     HAPCalibrate,
@@ -25,7 +26,7 @@ class DyPEExtension(ComfyExtension):
         install_qwen2d_patch()
 
     async def get_node_list(self) -> list[type[io.ComfyNode]]:
-        return [DyPE_FLUX, SEGA, SPA, HAP, HAPCalibrate, PixelRushNode, FreeScaleNode, HiFlowNode]
+        return [DyPE_FLUX, SEGA, SPA, HAP, HAPCalibrate, PixelRushNode, FreeScaleNode, HiFlowNode, EmptyQwenImage21LatentImage]
 
 
 async def comfy_entrypoint() -> DyPEExtension:

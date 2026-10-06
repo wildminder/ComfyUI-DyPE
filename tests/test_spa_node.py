@@ -140,6 +140,13 @@ class TestSpaNodeSchema:
         for opt in ('"auto"', '"flux"', '"qwen"', '"anima"'):
             assert opt in content
 
+    def test_qwen21_in_model_type_options(self):
+        """Qwen-Image-2.1 gets its own architecture key (16x VAE, no patchify,
+        its own attention symbol); "qwen" is 1.0 and must not stand in for it."""
+        content = _INIT.read_text(encoding="utf-8")
+        start = content.index("class SPA(io.ComfyNode):")
+        assert '"qwen21"' in content[start:]
+
     def test_category_and_output(self):
         content = _INIT.read_text(encoding="utf-8")
         assert "WMNodes/image" in content

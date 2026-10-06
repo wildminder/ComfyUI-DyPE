@@ -46,9 +46,13 @@ from .spa_attn import (
 )
 from .spa_context import (
     SPAContext,
+    SPA_JOINT_MODE_CAUSAL_PREFIX,
+    SPA_JOINT_MODE_JOINT,
     get_hap_context,
+    get_hrdit_layer_idx,
     get_hrdit_proportional,
     get_spa_context,
+    get_spa_joint_mode,
     get_spa_layer_filter,
     get_spa_step_gate,
     next_hap_layer_idx,
@@ -58,6 +62,7 @@ from .spa_context import (
     set_hrdit_layer_idx,
     set_hrdit_proportional,
     set_spa_context,
+    set_spa_joint_mode,
     set_spa_layer_filter,
     set_spa_step_gate,
 )
@@ -315,13 +320,24 @@ class SPABasePosEmbed(DyPEBasePosEmbed):
     # implementation wins over this base.  Instantiating ``SPABasePosEmbed``
     # directly (without an adapter) is unsupported.
 
+    def _freqs_dtype(self, pos: torch.Tensor) -> torch.dtype:
+        """Return the dtype the cos/sin frequencies are built in.
+
+        bf16 on CUDA (bandwidth) and fp32 elsewhere is right for every backend
+        EXCEPT Qwen-Image-2.1: its call site (``qwen_image21/model.py``) feeds
+        ``pe`` straight into the fused ``ck.rms_rope`` / ``apply_rope1`` with no
+        dtype cast, so a bf16 PE would silently change the model's numerics.  The
+        2.1 adapter overrides this to fp32.
+        """
+        return torch.bfloat16 if pos.device.type == "cuda" else torch.float32
+
     # -- forward: base RoPE + register variants (NO tensor averaging) ---------
     def forward(self, ids: torch.Tensor) -> torch.Tensor:
         if (not self.enable_spa) or self.bundle_size == 1:
             # Identity: base (no-extrapolation) RoPE, no hook effect.
             # (N == 1 is "off"; N == 0 is "auto" and stays active.)
             pos = ids.float()
-            fdtype = torch.bfloat16 if pos.device.type == "cuda" else torch.float32
+            fdtype = self._freqs_dtype(pos)
             set_spa_context(None)
             return self.format_components(self._spa_components(pos, fdtype), ids)
 
@@ -370,7 +386,7 @@ class SPABasePosEmbed(DyPEBasePosEmbed):
             return base_pe, variant_pes
 
         pos = ids.float()
-        fdtype = torch.bfloat16 if pos.device.type == "cuda" else torch.float32
+        fdtype = self._freqs_dtype(pos)
         base_pe = self.format_components(self._spa_components(pos, fdtype), ids)
         variants = build_bundle_id_variants(ids, self.bundle_size, self.trained_extent)
         variant_pes = [
@@ -428,6 +444,12 @@ class SPABasePosEmbed(DyPEBasePosEmbed):
         # position ids so the HAP band mask does not rely solely on the node's
         # ``text_len`` default.
         derived_text_len = _spa_derive_text_len(ids)
+        # Qwen-Image-2.1 joint mode: the FULL sequence length, recorded HERE at
+        # registration.  The hook cannot recover it from the PE at call time — on
+        # a cached prefill step 2.1 has already sliced ``pe`` down to the target
+        # rows, so the PE length would under-report the sequence the block-causal
+        # segments index into.
+        total_len = int(ids.shape[1])
 
         ctx = get_spa_context()
         if ctx is None or not ctx.active:
@@ -441,6 +463,7 @@ class SPABasePosEmbed(DyPEBasePosEmbed):
                 model_key=id(self),
                 variant_deltas=variant_deltas,
                 text_len=derived_text_len,
+                total_len=total_len,
             )
         else:
             # Reuse the live context (Z-Image multi-group accumulation).
@@ -450,6 +473,7 @@ class SPABasePosEmbed(DyPEBasePosEmbed):
             ctx.fmt = self._rope_fmt
             ctx.model_key = id(self)
             ctx.variant_deltas = variant_deltas
+            ctx.total_len = total_len
             if derived_text_len is not None:
                 ctx.text_len = derived_text_len
 
@@ -516,6 +540,7 @@ def _spa_ensure_no_incompatible_embedder(orig_embedder) -> None:
         "PosEmbedFlux",
         "PosEmbedNunchaku",
         "PosEmbedQwen",
+        "PosEmbedQwen21",
         "PosEmbedZImage",
         "PosEmbedAnima",
     }:
@@ -547,6 +572,14 @@ def _spa_patch_targets(model_type: str):
         return [("comfy.ldm.flux.math", "optimized_attention", False)]
     if model_type == "qwen":
         return [("comfy.ldm.qwen_image.model", "optimized_attention_masked", True)]
+    if model_type == "qwen21":
+        # Qwen-Image-2.1 is NOT a variant of the 1.0 backend module: its model file
+        # binds the UNMASKED ``optimized_attention`` (it never references
+        # ``optimized_attention_masked``) and calls it once per block-causal SEGMENT
+        # with ``q = q[:, start:end]`` / ``k = k[:, :end]``.  Reusing the 1.0 target
+        # would patch a symbol nobody calls — the same silent no-op as Krea-2.  The
+        # segment handling lives in the ``causal_prefix`` joint mode.
+        return [("comfy.ldm.qwen_image21.model", "optimized_attention", False)]
     if model_type == "krea2":
         # Krea-2 (K2) "SingleStreamDiT" binds optimized_attention_masked into its OWN
         # module (comfy.ldm.krea2.model), a *different* symbol than the Qwen backend
@@ -580,7 +613,8 @@ def _spa_resolve_type(model_type: str, dm) -> str:
     return resolve_model_type(dm, model_type)
 
 
-def _spa_run_averaged(q, k, v, ctx, attn_fn):
+def _spa_run_averaged(q, k, v, ctx, attn_fn, flatten_heads=None,
+                      q_slice=None, k_slice=None):
     """Run ``N`` averaged attention passes over the bundled RoPE variants (HRDiT).
 
     Emits a one-time-per-forward INFO log (guarded by ``ctx._spa_logged``) so a real
@@ -590,6 +624,10 @@ def _spa_run_averaged(q, k, v, ctx, attn_fn):
     Krea-2 "doubled / mosaic-glass" report): if this line is ABSENT, SPA is a silent
     no-op for that model; if it is present with an unexpected variant count, the bug is
     in the variant/slide math, not the model.
+
+    ``flatten_heads`` / ``q_slice`` / ``k_slice`` are the Qwen-Image-2.1 segment
+    pass-through (see :func:`src.spa_attn.spa_averaged_attention`); all ``None``
+    for every other backend.
     """
     fmt = ctx.fmt
     if ctx.pre_roped:
@@ -620,7 +658,9 @@ def _spa_run_averaged(q, k, v, ctx, attn_fn):
             n_variants, s_est,
         )
     return spa_averaged_attention(q, k, v, None, rotations, attn_fn=attn_fn,
-                                 pre_roped=False, fmt=fmt)
+                                 pre_roped=False, fmt=fmt,
+                                 flatten_heads=flatten_heads,
+                                 q_slice=q_slice, k_slice=k_slice)
 
 
 def _spa_assemble_zimage_posids(pending):
@@ -776,7 +816,8 @@ def _spa_derive_text_len(ids: torch.Tensor):
         return None
 
 
-def _spa_dispatch_attention(q, k, v, ctx, _attn, fmt):
+def _spa_dispatch_attention(q, k, v, ctx, _attn, fmt, flatten_heads=None,
+                            q_slice=None, k_slice=None):
     """Run the averaged-attention hook, selecting the Z-Image vs single-group path.
 
     Z-Image / Lumina accumulates per-group position ids in ``ctx.pending`` (because a
@@ -791,6 +832,10 @@ def _spa_dispatch_attention(q, k, v, ctx, _attn, fmt):
     NOTHING, so a Z-Image run showing only the single-group "SPA averaged-attention
     ACTIVE" line meant the pending path never engaged (or the model was not detected
     as zimage).  These logs make that decisive.
+
+    ``flatten_heads`` / ``q_slice`` / ``k_slice`` are the Qwen-Image-2.1 segment
+    pass-through.  2.1 uses no pending groups, so it always takes the single-group
+    path below; they are ``None`` for every other backend.
     """
     if getattr(ctx, "uses_pending", False) and ctx.pending:
         full = _spa_assemble_zimage_posids(ctx.pending)
@@ -828,7 +873,8 @@ def _spa_dispatch_attention(q, k, v, ctx, _attn, fmt):
         "SPA dispatch: SINGLE-GROUP path (uses_pending=%s, pending_len=%d).",
         getattr(ctx, "uses_pending", False), len(ctx.pending) if ctx.pending else 0,
     )
-    return _spa_run_averaged(q, k, v, ctx, _attn)
+    return _spa_run_averaged(q, k, v, ctx, _attn, flatten_heads=flatten_heads,
+                             q_slice=q_slice, k_slice=k_slice)
 
 
 def _hrdit_resolve_text_len(hap_ctx, seq_len):
@@ -931,6 +977,10 @@ def _make_hrdit_wrapper(orig, is_masked: bool):
       the current layer index is NOT in it, SPA is skipped for that layer (plain
       attention) while the counter and HAP dispatch are unaffected.
 
+    Qwen-Image-2.1 (``causal_prefix`` joint mode) is the ONE exception to the
+    unconditional counter advance and to the non-square guard: see the block
+    comments in the body.  Every other backend keeps the behaviour above.
+
     ``is_masked`` is retained for patch-target bookkeeping and tests but no longer
     changes the call convention (the two real symbols are the same function).
 
@@ -942,7 +992,38 @@ def _make_hrdit_wrapper(orig, is_masked: bool):
 
     def _wrapper(q, k, v, heads, mask=None, attn_precision=None,
                  skip_reshape=False, skip_output_reshape=False, **kw):
-        layer_idx = next_hrdit_layer_idx()
+        # QWEN-IMAGE-2.1 JOINT MODE ("causal_prefix").  2.1's block-causal
+        # attention issues ONE ``optimized_attention`` call per SEQUENCE SEGMENT
+        # per block (a text chunk with a causal mask, then the image chunk
+        # unmasked), where 1.0 and every other backend issue one per block.  The
+        # per-forward layer counter is what ``spa_layer_filter`` and the HAP plan
+        # ordinal resolve the model's block order through, so it must advance ONCE
+        # PER BLOCK — on the image target segment — while the other segments only
+        # PEEK at it (``get_hrdit_layer_idx``, no advance).  The segment list is
+        # ordered text-then-image, so the image segment of block *n* sees exactly
+        # counter value *n*.  The mode needs a registered context (``total_len``)
+        # to be meaningful; without one we keep the unconditional advance.
+        _ctx_peek = get_spa_context()
+        _causal_prefix = (
+            get_spa_joint_mode() == SPA_JOINT_MODE_CAUSAL_PREFIX
+            and _ctx_peek is not None
+            and getattr(_ctx_peek, "total_len", None) is not None
+        )
+        # 2.1 slices the sequence per segment, so the bounds are recoverable from
+        # the tensors alone: ``q`` spans ``[start, end)`` and ``k`` spans
+        # ``[0, end)``.  The prefill-cache path is the same shape with
+        # ``end == total_len`` and ``start == prefix_len``, so it needs no
+        # special case.
+        _end = int(k.shape[-2])
+        _start = _end - int(q.shape[-2])
+        # The TARGET segment is the one whose k reaches the end of the sequence;
+        # reference-image chunks end earlier.
+        _is_target_segment = bool(_causal_prefix and _ctx_peek.total_len == _end)
+        layer_idx = (
+            get_hrdit_layer_idx()
+            if (_causal_prefix and not _is_target_segment)
+            else next_hrdit_layer_idx()
+        )
         # HAP PLAN-LAYER ORDINAL (2026-08-19, runtime layer-index mismatch fix).
         # Calibration enumerates scope-plan layers by the DOMINANT-HEAD-ONLY
         # ordinal: its heterogeneous-head-count filter drops auxiliary attention
@@ -980,7 +1061,7 @@ def _make_hrdit_wrapper(orig, is_masked: bool):
         # variants included) sees the scaled q without backend changes.
         if get_hrdit_proportional():
             q = q * _hrdit_proportional_ratio(q)
-        ctx = get_spa_context()
+        ctx = _ctx_peek
         spa_active = (
             get_spa_step_gate()
             and ctx is not None
@@ -988,6 +1069,51 @@ def _make_hrdit_wrapper(orig, is_masked: bool):
             and len(ctx.variant_pes) > 1
             and _spa_layer_allowed(layer_idx)
         )
+
+        # QWEN-IMAGE-2.1 SEGMENT GATE ("causal_prefix").  Two segments decline to
+        # plain attention — bit-identical to unpatched — and only the image TARGET
+        # segment keeps the full SPA path:
+        #   * a call carrying a mask is a TEXT segment (2.1 masks the text chunks
+        #     with a causal mask; the spatial RoPE variants mean nothing there);
+        #   * a segment whose ``end`` is short of ``total_len`` is a REFERENCE
+        #     image chunk — its k does not even reach the target rows, so the
+        #     rotations have no matching query rows to align with.
+        # Both declines leave the counter untouched (they peeked above), so the
+        # next target segment still reads the block's own index.
+        # ``segment_sliced`` marks the target segment, whose NON-SQUARE q/k is
+        # legitimate (q is the ``[start, end)`` suffix of the ``[0, end)`` key
+        # prefix) and therefore exempt from the guard below.
+        flatten_heads = q_slice = k_slice = None
+        segment_sliced = False
+        if _causal_prefix and spa_active:
+            if mask is not None or not _is_target_segment:
+                if not getattr(ctx, "_qwen21_declined_logged", False):
+                    ctx._qwen21_declined_logged = True
+                    logger.debug(
+                        "SPA (qwen21 causal_prefix): declining segment "
+                        "(masked=%s, target=%s, end=%d of total=%d) -> plain "
+                        "attention; the layer counter did not advance for it.",
+                        mask is not None, _is_target_segment, _end, ctx.total_len,
+                    )
+                spa_active = False
+            elif heads is None:
+                # The head split needs ``heads``; every 2.1 call site passes it
+                # positionally, so this is unreachable today — decline rather
+                # than raise ``int(None)`` if that ever stops being true.
+                logger.debug(
+                    "SPA (qwen21 causal_prefix): no head count on this call -> "
+                    "plain attention."
+                )
+                spa_active = False
+            else:
+                # The rotations cover the FULL sequence; select this segment's
+                # rows before rotating so each pass matches the tensor it is
+                # applied to, and unflatten the heads so the per-head rotation
+                # lands on the same elements the backend's own split would.
+                q_slice = slice(_start, _end)
+                k_slice = slice(0, _end)
+                flatten_heads = int(heads)
+                segment_sliced = True
 
         # NON-SQUARE GUARD (2026-08-16, Anima cross-attention crash): the
         # averaged passes apply the registered spatial RoPE rotations to BOTH q
@@ -1003,7 +1129,12 @@ def _make_hrdit_wrapper(orig, is_masked: bool):
         # (alignment is sacred) and HAP dispatch keeps its own guard.  FLUX /
         # Qwen / Krea-2 / Z-Image are unaffected: their attention is joint
         # text+image (always square).
-        if spa_active and q.shape[-2] != k.shape[-2]:
+        #
+        # ``segment_sliced`` is the Qwen-Image-2.1 EXCEPTION: its target segment
+        # is non-square BY CONSTRUCTION (q = the ``[start, end)`` rows of a
+        # ``[0, end)`` sequence) and is precisely the call that must run SPA, so
+        # the guard would reproduce the silent no-op this mode exists to prevent.
+        if spa_active and not segment_sliced and q.shape[-2] != k.shape[-2]:
             if not getattr(ctx, "_spa_nonsquare_logged", False):
                 ctx._spa_nonsquare_logged = True
                 logger.debug(
@@ -1051,7 +1182,9 @@ def _make_hrdit_wrapper(orig, is_masked: bool):
         if not spa_active:
             # SPA off / gated: single pass (still HAP-routed when live).
             return _attn(q, k, v)
-        return _spa_dispatch_attention(q, k, v, ctx, _attn, ctx.fmt)
+        return _spa_dispatch_attention(q, k, v, ctx, _attn, ctx.fmt,
+                                       flatten_heads=flatten_heads,
+                                       q_slice=q_slice, k_slice=k_slice)
 
     return _wrapper
 
@@ -1269,6 +1402,10 @@ def _hrdit_install_hook(m, model_type: str, consumer: str = "spa") -> None:
         # Read at call time so a later apply_* still takes effect on the shared
         # wrapper.  The filter gates SPA ALONE (counter + HAP unaffected).
         set_spa_layer_filter(getattr(state, "_spa_layer_filter", None))
+        # Joint mode (Qwen-Image-2.1 ``causal_prefix``): activate for this forward
+        # from the model attr, read at call time like the filter above.  Absent /
+        # unknown -> the default ``"joint"``, i.e. one attention call per block.
+        set_spa_joint_mode(getattr(state, "_spa_joint_mode", None))
         # HAP (plan P4/T4.1): activate this model's HapContext for the forward.
         # Read at call time (not install time) so SPA-then-HAP installs share the
         # SAME unet wrapper and HAP state applied later is still honoured.
@@ -1332,6 +1469,7 @@ def _hrdit_install_hook(m, model_type: str, consumer: str = "spa") -> None:
             set_hap_context(None)  # clear HAP too -> no cross-model leak
             set_hrdit_proportional(False)  # clear proportional flag -> no leak
             set_spa_layer_filter(None)  # clear layer filter -> no cross-model leak
+            set_spa_joint_mode(None)  # clear joint mode -> no cross-model leak
             set_spa_step_gate(True)  # reopen so a non-SPA forward is unaffected
             set_hap_layer_idx(0)  # clear HAP plan ordinal -> no cross-model leak
 
@@ -1442,6 +1580,7 @@ def apply_spa_to_model(
     from .models.spa_flux import PosEmbedSPAFlux
     from .models.spa_nunchaku import PosEmbedSPANunchaku
     from .models.spa_qwen import PosEmbedSPAQwen
+    from .models.spa_qwen21 import PosEmbedSPAQwen21
     from .models.spa_zimage import PosEmbedSPAZImage
 
     width = _snap_to_multiple(width, 16)
@@ -1469,6 +1608,7 @@ def apply_spa_to_model(
     detected_type = _spa_resolve_type(model_type, dm)
     is_nunchaku = detected_type == "nunchaku"
     is_qwen = detected_type == "qwen"
+    is_qwen21 = detected_type == "qwen21"
     is_z_image = detected_type == "zimage"
     is_anima = detected_type == "anima"
     is_krea2 = detected_type == "krea2"
@@ -1578,6 +1718,12 @@ def apply_spa_to_model(
         spa_cls = PosEmbedSPANunchaku
     elif is_qwen:
         spa_cls = PosEmbedSPAQwen
+    elif is_qwen21:
+        # Qwen-Image-2.1 shares 1.0's ``pe_embedder`` path and RoPE layout; the
+        # adapter differs only in pinning fp32 frequencies (its call site feeds
+        # ``pe`` to the fused kernel uncast) and, via the ``causal_prefix``
+        # joint mode below, in how many attention calls a block makes.
+        spa_cls = PosEmbedSPAQwen21
     elif is_z_image:
         spa_cls = PosEmbedSPAZImage
     elif is_krea2:
@@ -1626,6 +1772,18 @@ def apply_spa_to_model(
     # SPA on filtered-out layers (counter + HAP unaffected).  Invalid specs
     # raise ValueError here (clear node error, plan T8.3).
     m._spa_layer_filter = parse_layer_filter(spa_layer_filter)
+    # JOINT MODE (Qwen-Image-2.1): store which attention-call convention the
+    # backend has for the duration of this forward.  Every backend but 2.1 makes
+    # ONE attention call per block; 2.1's block-causal attention makes one call
+    # per SEQUENCE SEGMENT (masked text chunks + the unmasked image target), so
+    # the shared wrapper must run the averaged passes — and advance the
+    # per-forward layer counter — only on the image target segment.  Set
+    # explicitly (never left stale) so a re-apply onto another backend's patcher
+    # cannot inherit ``causal_prefix``.  The shared unet wrapper activates it at
+    # call time, exactly like the step gate and the layer filter.
+    m._spa_joint_mode = (
+        SPA_JOINT_MODE_CAUSAL_PREFIX if is_qwen21 else SPA_JOINT_MODE_JOINT
+    )
     if enable_spa and bundle_size != 1:
         _spa_install_hook(m, detected_type)
 

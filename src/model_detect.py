@@ -9,9 +9,14 @@ Precedence (mirrors SPA's proven semantics verbatim):
 
 1. CLASS-NAME checks first — Krea-2's ``SingleStreamDiT`` shares the Qwen
    architecture but binds its own attention symbol, so it MUST be detected by
-   class name BEFORE any requested-string or attr probe.
-2. Explicit ``requested`` overrides ("flux"/"qwen"/"nunchaku"/"zimage"/
-   "z_image"/"anima"/"krea2").
+   class name BEFORE any requested-string or attr probe.  Qwen-Image-2.1
+   (``QwenImage21Transformer2DModel``) is the same hazard in the other
+   direction: its class name CONTAINS "QwenImage", so without an explicit
+   class-name check the substring probe in step 3 would claim it for
+   "qwen" (Qwen-Image 1.0) — a different VAE downscale, no patchify, and a
+   different attention symbol.
+2. Explicit ``requested`` overrides ("flux"/"qwen"/"qwen21"/"nunchaku"/
+   "zimage"/"z_image"/"anima"/"krea2").
 3. ``auto``: attribute probes in order — QwenImage/Anima class names,
    ``rope_embedder`` (Z-Image), ``model.pos_embed`` (Nunchaku),
    ``pe_embedder`` (FLUX), ``pos_embedder.dim_spatial_range`` (Anima).
@@ -31,22 +36,27 @@ def resolve_model_type(dm, requested: str = "auto") -> str:
         requested: user knob.  ``"auto"`` probes attributes; anything else is
             an explicit override (``z_image`` normalizes to ``zimage``).
 
-    Returns one of ``"flux"``, ``"qwen"``, ``"krea2"``, ``"zimage"``,
-    ``"nunchaku"``, ``"anima"``.
+    Returns one of ``"flux"``, ``"qwen"``, ``"qwen21"``, ``"krea2"``,
+    ``"zimage"``, ``"nunchaku"``, ``"anima"``.
 
     Raises:
         ValueError: when ``requested == "auto"`` and no probe matches.
     """
-    # 1. Class-name checks FIRST (Krea-2 before everything — see module doc).
+    # 1. Class-name checks FIRST (Krea-2 and Qwen-Image-2.1 before everything —
+    # see module doc).
     model_class_name = getattr(dm.__class__, "__name__", "")
     if model_class_name == "SingleStreamDiT":
         return "krea2"
+    if model_class_name == "QwenImage21Transformer2DModel":
+        return "qwen21"
 
     # 2. Explicit override.
     if requested == "krea2":
         return "krea2"
     if requested == "nunchaku":
         return "nunchaku"
+    if requested == "qwen21":
+        return "qwen21"
     if requested == "qwen":
         return "qwen"
     if requested in ("z_image", "zimage"):

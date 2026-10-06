@@ -140,6 +140,22 @@ def _mock_flow_model(latent_dimensions=2, prediction_mixin="CONST"):
     model.model_options = {}
     model.load_device = torch.device("cpu")
     model.pre_run = lambda: None
+
+    def _clone(_self=model):
+        """Mirror ModelPatcher.clone(): a new patcher with copied model_options.
+
+        The cascade nodes clone before writing run-scoped options (Qwen-Image 2.1's
+        prefix K/V cache — see src/prefix_cache.py), so the mock has to model the
+        copy or it stops representing the production path.
+        """
+        out = types.SimpleNamespace(**vars(_self))
+        out.model_options = {
+            k: (v.copy() if isinstance(v, dict) else v)
+            for k, v in _self.model_options.items()
+        }
+        return out
+
+    model.clone = _clone
     return model
 
 
@@ -976,6 +992,12 @@ class TestHiFlowDocs:
         assert "user-content-hiflow" in readme
 
     def test_version_bumped(self):
+        """The released version is single-sourced from pyproject.toml and the
+        README changelog leads with it.
+
+        The literal is deliberately NOT repeated here (it broke on every
+        release bump); tests/test_version_sync.py owns the full parity guard.
+        """
         import pathlib
         import re
         pyproject = (pathlib.Path(__file__).parent.parent
@@ -983,8 +1005,8 @@ class TestHiFlowDocs:
         readme = (pathlib.Path(__file__).parent.parent
                   / "README.md").read_text(encoding="utf-8")
         m = re.search(r'^version = "([^"]+)"', pyproject, re.MULTILINE)
-        assert m and m.group(1) == "2.16.0"
-        assert "### v2.16.0" in readme
+        assert m, "pyproject.toml has no parseable version"
+        assert f"### v{m.group(1)}" in readme
 
 
 # ---------------------------------------------------------------------------

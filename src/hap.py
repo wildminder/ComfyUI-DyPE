@@ -873,6 +873,27 @@ def apply_hap_to_model(
     detected_type = _spa_resolve_type(model_type, dm)
     logger.info("HAP: Detected model type: %s", detected_type)
 
+    if detected_type == "qwen21":
+        # ACTIONABLE REFUSAL (house rule: an unsupported-model error must name
+        # the offender AND the recovery path — "reload the model" is never the
+        # fix).  HAP is head-adaptive PRUNING calibrated against a scope plan
+        # whose layer ordinals come from one attention call per block.  2.1's
+        # block-causal attention splits every block into per-segment calls (the
+        # text chunks are mask-carrying, the image chunk is a non-square
+        # [start, end) x [0, end) pair), so the plan would be indexed by
+        # segments instead of blocks and every pruned head count would be wrong.
+        # SPA handles this explicitly via its ``causal_prefix`` joint mode; DyPE
+        # and SEGA need no attention-level change at all.  Fail loudly here
+        # rather than pruning an arbitrary set of heads.
+        raise ValueError(
+            "HAP is not supported on Qwen-Image-2.1 (qwen21). Its block-causal "
+            "attention issues one attention call per sequence segment (masked "
+            "text chunks plus a non-square image segment), so a HAP scope plan "
+            "calibrated per block would prune the wrong heads. Use the DyPE, "
+            "SEGA or SPA node for this model instead (SPA supports 2.1 through "
+            "its causal_prefix joint mode)."
+        )
+
     if detected_type == "nunchaku":
         logger.warning(
             "HAP: unsupported on quantized/fused Nunchaku kernels (they bypass "

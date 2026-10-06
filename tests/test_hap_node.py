@@ -191,6 +191,13 @@ class TestHapNodeSchema:
         assert "WMNodes/image" in section
         assert "io.Model.Output" in section
 
+    def test_qwen21_in_model_type_options(self):
+        """2.1 is selectable so a refusal names the model the user actually
+        picked, instead of silently mis-detecting it as 1.0."""
+        content = self._content()
+        start = content.index("class HAP(io.ComfyNode):")
+        assert '"qwen21"' in content[start:]
+
 
 # ---------------------------------------------------------------------------
 # T4.3 — shipped reference FLUX scope plan

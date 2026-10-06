@@ -70,6 +70,12 @@ class TestSegaNodeSchema:
         assert '"flux"' in content
         assert '"qwen"' in content
 
+    def test_qwen21_in_model_type_options(self):
+        """Qwen-Image-2.1 is its own architecture key, not "qwen" (1.0)."""
+        content = _NODE.read_text(encoding="utf-8")
+        start = content.index("class SEGA(io.ComfyNode):")
+        assert '"qwen21"' in content[start:]
+
     def test_node_defaults_match_paper(self):
         """Default SEGA parameters should match the paper's recommendations."""
         content = _NODE.read_text(encoding="utf-8")

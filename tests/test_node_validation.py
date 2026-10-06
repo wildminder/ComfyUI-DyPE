@@ -1,5 +1,8 @@
 """Tests for resolution snapping + input validation (Tier 1: pure unit tests)."""
+import ast
 import pathlib
+import re
+import types
 
 import pytest
 
@@ -207,3 +210,79 @@ class TestNodeValidateInputsWiring:
         that forbade validate_inputs entirely."""
         content = (pathlib.Path(__file__).parent.parent / "nodes" / "hap.py").read_text(encoding="utf-8")
         assert "class HAP(" in content
+
+
+# ---------------------------------------------------------------------------
+# model_type combo parity across the four patch nodes
+# ---------------------------------------------------------------------------
+
+_MODEL_TYPE_RE = re.compile(r'options=(\[[^\]]*\])')
+_NODE_CLASS_RE = re.compile(r'^class\s+\w+\(io\.ComfyNode\)', re.MULTILINE)
+
+
+def _model_type_options(node_file: str):
+    """The ``options=[...]`` list of the node's ``model_type`` combo.
+
+    Scoped to the ``io.ComfyNode`` class body and taking the FIRST options
+    list inside it: in every one of the four node modules ``model_type`` is
+    the first combo declared, while ``method``/``resize_mode`` carry their own
+    option lists further down that must not be mistaken for it.
+    """
+    root = pathlib.Path(__file__).parent.parent / "nodes"
+    content = (root / node_file).read_text(encoding="utf-8")
+    class_at = _NODE_CLASS_RE.search(content)
+    assert class_at, f"{node_file}: no io.ComfyNode class found"
+    match = _MODEL_TYPE_RE.search(content[class_at.end():])
+    assert match, f"{node_file}: no options=[...] combo found in the node class"
+    return ast.literal_eval(match.group(1))
+
+
+@pytest.mark.unit
+class TestModelTypeComboParity:
+    """THE invariant: the four patch nodes expose ONE identical architecture
+    list.
+
+    Four separate "is qwen21 present" tests only prove four facts; what
+    actually breaks users is the lists drifting apart (a key that one node
+    accepts and another rejects is invisible until a graph fails at runtime),
+    so the equality itself is the thing worth pinning.  ``"krea2"`` stays
+    absent on purpose — Krea-2 users pick ``"qwen"`` (pre-existing precedent).
+    """
+
+    _NODES = ("dype.py", "sega.py", "spa.py", "hap.py")
+
+    @pytest.mark.parametrize("node_file", _NODES)
+    def test_qwen21_selectable(self, node_file):
+        assert "qwen21" in _model_type_options(node_file)
+
+    @pytest.mark.parametrize("node_file", _NODES)
+    def test_option_list_is_identical_across_nodes(self, node_file):
+        reference = _model_type_options("dype.py")
+        assert _model_type_options(node_file) == reference, (
+            f"{node_file} model_type options drifted from nodes/dype.py:\n"
+            f"  dype: {reference}\n"
+            f"  {node_file}: {_model_type_options(node_file)}"
+        )
+
+    def test_option_order_is_stable(self):
+        """Pinned so the widget layout does not silently reorder between
+        releases (users' saved graphs key off the option text, not the index,
+        but a stable order keeps the UI stable)."""
+        assert _model_type_options("dype.py") == [
+            "auto", "flux", "nunchaku", "qwen", "qwen21", "zimage", "anima",
+        ]
+
+    def test_detector_accepts_every_advertised_option(self):
+        """Every option the nodes advertise must be one the canonical detector
+        understands — except "auto", which means "probe"."""
+        from src.model_detect import resolve_model_type
+
+        dm = types.SimpleNamespace(
+            pe_embedder=types.SimpleNamespace(theta=10000))
+        for opt in _model_type_options("dype.py"):
+            if opt == "auto":
+                continue
+            assert resolve_model_type(dm, opt) == opt, (
+                f"nodes advertise model_type={opt!r} but the detector does not "
+                f"resolve it to itself"
+            )

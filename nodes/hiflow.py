@@ -22,10 +22,14 @@ try:
     from ..src.effective_sampling import effective_model_sampling, warn_if_stale_leak
     from ..src.freescale import gaussian_blur_2d
     from ..src.hiflow import HiFlowConfig, hiflow_cascade
+    from ..src.prefix_cache import disable_prefix_kv_cache
+    from ..src.vae_channels import pad_to_vae_channels, strip_alpha_channel
 except ImportError:  # flat repo layout (tests / CLI)
     from src.effective_sampling import effective_model_sampling, warn_if_stale_leak
     from src.freescale import gaussian_blur_2d
     from src.hiflow import HiFlowConfig, hiflow_cascade
+    from src.prefix_cache import disable_prefix_kv_cache
+    from src.vae_channels import pad_to_vae_channels, strip_alpha_channel
 
 from .pixelrush import _detect_prediction_type
 
@@ -243,11 +247,18 @@ def _make_vae_adapters(vae, device):
             decoded = decoded[:, 0]     # first temporal frame [B, H, W, 3]
         elif decoded.ndim == 3:
             decoded = decoded.unsqueeze(0)
+        # RGBA VAEs (Qwen-Image 2.1) decode [B, H, W, 4]; the whole node
+        # downstream — _sharpen's channels-last probe, resize, compositing —
+        # is RGB, so alpha is dropped here (logged once, see vae_channels).
+        decoded = strip_alpha_channel(decoded, vae, "HiFlow")
         return decoded  # [B, H, W, 3] channels-last, untouched
 
     def vae_encode(image: torch.Tensor) -> torch.Tensor:
         """image [B, H, W, 3] -> latent [B, C, h, w] (4D for the core)."""
         image = image.to(device)
+        # Symmetric to the decode side: hand an RGBA VAE the four channels it
+        # expects (opaque alpha), as ComfyUI's own vae_encode_crop_pixels does.
+        image = pad_to_vae_channels(image, vae)
         encoded = vae.encode(image)
         if isinstance(encoded, dict):
             encoded = encoded["samples"]
@@ -452,6 +463,12 @@ class HiFlowNode(io.ComfyNode):
         # don't (Krea2 plan S2).
         _, latent_dimensions = _require_flow_model(model)
         warn_if_stale_leak(model, "HiFlow")
+
+        # Qwen-Image-2.1 keys its prefix K/V cache on the latent shape, so each
+        # cascade stage adds a slot and the upstream LRU eviction then raises on
+        # a tensor-valued dict comparison.  A cascade invalidates that cache
+        # anyway — see src/prefix_cache.py.
+        model = disable_prefix_kv_cache(model)
 
         if isinstance(latent_image, dict):
             initial_latent = latent_image["samples"]
