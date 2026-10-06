@@ -1,15 +1,17 @@
 """
-I-Max ComfyUI node layer — inference toolkit (plan 2026-10-05, P4-P5).
+I-Max ComfyUI node layer — inference toolkit + node (plan 2026-10-05, P4-P6).
 
 The inference-time compensations of I-Max (arXiv 2410.07536 §2.3) as ComfyUI
-transformer patches, plus the per-pass ``model_options`` builder that installs
-them on the high-resolution pass only (D5). The node itself — gates, adapters,
-schema, execute — lands with P6 on top of this module.
+transformer patches, the per-pass ``model_options`` builder that installs them
+on the high-resolution pass only (D5), and the :class:`IMaxNode` dual-pass
+node itself — gates, x0/VAE adapters, guidance-latent builder, schema and
+execute.
 
-Everything here is torch-only at MODULE scope: comfy modules are imported
-LAZILY inside the functions that need them (the ``nodes/hiflow.py`` discipline
-one level stricter — not even ``comfy_api`` at import time), so this layer
-imports and unit-tests without a ComfyUI installation.
+Everything here is torch-only at MODULE scope — the single exception is the
+V3 schema base (``comfy_api.latest.io``, which the root conftest mocks): the
+comfy.* modules are imported LAZILY inside the functions that need them (the
+``nodes/hiflow.py`` discipline one level stricter), so this layer imports and
+unit-tests without a ComfyUI installation.
 
 Toolkit items and their decisions:
 
@@ -67,7 +69,21 @@ import math
 from typing import Callable
 
 import torch
+from comfy_api.latest import io
 from torch import Tensor
+
+try:
+    from ..src.effective_sampling import effective_model_sampling, warn_if_stale_leak
+    from ..src.imax import IMaxConfig, build_flow_sigmas, imax_dual_pass
+    from ..src.prefix_cache import disable_prefix_kv_cache
+    from ..src.vae_channels import pad_to_vae_channels, strip_alpha_channel
+except ImportError:  # flat repo layout (tests / CLI)
+    from src.effective_sampling import effective_model_sampling, warn_if_stale_leak
+    from src.imax import IMaxConfig, build_flow_sigmas, imax_dual_pass
+    from src.prefix_cache import disable_prefix_kv_cache
+    from src.vae_channels import pad_to_vae_channels, strip_alpha_channel
+
+from .pixelrush import _detect_prediction_type
 
 logger = logging.getLogger("ComfyUI-DyPE")
 
@@ -419,3 +435,708 @@ def build_pass_model_options(
             make_text_duplication_patch(),
         ]
     return options
+
+
+# ---------------------------------------------------------------------------
+# Model gate (plan P6 / D1 — FLUX-family flow models only in v1)
+# ---------------------------------------------------------------------------
+
+def _resolve_diffusion_model(model):
+    """Resolve ``diffusion_model`` the pack's patcher-aware way.
+
+    ``ModelPatcher.get_model_object`` order (model_patcher.py:758-768):
+    object patch -> backup -> live attribute. Plain mocks without the method
+    fall back to the live attribute (the effective_model_sampling pattern).
+    """
+    get_model_object = getattr(model, "get_model_object", None)
+    if callable(get_model_object):
+        try:
+            return get_model_object("diffusion_model")
+        except AttributeError:
+            pass  # degrade: path missing on the patcher's BaseModel
+    return getattr(getattr(model, "model", None), "diffusion_model", None)
+
+
+def _require_flux_flow_model(model) -> tuple[str, int]:
+    """Gate I-Max to FLUX-arch rectified-flow models (plan D1 scope).
+
+    I-Max v1 is written against the Flux MMDiT wiring — the ``pe_embedder``
+    RoPE seam, the ``attn1_patch``/``post_input`` patch contracts and the
+    3-axis ``txt_ids`` grid. Three checks, in the order a user can act on:
+
+    1. flow prediction (rectified flow: CONST / img_to_img_flow /
+       cosmos_rflow — the HiFlow gate, resolved through the patcher);
+    2. FLUX arch: the BaseModel is comfy's ``model_base.Flux`` family
+       (Flux/Flux2/FluxSchnell/LongCatImage). Qwen models also own a
+       ``pe_embedder`` (src/patch_utils.py:239) but a completely different
+       forward — the MRO name is the real discriminator;
+    3. the D4 swap target exists: ``diffusion_model.pe_embedder``
+       (nunchaku builds route RoPE through ``model.pos_embed`` instead).
+
+    3D-FORMAT latent models (Wan21) would pass 1 but die at 2 — the v1
+    answer for them is HiFlow. Returns the detected flow family.
+    """
+    # Patch-resolved (KSampler semantics): a schedule leaked by a previous
+    # run's patch node must not flip this gate.
+    model_sampling = effective_model_sampling(model)
+    detected = _detect_prediction_type(model_sampling)
+    mro_names = [c.__name__ for c in type(model_sampling).__mro__]
+    if detected == "const" and "IMG_TO_IMG_FLOW" in mro_names:
+        detected = "img_to_img_flow"
+    elif detected == "const" and "COSMOS_RFLOW" in mro_names:
+        detected = "cosmos_rflow"
+
+    if detected not in ("const", "img_to_img_flow", "cosmos_rflow"):
+        raise ValueError(
+            f"I-Max needs a rectified-flow model (FLUX family); this model "
+            f"predicts '{detected.upper()}'. For SD/SDXL-style models use "
+            f"the PixelRush node instead."
+        )
+
+    base_mro = [c.__name__ for c in type(getattr(model, "model", None)).__mro__]
+    if "Flux" not in base_mro:
+        raise ValueError(
+            "I-Max v1 supports the FLUX family only (its NTK RoPE, text "
+            "duplication and guidance math are written against the Flux "
+            "MMDiT wiring); this model's arch is "
+            f"{type(getattr(model, 'model', None)).__name__}. For other "
+            f"flow models (Qwen-Image, AuraFlow, ...) use the HiFlow node."
+        )
+
+    diffusion_model = _resolve_diffusion_model(model)
+    if diffusion_model is None or not hasattr(diffusion_model, "pe_embedder"):
+        raise ValueError(
+            "I-Max could not find diffusion_model.pe_embedder on this model "
+            "(nunchaku builds route RoPE through model.pos_embed). The D4 "
+            "positional scaling has no seam to install on."
+        )
+
+    latent_dimensions = getattr(
+        getattr(model, "model", None).latent_format, "latent_dimensions", 2)
+    if latent_dimensions not in (2, 3):
+        raise ValueError(
+            f"I-Max supports 2D or 3D-format image latents; this model "
+            f"reports latent_dimensions={latent_dimensions}."
+        )
+    return detected, int(latent_dimensions)
+
+
+def _apply_guidance_override(conditioning, guidance_value) -> list:
+    """D12: write the FLUX guidance embed into a COPY of a conditioning list.
+
+    0.0 (or None) = passthrough — whatever a chained FluxGuidance set wins
+    (node_helpers.conditioning_set_values semantics, node_helpers.py:9-22:
+    every entry's option dict is copied, the caller's objects are never
+    mutated). The key is ``guidance`` (comfy model_base.py:1046-1048).
+    """
+    if guidance_value is None or float(guidance_value) <= 0.0:
+        return conditioning
+    out = []
+    for entry in conditioning or []:
+        if isinstance(entry, (tuple, list)) and len(entry) == 2:
+            tensor, opts = entry
+            opts = dict(opts) if isinstance(opts, dict) else opts
+            opts["guidance"] = float(guidance_value)
+            out.append((tensor, opts))
+        else:
+            out.append(entry)
+    return out
+
+
+# ---------------------------------------------------------------------------
+# D4 unet function wrapper — the per-pass pe_embedder swap
+# ---------------------------------------------------------------------------
+
+def _make_imax_unet_wrapper(
+    pass_state: dict,
+    ntk_factor: float = 10.0,
+    ntk_clip: bool = True,
+    previous_wrapper: Callable | None = None,
+) -> Callable:
+    """Build the ``model_function_wrapper`` that swaps the RoPE embedder.
+
+    comfy consumes ``model_options["model_function_wrapper"]`` per batch as
+    ``wrapper(model.apply_model, {"input","timestep","c","cond_or_uncond"})``
+    (samplers.py:332-335) — so the wrapper receives the BaseModel (via the
+    bound method's ``__self__``; the ``pass_state["inner_model"]`` fallback
+    covers plain test callables) and can swap ``diffusion_model.pe_embedder``
+    around each forward:
+
+    - pass A (``pass_state["high_pass"] is False``): call through unchanged —
+      the model runs exactly as installed (D4: pass A is unmodified);
+    - pass B: resolve the CURRENTLY installed embedder per forward (so a
+      chained DyPE/SEGA object-patched embedder is seen at call time), wrap
+      it in :class:`IMaxNTKEmbedder` (constructed once per distinct inner —
+      that is where the takeover warning fires, once per run), swap it in and
+      restore the original in ``finally``. No ``add_object_patch``, no
+      patch/unpatch window, nothing to leak (D4).
+
+    ``previous_wrapper`` (a chained DyPE wrapper found on the cloned
+    model_options) is called THROUGH: our swap happens first, then the
+    previous wrapper keeps its per-forward state updates and performs the
+    forward — replacing it outright would silently drop its behavior.
+    """
+
+    def _call_through(model_function: Callable, params: dict):
+        if previous_wrapper is not None:
+            return previous_wrapper(model_function, params)
+        return model_function(
+            params["input"], params["timestep"], **params.get("c", {}))
+
+    def wrapper(model_function: Callable, params: dict) -> Tensor:
+        if not pass_state.get("high_pass"):
+            return _call_through(model_function, params)
+        inner_model = getattr(model_function, "__self__", None) \
+            or pass_state.get("inner_model")
+        diffusion_model = getattr(inner_model, "diffusion_model", None)
+        if diffusion_model is None or not hasattr(
+                diffusion_model, "pe_embedder"):
+            raise ValueError(
+                "I-Max could not find diffusion_model.pe_embedder on the "
+                "model for the high-resolution pass."
+            )
+        installed = diffusion_model.pe_embedder
+        imax_embedder = pass_state.get("imax_embedder")
+        if imax_embedder is None or pass_state.get("embedder_inner") \
+                is not installed:
+            imax_embedder = IMaxNTKEmbedder(
+                installed, ntk_factor=ntk_factor, ntk_clip=ntk_clip)
+            pass_state["imax_embedder"] = imax_embedder
+            pass_state["embedder_inner"] = installed
+        diffusion_model.pe_embedder = imax_embedder
+        try:
+            return _call_through(model_function, params)
+        finally:
+            diffusion_model.pe_embedder = installed
+
+    return wrapper
+
+
+# ---------------------------------------------------------------------------
+# x0 adapter (plan P6 — the nodes/hiflow.py:89-200 pattern)
+# ---------------------------------------------------------------------------
+
+def _make_predict_x0(
+    model,
+    positive,
+    negative,
+    cfg_scale: float,
+    model_options: dict,
+    pass_state: dict,
+    high_pass: bool,
+    guidance_override: float = 0.0,
+    latent_dimensions: int = 2,
+) -> Callable[[Tensor, float], Tensor]:
+    """Create a pass-bound x0 adapter: ``(x_vae, sigma) -> x0_vae``.
+
+    Mirrors ``nodes/hiflow.py:89-200`` — conditioning prepared once per
+    latent shape via convert_cond -> process_conds, per-call
+    ``comfy.samplers.sampling_function`` (full CFG, areas, control nets),
+    VAE<->model conversions bracketing the model call, CFG auto-skip for
+    token-less negatives — with three I-Max differences:
+
+    - ``model_options`` is the PASS dict (D5): the pass-A clone carries no
+      I-Max patches, the pass-B clone carries the toolkit patches; both
+      carry the D4 unet wrapper (it rides inside model_options);
+    - the adapter flips ``pass_state["high_pass"]`` to its own pass before
+      every model call — that state cell is what the D4 wrapper reads to
+      decide whether to swap the RoPE embedder (P6);
+    - ``guidance_override`` (D12) rewrites the conditioning's ``guidance``
+      embed on copies before conversion (0.0 = passthrough).
+    """
+    import comfy.model_management
+    import comfy.sampler_helpers
+    import comfy.samplers
+
+    device = model.load_device if hasattr(model, "load_device") \
+        else torch.device("cpu")
+    inner_model = model.model
+    model_sampling = effective_model_sampling(model)
+    process_latent_in = getattr(inner_model, "process_latent_in", None)
+    process_latent_out = getattr(inner_model, "process_latent_out", None)
+
+    comfy.model_management.load_models_gpu([model])
+    model.pre_run()
+
+    positive = _apply_guidance_override(positive, guidance_override)
+    negative = _apply_guidance_override(negative, guidance_override)
+
+    _conds_by_shape: dict[tuple, dict] = {}
+
+    def _get_conds(shape: tuple) -> dict:
+        key = tuple(shape)
+        if key not in _conds_by_shape:
+            conds = {
+                "positive": comfy.sampler_helpers.convert_cond(positive),
+                "negative": comfy.sampler_helpers.convert_cond(negative),
+            }
+            noise = torch.zeros(shape, device=device)
+            _conds_by_shape[key] = comfy.samplers.process_conds(
+                inner_model, noise, conds, device,
+            )
+        return _conds_by_shape[key]
+
+    # CFG guard (the Z-Image bugfix pattern): with a NEGATIVE that carries no
+    # tokens, CFG amplifies a meaningless difference. Mirror ComfyUI's cfg=1
+    # skip: run the conditional branch only.
+    _has_negative = False
+    for _entry in negative or []:
+        if isinstance(_entry, (tuple, list)) and len(_entry) == 2:
+            _tensor, _opts = _entry
+            _tokens = 0
+            if torch.is_tensor(_tensor):
+                _tokens = int(_tensor.numel())
+            elif isinstance(_tensor, (list, tuple)):
+                _tokens = sum(
+                    int(t.numel()) if torch.is_tensor(t) else len(t)
+                    for t in _tensor
+                )
+            if _tokens > 0:
+                _has_negative = True
+                break
+    if not _has_negative:
+        cfg_scale = 1.0
+        logger.info(
+            "I-Max: negative conditioning carries no tokens — running "
+            "the conditional branch only (CFG skipped, scale forced to 1.0)"
+        )
+
+    def predict_x0(x_vae: Tensor, sigma: float) -> Tensor:
+        # Pass discrimination for the D4 wrapper (read inside this call's
+        # forward; see _make_imax_unet_wrapper).
+        pass_state["high_pass"] = high_pass
+        x = x_vae.to(device)
+        # 3D-format models need the 5D tensor (the Wan21 stats contract) —
+        # inert for FLUX (latent_dimensions == 2).
+        was_4d = x.dim() == 4
+        if was_4d and latent_dimensions == 3:
+            x = x.unsqueeze(2)  # [B, C, 1, H, W]
+        if process_latent_in is not None:
+            x = process_latent_in(x)
+
+        conds = _get_conds(tuple(x_vae.shape))
+        sigma_t = torch.tensor([float(sigma)], device=device)
+        timestep = model_sampling.timestep(sigma_t)
+
+        x0 = comfy.samplers.sampling_function(
+            inner_model, x, timestep,
+            uncond=conds["negative"], cond=conds["positive"],
+            cond_scale=cfg_scale,
+            model_options=model_options,
+        )
+        if process_latent_out is not None:
+            x0 = process_latent_out(x0)
+        if was_4d and x0.dim() == 5:
+            x0 = x0.squeeze(2)
+        return x0.to(x_vae.dtype).to(x_vae.device)
+
+    return predict_x0
+
+
+# ---------------------------------------------------------------------------
+# VAE adapters + guidance latent (plan P6; nodes/hiflow.py:207-269 pattern)
+# ---------------------------------------------------------------------------
+
+def _downscale_ratio(vae) -> int:
+    """The VAE's latent->pixel downscale ratio (tuple-tolerant, Qwen style)."""
+    ratio = getattr(vae, "downscale_ratio", 8)
+    if isinstance(ratio, (tuple, list)):
+        ratio = ratio[1]  # (callable, h_ratio, w_ratio) convention
+    return int(ratio)
+
+
+def _make_vae_adapters(vae, device):
+    """Create (vae_decode, vae_encode) callables in VAE latent space.
+
+    Same contract as ``nodes/hiflow.py:207-269``: channels-LAST at the ComfyUI
+    VAE boundary (decode returns [B, H, W, 3], encode expects it and applies
+    ``movedim(-1, 1)`` itself), no latent-format conversions here (the engine
+    and the x0 adapter own the format), and the 3D-format VAE dance — 5D
+    latent in on decode, first temporal frame out; channels-last 4D image in
+    on encode, first frame of the 5D latent back.
+    """
+    latent_dim = getattr(vae, "latent_dim", 2)
+
+    def vae_decode(latent: Tensor) -> Tensor:
+        """latent [B,C,h,w] (or 5D [B,C,1,h,w]) -> image [B, H, W, 3]."""
+        if isinstance(latent, dict):
+            latent = latent["samples"]
+        latent = latent.to(device)
+        if latent_dim == 3 and latent.dim() == 4:
+            latent = latent.unsqueeze(2)  # [B, C, 1, h, w]
+        decoded = vae.decode(latent)
+        if isinstance(decoded, dict):
+            decoded = decoded["samples"]
+        if decoded.ndim == 5:
+            decoded = decoded[:, 0]     # first temporal frame [B, H, W, 3]
+        elif decoded.ndim == 3:
+            decoded = decoded.unsqueeze(0)
+        decoded = strip_alpha_channel(decoded, vae, "I-Max")
+        return decoded  # [B, H, W, 3] channels-last, untouched
+
+    def vae_encode(image: Tensor) -> Tensor:
+        """image [B, H, W, 3] -> latent [B, C, h, w] (4D for the core)."""
+        image = image.to(device)
+        image = pad_to_vae_channels(image, vae)
+        encoded = vae.encode(image)
+        if isinstance(encoded, dict):
+            encoded = encoded["samples"]
+        if latent_dim == 3 and encoded.ndim == 5:
+            encoded = encoded[:, :, 0]  # first temporal frame -> 4D
+        return encoded
+
+    return vae_decode, vae_encode
+
+
+def _build_guidance_latent(
+    low_latent: Tensor,
+    vae_decode: Callable[[Tensor], Tensor],
+    vae_encode: Callable[[Tensor], Tensor],
+    target_size: tuple[int, int],
+) -> Tensor:
+    """Pass-A result -> the FIXED target-resolution guidance latent.
+
+    The reference's upsample (pipeline_flux_imax.py:711-718): VAE decode,
+    bicubic resize to the target PIXEL size, VAE re-encode. Runs ONCE per
+    generation — the result is fixed for the whole pass B, and the engine
+    derives P(G) from it exactly once more (haar_lowpass). ``vae.encode``
+    sampling is stochastic: same inputs, a fresh guidance draw — accepted
+    (plan §5; same as HiFlow), fingerprint_inputs keeps the node uncached.
+
+    ``target_size`` is in PIXELS ``(H, W)``; bicubic runs on a channels-FIRST
+    view of the channels-last decode output (F.interpolate treats dim 1 as
+    channels).
+    """
+    image = vae_decode(low_latent)          # [B, H_low, W_low, 3]
+    up = torch.nn.functional.interpolate(
+        image.movedim(-1, 1), size=tuple(target_size), mode="bicubic",
+    )
+    return vae_encode(up.movedim(1, -1))    # [B, C, h_t, w_t]
+
+
+def _wrap_final_x0_call(
+    predict_x0: Callable[[Tensor, float], Tensor],
+    total_steps: int,
+    on_final: Callable[[Tensor], None],
+) -> Callable[[Tensor, float], Tensor]:
+    """Fire ``on_final(x0)`` on the adapter's LAST scheduled call.
+
+    The bridge that lets the node own the VAE round trip while the engine
+    owns the loop: the engine's final Euler step of pass A lands on σ=0,
+    and x + (x − x̂₁)/σ · (0 − σ) = x̂₁ analytically — the model's last clean
+    prediction IS the final low-res latent (fp32 deviation ~1e-7, far below
+    the VAE round-trip noise). ``on_final`` therefore runs inside the last
+    pass-A step, BEFORE the engine computes P(G) from the guidance buffer
+    the callback fills (see IMaxNode.execute).
+    """
+    calls = {"n": 0}
+
+    def wrapped(x: Tensor, sigma: float) -> Tensor:
+        x0 = predict_x0(x, sigma)
+        calls["n"] += 1
+        if calls["n"] == total_steps:
+            on_final(x0)
+        return x0
+
+    return wrapped
+
+
+# ---------------------------------------------------------------------------
+# I-Max node (plan D1, D11-D15)
+# ---------------------------------------------------------------------------
+
+class IMaxNode(io.ComfyNode):
+    """I-Max — tuning-free resolution extrapolation for FLUX (arXiv 2410.07536).
+
+    Pass A generates at the native-area low resolution unpatched; its final
+    clean prediction is VAE round-tripped (decode -> bicubic -> encode) into
+    a FIXED guidance latent; pass B at the target resolution runs with the
+    NTK RoPE embedder + proportional attention + text duplication active and
+    its clean predictions pulled toward the low pass of the guidance
+    (Projected Flow, paper §2.2).
+    """
+
+    @classmethod
+    def define_schema(cls) -> io.Schema:
+        return io.Schema(
+            node_id="IMax",
+            display_name="I-Max",
+            category="WMNodes/image",
+            description=(
+                "Tuning-free resolution extrapolation for FLUX (arXiv "
+                "2410.07536): a low-resolution pass builds a fixed guidance "
+                "latent; the target-resolution pass is pulled toward its "
+                "low pass while NTK RoPE, proportional attention and text "
+                "duplication compensate the resolution gap. Feed a latent "
+                "at the TARGET size (EmptySD3LatentImage)."
+            ),
+            inputs=[
+                io.Model.Input("model", tooltip="The FLUX-family flow model."),
+                io.Vae.Input(
+                    "vae",
+                    tooltip="VAE for the guidance round trip (decode -> "
+                            "bicubic -> encode, once per generation)."),
+                io.Conditioning.Input(
+                    "positive", tooltip="Positive conditioning."),
+                io.Conditioning.Input(
+                    "negative", tooltip="Negative conditioning."),
+                io.Latent.Input(
+                    "latent_image",
+                    tooltip="Latent at the TARGET resolution (e.g. "
+                            "EmptySD3LatentImage at the desired output "
+                            "size). An empty latent is pure txt2img; a "
+                            "content latent + denoise < 1 is img2img."),
+                io.Int.Input(
+                    "noise_seed", default=0, min=0, max=2**32 - 1, step=1,
+                    tooltip="One shared generator: pass A's start noise, "
+                            "then pass B's img2img noise — same seed, same "
+                            "result (modulo the VAE encode sampling)."),
+                io.Float.Input(
+                    "denoise", default=1.0, min=0.05, max=1.0, step=0.05,
+                    tooltip="Img2img strength for PASS B only (KSampler "
+                            "convention); pass A always starts from pure "
+                            "noise. Ignored for an empty latent — that "
+                            "always runs the full schedule."),
+                io.Float.Input(
+                    "cfg", default=1.0, min=0.0, max=20.0, step=0.1,
+                    tooltip="Classifier-free guidance for BOTH passes. "
+                            "FLUX-dev: leave at 1.0 — the guidance embeds "
+                            "below do the work. CFG is auto-skipped when "
+                            "the negative carries no tokens."),
+                io.Int.Input(
+                    "steps_low", default=30, min=1, max=200, step=1,
+                    tooltip="Pass A (low-resolution guidance) steps — "
+                            "paper: 30."),
+                io.Int.Input(
+                    "steps_high", default=20, min=1, max=200, step=1,
+                    tooltip="Pass B (target resolution) steps — paper: 20."),
+                io.Float.Input(
+                    "guidance_low", default=3.5, min=0.0, max=20.0, step=0.1,
+                    tooltip="FLUX guidance embed written into a copy of the "
+                            "conditioning for pass A (paper/gradio 3.5). "
+                            "0.0 keeps whatever a chained FluxGuidance set."),
+                io.Float.Input(
+                    "guidance_high", default=5.0, min=0.0, max=20.0,
+                    step=0.1,
+                    tooltip="FLUX guidance embed for pass B (gradio 5.0). "
+                            "0.0 keeps whatever a chained FluxGuidance set."),
+                io.Float.Input(
+                    "time_shift_low", default=3.0, min=0.01, max=10.0,
+                    step=0.05,
+                    tooltip="Static flow shift of pass A's sigma schedule "
+                            "(paper: 3.0) — I-Max owns both schedules, no "
+                            "model_sampling patch is involved."),
+                io.Float.Input(
+                    "time_shift_high", default=6.0, min=0.01, max=10.0,
+                    step=0.05,
+                    tooltip="Static flow shift of pass B's schedule (paper: "
+                            "6.0) — the SNR re-balance between the passes."),
+                io.Float.Input(
+                    "ntk_factor", default=10.0, min=1.0, max=100.0, step=0.5,
+                    tooltip="NTK-aware RoPE base multiplier for the "
+                            "high-resolution pass (paper: 10 for "
+                            "Flux.1-dev). 1.0 = plain RoPE."),
+                io.Int.Input(
+                    "dwt_level", default=1, min=1, max=8, step=1,
+                    tooltip="Haar low-pass level of the guidance projection "
+                            "(paper: 1). Higher = coarser guidance detail."),
+                io.Combo.Input(
+                    "guidance_schedule",
+                    options=["disable", "cosine_decay", "cosine_shift",
+                             "constant"],
+                    default="cosine_decay",
+                    tooltip="Projected-Flow guidance schedule (paper §2.2): "
+                            "cosine_decay is the README/gradio default; "
+                            "disable runs pass B as plain Euler."),
+                io.Boolean.Input(
+                    "proportional_attention", default=True,
+                    tooltip="Scale the attention temperature with the joint "
+                            "sequence length (paper §2.3). Clamped to a "
+                            "no-op at/below the native 1024 px."),
+                io.Boolean.Input(
+                    "text_duplication", default=True,
+                    tooltip="Duplicate the text tokens per native 1024 px "
+                            "tile so the image/text token ratio stays in "
+                            "distribution (paper §2.3). No-op at/below "
+                            "1024 px."),
+                io.Float.Input(
+                    "low_res_scale", default=1.0, min=0.25, max=2.0,
+                    step=0.05,
+                    tooltip="Scales the LOW-RES pass AREA (1.0 = the "
+                            "paper's native-area guidance; 0.5 halves it)."),
+            ],
+            outputs=[
+                io.Latent.Output(display_name="High-Res Latent"),
+            ],
+        )
+
+    @classmethod
+    def fingerprint_inputs(cls, **kwargs) -> float:
+        """Never serve this node from the cache (D15).
+
+        The guidance latent's ``vae.encode`` is stochastic: identical inputs
+        still yield a fresh draw, so a cached result would silently repeat
+        the previous image. NaN compares unequal to itself — the canonical
+        always-rerun fingerprint.
+        """
+        return float("nan")
+
+    @classmethod
+    def execute(cls, model, vae, positive, negative, latent_image,
+                noise_seed=0, denoise=1.0, cfg=1.0,
+                steps_low=30, steps_high=20, guidance_low=3.5,
+                guidance_high=5.0, time_shift_low=3.0, time_shift_high=6.0,
+                ntk_factor=10.0, dwt_level=1,
+                guidance_schedule="cosine_decay",
+                proportional_attention=True, text_duplication=True,
+                low_res_scale=1.0) -> io.NodeOutput:
+        import comfy.utils
+
+        # Gate BEFORE any model calls: FLUX-family rectified flow only (D1).
+        _, latent_dimensions = _require_flux_flow_model(model)
+        warn_if_stale_leak(model, "I-Max")
+
+        # Clone FIRST: the unet wrapper and per-pass options are run-scoped
+        # and must never outlive this node onto the caller's patcher (D4).
+        # The prefix-cache disable rides the same clone (Qwen-2.1 no-op here).
+        model = disable_prefix_kv_cache(model)
+
+        if isinstance(latent_image, dict):
+            content_latent = latent_image["samples"]
+        else:
+            content_latent = latent_image
+        if content_latent.ndim == 5:
+            if content_latent.shape[2] != 1:
+                raise ValueError(
+                    "I-Max received a multi-frame (video) latent "
+                    f"(T={content_latent.shape[2]}). It supports single-"
+                    "frame image latents only — the dual pass is 2D per "
+                    "frame."
+                )
+            content_latent = content_latent.squeeze(2)  # [B, C, H, W]
+
+        device = model.load_device if hasattr(model, "load_device") \
+            else torch.device("cpu")
+        content_latent = content_latent.to(device)
+
+        # Channel handling for empty latents (EmptyLatentImage may produce 4
+        # channels for a 16-channel model) — the PixelRush convention.
+        model_latent_channels = getattr(
+            model.model.latent_format, "latent_channels", None)
+        if model_latent_channels is not None and \
+                content_latent.shape[1] != model_latent_channels:
+            if torch.count_nonzero(content_latent) == 0:
+                logger.info(
+                    "I-Max: empty input latent has %d channels, model "
+                    "expects %d — repeating channels",
+                    content_latent.shape[1], model_latent_channels,
+                )
+                content_latent = comfy.utils.repeat_to_batch_size(
+                    content_latent, model_latent_channels, dim=1,
+                )
+            else:
+                logger.warning(
+                    "I-Max: non-empty input latent has %d channels, model "
+                    "expects %d — results may be unexpected",
+                    content_latent.shape[1], model_latent_channels,
+                )
+
+        h_t, w_t = int(content_latent.shape[-2]), int(content_latent.shape[-1])
+        vae_ratio = _downscale_ratio(vae)
+
+        # A content latent with denoise=1.0 is a foot-gun (HiFlow warning).
+        if torch.count_nonzero(content_latent) > 0 and \
+                float(denoise) > 0.9999:
+            logger.warning(
+                "I-Max: denoise=1.0 with a non-empty latent — the input "
+                "image is ignored (pass B starts from pure noise). Lower "
+                "denoise (e.g. 0.6) to condition on the connected latent."
+            )
+
+        # ---- D4 wrapper + D5 per-pass model options. -----------------------
+        pass_state = {
+            "high_pass": False,          # the pass-discrimination cell (P6)
+            "inner_model": model.model,  # wrapper fallback for plain fns
+            "imax_embedder": None,
+            "embedder_inner": None,
+        }
+        previous_wrapper = model.model_options.get("model_function_wrapper")
+        model.set_model_unet_function_wrapper(_make_imax_unet_wrapper(
+            pass_state, ntk_factor=float(ntk_factor),
+            previous_wrapper=previous_wrapper,
+        ))
+        # Build the pass clones AFTER installing the wrapper: it rides inside
+        # model_options, so BOTH pass dicts must carry it (D5/P6).
+        options_low = build_pass_model_options(model, enabled=False)
+        options_high = build_pass_model_options(
+            model, enabled=True,
+            proportional_attention=bool(proportional_attention),
+            text_duplication=bool(text_duplication),
+        )
+
+        # ---- Pass-bound x0 adapters (D5, D12). -----------------------------
+        predict_x0_low = _make_predict_x0(
+            model, positive, negative, cfg_scale=float(cfg),
+            model_options=options_low, pass_state=pass_state,
+            high_pass=False, guidance_override=float(guidance_low),
+            latent_dimensions=latent_dimensions,
+        )
+        predict_x0_high = _make_predict_x0(
+            model, positive, negative, cfg_scale=float(cfg),
+            model_options=options_high, pass_state=pass_state,
+            high_pass=True, guidance_override=float(guidance_high),
+            latent_dimensions=latent_dimensions,
+        )
+
+        # ---- The guidance latent: fixed for all of pass B. -----------------
+        # The engine takes the guidance as a static argument, but it is a
+        # function of pass A's output — so the buffer below is filled IN the
+        # last pass-A step (see _wrap_final_x0_call), before the engine
+        # computes P(G) from it. Built exactly once per generation.
+        vae_decode, vae_encode = _make_vae_adapters(vae, device)
+        guidance_buffer = torch.zeros_like(content_latent)
+        target_px = (h_t * vae_ratio, w_t * vae_ratio)
+
+        def _fill_guidance(x0_low: Tensor) -> None:
+            guidance_buffer.copy_(_build_guidance_latent(
+                x0_low, vae_decode, vae_encode, target_px,
+            ).to(device=guidance_buffer.device, dtype=guidance_buffer.dtype))
+
+        predict_x0_low = _wrap_final_x0_call(
+            predict_x0_low, int(steps_low), _fill_guidance)
+
+        # ---- I-Max owns both sigma schedules (D3). -------------------------
+        cfg_obj = IMaxConfig(
+            steps_low=int(steps_low), steps_high=int(steps_high),
+            time_shift_low=float(time_shift_low),
+            time_shift_high=float(time_shift_high),
+            dwt_level=int(dwt_level),
+            guidance_schedule=str(guidance_schedule),
+            denoise=float(denoise), low_res_scale=float(low_res_scale),
+            pixels_per_latent=vae_ratio,
+        )
+        sigmas_low = build_flow_sigmas(int(steps_low), float(time_shift_low))
+        sigmas_high = build_flow_sigmas(
+            int(steps_high), float(time_shift_high))
+
+        total = int(steps_low) + 1 + int(steps_high)
+        pbar = comfy.utils.ProgressBar(total)
+        counter = {"n": 0}
+
+        def progress_callback(i, total_steps, stage):
+            counter["n"] += 1
+            pbar.update_absolute(min(counter["n"], total))
+
+        # Model-space noising conversions (the v2.12.1 HiFlow fix); None on
+        # format-less models falls back to the engine's VAE-space mix.
+        inner_model = model.model
+        result = imax_dual_pass(
+            predict_x0_low, predict_x0_high, sigmas_low, sigmas_high,
+            content_latent, guidance_buffer, int(noise_seed), cfg_obj,
+            progress_callback,
+            process_latent_in=getattr(inner_model, "process_latent_in", None),
+            process_latent_out=getattr(
+                inner_model, "process_latent_out", None),
+        )
+        pbar.update_absolute(total)
+        return io.NodeOutput({"samples": result})
