@@ -33,13 +33,14 @@ SRC_DIR = PROJECT_ROOT / "src"
 ALL_NODE_CLASSES = [
     "DyPE_FLUX", "SEGA", "SPA", "HAP",
     "HAPCalibrate", "PixelRushNode", "FreeScaleNode", "HiFlowNode",
-    "EmptyQwenImage21LatentImage",
+    "IMaxNode", "EmptyQwenImage21LatentImage",
 ]
 
 # Expected node modules once every layout-plan step has landed.
 EXPECTED_NODE_MODULES = [
     "dype", "sega", "spa", "hap",
-    "hap_calibrate", "freescale", "pixelrush", "hiflow", "qwen21_latent",
+    "hap_calibrate", "freescale", "pixelrush", "hiflow", "imax",
+    "qwen21_latent",
 ]
 
 _OLD_CATEGORIES = ("model_patches/position_encoding", "image/upscaling")
