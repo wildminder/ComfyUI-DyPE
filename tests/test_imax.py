@@ -8,15 +8,18 @@ Phases 1-3 of plan 2026-10-05:
 - the dual-pass orchestration (D14).
 """
 
+import inspect
 import math
 
 import pytest
 import torch
 
 from src.imax import (
+    IMaxConfig,
     build_flow_sigmas,
     cosine_factor,
     haar_lowpass,
+    imax_dual_pass,
     low_res_size,
     projected_flow_x0,
 )
@@ -343,3 +346,189 @@ class TestLowResSize:
     def test_low_res_never_exceeds_target(self):
         assert low_res_size(2048, 2048, scale=64.0) == (2048, 2048)
         assert low_res_size(1536, 1024) <= (1536, 1024)
+
+
+# ---------------------------------------------------------------------------
+# Dual-pass orchestration (plan Phase 3 / D14 — fake predict_x0 returning
+# 0.5*x, the tests/test_hiflow_node.py convention)
+# ---------------------------------------------------------------------------
+
+def _recording_predict(factor: float = 0.5):
+    """Fake predict_x0: returns factor*x and records shapes/sigmas plus the
+    FIRST input it sees (each pass gets its own recorder)."""
+    calls: dict = {"shapes": [], "sigmas": [], "first_input": None}
+
+    def predict(x: torch.Tensor, sigma: float) -> torch.Tensor:
+        if calls["first_input"] is None:
+            calls["first_input"] = x.detach().clone()
+        calls["shapes"].append(tuple(x.shape))
+        calls["sigmas"].append(float(sigma))
+        return factor * x
+
+    return predict, calls
+
+
+# 160 latent = 1280 px > native 1024 px: the low pass lands at 1024 px
+# (= 128 latent) per D10's area-normalised formula.
+_TARGET_LATENT = (160, 160)
+_LOW_LATENT = (128, 128)
+_SIGMAS_LOW = build_flow_sigmas(4, 3.0)
+_SIGMAS_HIGH = build_flow_sigmas(3, 6.0)
+_SEED_CONTENT = 7
+
+
+def _make_content(seed: int = _SEED_CONTENT, h: int = 160, w: int = 160) -> torch.Tensor:
+    g = torch.Generator().manual_seed(seed)
+    return torch.randn(1, 4, h, w, generator=g)
+
+
+def _make_guidance(h: int = 160, w: int = 160) -> torch.Tensor:
+    g = torch.Generator().manual_seed(99)
+    return torch.randn(1, 4, h, w, generator=g)
+
+
+def _engine_cfg(**overrides) -> IMaxConfig:
+    defaults = dict(
+        steps_low=4, steps_high=3,
+        native_resolution=1024, pixels_per_latent=8,
+    )
+    defaults.update(overrides)
+    return IMaxConfig(**defaults)
+
+
+def _run(content=None, guidance=None, cfg=None, seed=0, **kwargs):
+    low, low_calls = _recording_predict()
+    high, high_calls = _recording_predict()
+    content = _make_content() if content is None else content
+    guidance = _make_guidance() if guidance is None else guidance
+    cfg = _engine_cfg() if cfg is None else cfg
+    result = imax_dual_pass(
+        low, high, _SIGMAS_LOW, _SIGMAS_HIGH, content, guidance,
+        seed, cfg, **kwargs,
+    )
+    return result, low_calls, high_calls
+
+
+@pytest.mark.unit
+class TestIMaxDualPass:
+    def test_total_forward_count_is_steps_low_plus_steps_high(self):
+        _, low_calls, high_calls = _run()
+        assert len(low_calls["shapes"]) == 4  # cfg.steps_low
+        assert len(high_calls["shapes"]) == 3  # cfg.steps_high
+
+    def test_low_pass_shape_is_low_res_shape(self):
+        """160 latent = 1280 px target -> 1024 px (= 128 latent) low pass."""
+        _, low_calls, _ = _run()
+        assert low_calls["shapes"][0] == (1, 4, *_LOW_LATENT)
+
+    def test_high_pass_shape_is_target_shape(self):
+        result, _, high_calls = _run()
+        assert high_calls["shapes"][0] == (1, 4, *_TARGET_LATENT)
+        assert tuple(result.shape) == (1, 4, *_TARGET_LATENT)
+
+    def test_same_seed_is_deterministic(self):
+        content, guidance = _make_content(), _make_guidance()
+        result_a, _, _ = _run(content=content, guidance=guidance, seed=123)
+        result_b, _, _ = _run(content=content, guidance=guidance, seed=123)
+        assert torch.equal(result_a, result_b)
+
+    def test_different_seed_changes_result(self):
+        content, guidance = _make_content(), _make_guidance()
+        result_a, _, _ = _run(content=content, guidance=guidance, seed=1)
+        result_b, _, _ = _run(content=content, guidance=guidance, seed=2)
+        assert not torch.equal(result_a, result_b)
+
+    def test_denoise_one_starts_from_pure_noise(self):
+        content = _make_content(seed=42)
+        result, _, high_calls = _run(
+            content=content, cfg=_engine_cfg(denoise=1.0),
+        )
+        first = high_calls["first_input"]
+        assert first.mean().abs() < 0.05
+        assert (first.std() - 1.0).abs() < 0.05
+        assert high_calls["sigmas"][0] == pytest.approx(1.0)
+
+    def test_denoise_below_one_preserves_content(self):
+        content = _make_content(seed=42)
+
+        def correlation(first_input):
+            a = first_input.flatten()
+            b = content.flatten()
+            a = a - a.mean()
+            b = b - b.mean()
+            return float((a * b).mean() / (a.std() * b.std()))
+
+        _, _, high_calls = _run(
+            content=content, cfg=_engine_cfg(denoise=0.3),
+        )
+        corr_noisy = correlation(high_calls["first_input"])
+        assert high_calls["sigmas"][0] < 1.0  # truncated schedule entry
+        assert corr_noisy > 0.05  # content survives the init mix
+
+        _, _, high_calls_full = _run(
+            content=content, cfg=_engine_cfg(denoise=1.0),
+        )
+        assert corr_noisy > correlation(high_calls_full["first_input"]) + 0.05
+
+    def test_disable_schedule_equals_plain_euler(self):
+        content, guidance = _make_content(), _make_guidance()
+        cfg = _engine_cfg(guidance_schedule="disable")
+        result, _, high_calls = _run(
+            content=content, guidance=guidance, cfg=cfg,
+        )
+        # Manual Euler over the same schedule, from the engine's own
+        # pass-B init, with the same fake predictor.
+        x = high_calls["first_input"].clone()
+        for i in range(_SIGMAS_HIGH.numel() - 1):
+            sigma = float(_SIGMAS_HIGH[i])
+            x0 = 0.5 * x
+            v = (x - x0) / max(sigma, 1e-6)
+            x = x + v * (float(_SIGMAS_HIGH[i + 1]) - sigma)
+        assert torch.allclose(result, x, atol=1e-6)
+
+    def test_progress_callback_reports_both_passes(self):
+        events: list[tuple[int, int, str]] = []
+        _run(progress_callback=lambda i, n, stage: events.append((i, n, stage)))
+        stages = [stage for _, _, stage in events]
+        assert stages.count("low") == 4
+        assert stages.count("high") == 3
+        assert all(n == 4 for i, n, s in events if s == "low")
+        assert all(n == 3 for i, n, s in events if s == "high")
+
+    def test_engine_never_calls_vae(self):
+        """Signature guard: the engine takes injected predictors only —
+        no VAE object ever reaches src/imax.py (plan D2)."""
+        params = inspect.signature(imax_dual_pass).parameters
+        assert [p for p in params if "vae" in p.lower()] == []
+
+    def test_below_native_low_pass_runs_at_target(self, caplog):
+        """64 latent = 512 px target <= native: pass A runs at the target
+        and the D10 WARNING is logged."""
+        content = _make_content(h=64, w=64)
+        with caplog.at_level("WARNING", logger="ComfyUI-DyPE"):
+            result, low_calls, _ = _run(
+                content=content, guidance=_make_guidance(h=64, w=64),
+            )
+        assert low_calls["shapes"][0] == (1, 4, 64, 64)
+        assert "at/below the native" in caplog.text
+        assert tuple(result.shape) == (1, 4, 64, 64)
+
+    def test_low_res_scale_shrinks_low_pass(self):
+        """low_res_scale=0.25 quarters the guidance area (sqrt form)."""
+        content = _make_content()
+        _, low_calls, _ = _run(
+            content=content, cfg=_engine_cfg(low_res_scale=0.25),
+        )
+        assert low_calls["shapes"][0] == (1, 4, 64, 64)
+
+    def test_guidance_shape_mismatch_raises(self):
+        with pytest.raises(ValueError, match="must match the target"):
+            _run(guidance=_make_guidance(h=32, w=32))
+
+    def test_multiframe_content_rejected(self):
+        with pytest.raises(ValueError, match="4D latent"):
+            _run(content=torch.randn(1, 4, 2, 64, 64))
+
+    def test_denoise_out_of_range_raises(self):
+        with pytest.raises(ValueError, match="denoise"):
+            _run(cfg=_engine_cfg(denoise=0.0))
