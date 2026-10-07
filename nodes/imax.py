@@ -44,7 +44,14 @@ Toolkit items and their decisions:
   a scalar on q commutes with the rotation, so head_dim cancels and the patch
   is ``q *= sqrt(log(N, 4608))`` — clamped to exactly 1.0 at/below the native
   sequence length (the plan D8 clamp; at ``N = 4608`` the formula itself is
-  continuously 1.0).
+  continuously 1.0). From v2.19.0 the z-image profile installs the SAME
+  algebra as a global ``transformer_options["optimized_attention_override"]``
+  instead — lumina blocks have no ``attn1_patch`` seam (their only attention
+  call is the module-level ``optimized_attention_masked``, ldm/lumina/
+  model.py:179-182) — with the anchor the z-image native sequence length
+  (native image grid + padded caption) and the call forwarded through the
+  lumina ``optimized_attention_masked`` symbol so chained SPA rebindings
+  compose (plan 2026-10-06).
 - D9 — text duplication via ``post_input``. The reference tiles the text
   stream ``nh*nw`` times (transformer_flux.py:364-375), offsetting each
   copy's position grid by ``(i*64, j*64)`` so every text copy shares a RoPE
@@ -414,6 +421,70 @@ def make_proportional_attention_patch(
     return patch
 
 
+def make_attention_scale_override(
+    anchor_seq_len: int = _NATIVE_GRID * _NATIVE_GRID,
+    previous_override: Callable | None = None,
+) -> Callable:
+    """``optimized_attention_override`` factory (D8, z-image profile).
+
+    Lumina blocks have no ``attn1_patch`` seam: their ONLY attention call is
+    the module-level ``optimized_attention_masked`` (comfy ldm/lumina/
+    model.py:179-182), intercepted through the global
+    ``transformer_options["optimized_attention_override"]`` seam — wrap_attn
+    (ldm/modules/attention.py:206-240) unwraps the AttentionTensorContainers
+    and calls this override as ``override(func, q, k, v, heads, *args,
+    **kwargs)``: ``func`` is the RAW undecorated backend, q/k/v are already
+    ``[b, heads, N, d]`` (the lumina call passes ``skip_reshape=True``), the
+    mask rides positionally in ``args`` and ``_inside_attn_wrapper=True`` in
+    kwargs (comfy's own installer precedent: set_model_optimized_attention,
+    model_patcher.py:688-695).
+
+    The override pre-scales q by :func:`proportional_attention_factor` of
+    the CALL's N against ``anchor_seq_len`` — the same algebra as the flux
+    ``attn1_patch`` (a scalar on q commutes with RoPE, head_dim cancels),
+    with the anchor the z-image native sequence length: the native image
+    grid (64x64 = 4096) plus the padded caption length, which the wiring
+    passes. Clamped to exactly 1.0 at/below the anchor — an exact no-op
+    pass-through. APPROXIMATION: the override sees the per-call N only — an
+    image-only sub-stream call (no caption rows) is scaled against the JOINT
+    anchor, a <=1% ratio error (plan 2026-10-06 §5).
+
+    Dispatch after the scale deliberately does NOT call ``func``: ``func``
+    is wrap_attn's raw backend and calling it would bypass a chained SPA
+    rebinding. The override resolves the lumina module symbol
+    ``optimized_attention_masked`` (``comfy.ldm.lumina.model``) lazily
+    INSIDE the call (import discipline) and forwards q/k/v/heads/args/
+    kwargs untouched — SPA rebinds exactly that symbol (src/spa.py:590-591),
+    so the call composes with it, and the still-set ``_inside_attn_wrapper``
+    makes the wrapped symbol skip the override branch (no recursion;
+    wrap_attn already popped ``preferred_attention``). When the comfy import
+    fails (standalone/mock use) the raw ``func`` is the fallback.
+
+    ``previous_override`` chains a pre-existing comfy override read off
+    ``model_options`` when the builder installs ours: it receives the SCALED
+    q with the untouched rest.
+    """
+    if anchor_seq_len < 1:
+        raise ValueError(
+            f"anchor_seq_len must be >= 1; got {anchor_seq_len!r}")
+
+    def override(func, q, k, v, heads, *args, **kwargs):
+        n_tokens = int(q.shape[-2])
+        factor = proportional_attention_factor(n_tokens, anchor_seq_len)
+        if factor != 1.0:
+            q = q * factor
+        if previous_override is not None:
+            return previous_override(func, q, k, v, heads, *args, **kwargs)
+        try:
+            from comfy.ldm.lumina import model as lumina_model
+            attn_fn = lumina_model.optimized_attention_masked
+        except (ImportError, AttributeError):
+            attn_fn = func
+        return attn_fn(q, k, v, heads, *args, **kwargs)
+
+    return override
+
+
 # ---------------------------------------------------------------------------
 # Text duplication (D9) — reference transformer_flux.py:364-375
 # ---------------------------------------------------------------------------
@@ -502,6 +573,8 @@ def build_pass_model_options(
     *,
     proportional_attention: bool = True,
     text_duplication: bool = True,
+    arch_profile: str = "flux",
+    attention_anchor: int = _NATIVE_GRID * _NATIVE_GRID,
 ) -> dict:
     """Model options for ONE pass of the dual-pass loop (plan D5).
 
@@ -513,21 +586,46 @@ def build_pass_model_options(
     ``m.model_options`` is never touched. Pass A builds with ``enabled=False``
     and gets a clone with no I-Max patches; pass B builds with ``True``.
 
+    ``arch_profile`` selects the D8 seam (plan 2026-10-06): ``"flux"`` keeps
+    the ``attn1_patch`` q pre-scale; ``"zimage"`` installs
+    :func:`make_attention_scale_override` on the GLOBAL
+    ``transformer_options["optimized_attention_override"]`` instead — lumina
+    blocks have no ``attn1_patch`` seam — chaining any pre-existing override
+    found on ``model.model_options`` (comfy's own
+    ``set_model_optimized_attention`` writes the same key,
+    model_patcher.py:688-695). ``attention_anchor`` is that override's
+    native sequence length: the wiring passes the native image grid plus
+    the padded caption length (D8 cap accounting).
+
     The D4 unet function wrapper is NOT installed here — it rides inside
     ``model_options["model_function_wrapper"]`` on the clone (set once via
     ``set_model_unet_function_wrapper``, model_patcher.py:656-657) and is
     therefore carried by BOTH pass dicts; pass discrimination is a state
     cell closed over by the wrapper itself (P6).
     """
+    if arch_profile not in ("flux", "zimage"):
+        raise ValueError(
+            f"arch_profile must be 'flux' or 'zimage'; got {arch_profile!r}")
     options = _clone_model_options(model.model_options)
     if not enabled:
         return options
     transformer_options = options.setdefault("transformer_options", {})
     patches = transformer_options.setdefault("patches", {})
     if proportional_attention:
-        patches["attn1_patch"] = patches.get("attn1_patch", []) + [
-            make_proportional_attention_patch(),
-        ]
+        if arch_profile == "zimage":
+            previous_override = (
+                model.model_options.get("transformer_options") or {}
+            ).get("optimized_attention_override")
+            transformer_options["optimized_attention_override"] = (
+                make_attention_scale_override(
+                    anchor_seq_len=attention_anchor,
+                    previous_override=previous_override,
+                )
+            )
+        else:
+            patches["attn1_patch"] = patches.get("attn1_patch", []) + [
+                make_proportional_attention_patch(),
+            ]
     if text_duplication:
         patches["post_input"] = patches.get("post_input", []) + [
             make_text_duplication_patch(),

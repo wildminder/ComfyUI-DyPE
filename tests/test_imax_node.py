@@ -601,6 +601,293 @@ class TestProportionalAttentionPatch:
 
 
 # ---------------------------------------------------------------------------
+# Proportional attention override (v2.19.0 D8, z-image — plan 2026-10-06)
+# ---------------------------------------------------------------------------
+
+def _raw_attn_stub(q, k, v, heads, *args, **kwargs):
+    """wrap_attn's ``func``: the RAW undecorated backend the wrapper hands
+    the override (comfy ldm/modules/attention.py:222)."""
+    return ("raw", q, k, v, heads, args, kwargs)
+
+
+def _install_fake_lumina(monkeypatch, attn_fn=None):
+    """Register the comfy.ldm.lumina module chain the override lazily
+    resolves (the _install_fake_comfy pattern): ``attn_fn`` becomes the
+    module-level ``optimized_attention_masked`` the override must land on
+    (SPA rebinds exactly that symbol, src/spa.py:590-591)."""
+    fake_model = types.ModuleType("comfy.ldm.lumina.model")
+    if attn_fn is not None:
+        fake_model.optimized_attention_masked = attn_fn
+    fake_lumina = types.ModuleType("comfy.ldm.lumina")
+    fake_lumina.model = fake_model
+    fake_ldm = types.ModuleType("comfy.ldm")
+    fake_ldm.lumina = fake_lumina
+    fake_comfy = types.ModuleType("comfy")
+    fake_comfy.ldm = fake_ldm
+    for name, mod in [("comfy", fake_comfy), ("comfy.ldm", fake_ldm),
+                      ("comfy.ldm.lumina", fake_lumina),
+                      ("comfy.ldm.lumina.model", fake_model)]:
+        monkeypatch.setitem(sys.modules, name, mod)
+    return fake_model
+
+
+def _call_as_wrap_attn(override, q, k, v, heads, mask, transformer_options):
+    """Drive ``override`` exactly as comfy's wrap_attn does for a lumina
+    block call (attention.py:215-222 on lumina/model.py:179-182): containers
+    already unwrapped, the mask positional, the wrapper guard kwarg set."""
+    return override(
+        _raw_attn_stub, q, k, v, heads, mask,
+        skip_reshape=True, transformer_options=transformer_options,
+        _inside_attn_wrapper=True,
+    )
+
+
+@pytest.mark.unit
+class TestAttentionScaleOverride:
+    """v2.19.0 D8 — the z-image proportional-attention override: lumina
+    blocks have no attn1_patch seam, so the q pre-scale rides the GLOBAL
+    ``optimized_attention_override`` seam (wrap_attn, attention.py:206-240),
+    chained over any pre-existing override and dispatched through the lumina
+    ``optimized_attention_masked`` symbol. The anchor is the z-image native
+    sequence length: native image grid (64x64 = 4096) + padded caption."""
+
+    ANCHOR = 4608  # 4096 + a 512-token padded caption
+
+    def _zimage_qkv(self, n, heads=8, head_dim=4):
+        q = torch.randn(1, heads, n, head_dim)
+        k = torch.randn(1, heads, n, head_dim)
+        v = torch.randn(1, heads, n, head_dim)
+        return q, k, v
+
+    def test_noop_at_the_anchor(self):
+        """The D8 clamp: at the anchor the SAME q reaches the attention
+        call — no per-block copy, no scale."""
+        q, k, v = self._zimage_qkv(self.ANCHOR)
+        out = _call_as_wrap_attn(
+            imx.make_attention_scale_override(self.ANCHOR),
+            q, k, v, 8, "mask", {})
+        assert out[1] is q
+        assert out[2] is k and out[3] is v
+
+    def test_noop_below_the_anchor(self):
+        q, k, v = self._zimage_qkv(512)
+        out = _call_as_wrap_attn(
+            imx.make_attention_scale_override(self.ANCHOR),
+            q, k, v, 8, "mask", {})
+        assert out[1] is q
+
+    def test_scales_q_above_anchor_by_reference_formula(self):
+        """Above the anchor: q * sqrt(log(N, anchor)) — log BASE anchor,
+        the same algebra as the flux patch (head_dim cancels); k/v ride
+        unscaled and the inputs are never mutated in place."""
+        n = 9216
+        q, k, v = self._zimage_qkv(n)
+        q_before, k_before, v_before = q.clone(), k.clone(), v.clone()
+        out = _call_as_wrap_attn(
+            imx.make_attention_scale_override(self.ANCHOR),
+            q, k, v, 8, "mask", {})
+        expected = math.sqrt(math.log(n) / math.log(self.ANCHOR))
+        assert torch.equal(out[1], q * expected)
+        assert out[2] is k and out[3] is v
+        assert torch.equal(q, q_before)
+        assert torch.equal(k, k_before) and torch.equal(v, v_before)
+
+    def test_forwards_mask_args_and_kwargs_untouched(self):
+        """wrap_attn's call shape: the mask positional, ``skip_reshape`` /
+        ``transformer_options`` / the wrapper guard kwarg forwarded as-is,
+        heads untouched."""
+        q, k, v = self._zimage_qkv(self.ANCHOR + 1)
+        to = {"patches": {}}
+        out = _call_as_wrap_attn(
+            imx.make_attention_scale_override(self.ANCHOR),
+            q, k, v, 8, "mask", to)
+        _, rq, rk, rv, r_heads, r_args, r_kwargs = out
+        assert r_heads == 8
+        assert r_args == ("mask",)
+        assert r_kwargs["skip_reshape"] is True
+        assert r_kwargs["transformer_options"] is to
+        assert r_kwargs["_inside_attn_wrapper"] is True
+
+    def test_resolves_the_lumina_symbol_not_the_raw_func(self, monkeypatch):
+        """Dispatch goes through the module-level lumina symbol (which SPA
+        rebinds), NOT wrap_attn's raw ``func`` — with the full call shape
+        forwarded."""
+        lumina_calls = []
+
+        def lumina_attn(q, k, v, heads, *args, **kwargs):
+            lumina_calls.append((q, k, v, heads, args, kwargs))
+            return "lumina-result"
+
+        _install_fake_lumina(monkeypatch, lumina_attn)
+        q, k, v = self._zimage_qkv(self.ANCHOR + 1)
+        out = _call_as_wrap_attn(
+            imx.make_attention_scale_override(self.ANCHOR),
+            q, k, v, 8, "mask", {"erg": 1})
+        assert out == "lumina-result"
+        assert len(lumina_calls) == 1
+        expected = math.sqrt(
+            math.log(self.ANCHOR + 1) / math.log(self.ANCHOR))
+        assert torch.equal(lumina_calls[0][0], q * expected)
+        assert lumina_calls[0][4] == ("mask",)
+        assert lumina_calls[0][5]["skip_reshape"] is True
+
+    def test_falls_back_to_raw_func_when_symbol_missing(self, monkeypatch):
+        """A lumina module without the symbol (mock/standalone builds) —
+        the raw ``func`` is the fallback, not a crash."""
+        _install_fake_lumina(monkeypatch, attn_fn=None)
+        q, k, v = self._zimage_qkv(self.ANCHOR + 1)
+        out = _call_as_wrap_attn(
+            imx.make_attention_scale_override(self.ANCHOR),
+            q, k, v, 8, "mask", {})
+        assert out[0] == "raw"
+        expected = math.sqrt(
+            math.log(self.ANCHOR + 1) / math.log(self.ANCHOR))
+        assert torch.equal(out[1], q * expected)
+
+    def test_chains_previous_override_with_scaled_q(self):
+        """A pre-existing comfy override (set_model_optimized_attention
+        shape) receives the SCALED q with the untouched rest, and its
+        result is returned — ours wraps theirs, theirs owns dispatch."""
+        prev_calls = []
+
+        def previous_override(func, q, k, v, heads, *args, **kwargs):
+            prev_calls.append((func, q, k, v, heads, args, kwargs))
+            return "prev-result"
+
+        q, k, v = self._zimage_qkv(9216)
+        out = _call_as_wrap_attn(
+            imx.make_attention_scale_override(
+                self.ANCHOR, previous_override=previous_override),
+            q, k, v, 8, "mask", {})
+        assert out == "prev-result"
+        assert len(prev_calls) == 1
+        func, seen_q, seen_k, seen_v, heads, args, kwargs = prev_calls[0]
+        expected = math.sqrt(math.log(9216) / math.log(self.ANCHOR))
+        assert torch.equal(seen_q, q * expected)
+        assert seen_k is k and seen_v is v
+        assert args == ("mask",)
+        assert kwargs["skip_reshape"] is True
+
+    def test_previous_override_receives_unscaled_q_at_anchor(self):
+        """Below/at the anchor the chain sees the ORIGINAL q object — the
+        clamp is an exact pass-through, not a *1.0 copy."""
+        prev_q = []
+
+        def previous_override(func, q, k, v, heads, *args, **kwargs):
+            prev_q.append(q)
+            return "prev-result"
+
+        q, k, v = self._zimage_qkv(self.ANCHOR)
+        _call_as_wrap_attn(
+            imx.make_attention_scale_override(
+                self.ANCHOR, previous_override=previous_override),
+            q, k, v, 8, "mask", {})
+        assert prev_q[0] is q
+
+    def test_factory_rejects_nonpositive_anchor(self):
+        with pytest.raises(ValueError, match="anchor_seq_len"):
+            imx.make_attention_scale_override(0)
+        with pytest.raises(ValueError, match="anchor_seq_len"):
+            imx.make_attention_scale_override(-4608)
+
+    # ---- build_pass_model_options install branch (z-image, plan D5/D8) --
+
+    def test_builder_installs_override_for_zimage(self):
+        """The z-image pass-B clone carries the override on the GLOBAL seam;
+        the flux attn1_patch list is left untouched (profile-gated)."""
+        model = _patched_model()
+        opts = imx.build_pass_model_options(
+            model, enabled=True, arch_profile="zimage",
+            attention_anchor=self.ANCHOR)
+        to = opts["transformer_options"]
+        assert callable(to["optimized_attention_override"])
+        assert to["patches"]["attn1_patch"] == [_existing_attn_patch]
+        assert "optimized_attention_override" not in \
+            model.model_options["transformer_options"]
+
+    def test_builder_zimage_override_scales_with_the_passed_anchor(self):
+        """The anchor flows from the builder into the installed override —
+        clamped at the anchor, scaled above it."""
+        model = _patched_model()
+        opts = imx.build_pass_model_options(
+            model, enabled=True, arch_profile="zimage",
+            attention_anchor=self.ANCHOR)
+        to = opts["transformer_options"]
+        installed = to["optimized_attention_override"]
+        at_anchor = self._zimage_qkv(self.ANCHOR)
+        out = _call_as_wrap_attn(installed, *at_anchor, 8, "mask", {})
+        assert out[1] is at_anchor[0]
+        above = self._zimage_qkv(2 * self.ANCHOR)
+        out = _call_as_wrap_attn(installed, *above, 8, "mask", {})
+        expected = math.sqrt(math.log(2 * self.ANCHOR) / math.log(self.ANCHOR))
+        assert torch.equal(out[1], above[0] * expected)
+
+    def test_builder_chains_existing_override_for_zimage(self):
+        """An override already on model.model_options (comfy's own
+        set_model_optimized_attention precedent) is chained — the clone
+        carries OURS, the source keeps theirs untouched."""
+        prev_calls = []
+
+        def previous_override(func, q, k, v, heads, *args, **kwargs):
+            prev_calls.append((q, args, kwargs))
+            return "prev-result"
+
+        model = _patched_model()
+        model.model_options["transformer_options"][
+            "optimized_attention_override"] = previous_override
+        opts = imx.build_pass_model_options(
+            model, enabled=True, arch_profile="zimage",
+            attention_anchor=self.ANCHOR)
+        installed = opts["transformer_options"][
+            "optimized_attention_override"]
+        assert installed is not previous_override
+        q, k, v = self._zimage_qkv(9216)
+        assert _call_as_wrap_attn(installed, q, k, v, 8, "mask", {}) \
+            == "prev-result"
+        expected = math.sqrt(math.log(9216) / math.log(self.ANCHOR))
+        assert torch.equal(prev_calls[0][0], q * expected)
+        assert model.model_options["transformer_options"][
+            "optimized_attention_override"] is previous_override
+
+    def test_builder_flux_profile_installs_no_override(self):
+        """Default (flux) profile: no override key — the attn1_patch route
+        is the flux D8 seam, unchanged (D7)."""
+        model = _patched_model()
+        opts = imx.build_pass_model_options(model, enabled=True)
+        assert "optimized_attention_override" \
+            not in opts["transformer_options"]
+        assert len(opts["transformer_options"]["patches"]["attn1_patch"]) == 2
+
+    def test_builder_zimage_toggle_disables_override(self):
+        """The proportional_attention toggle governs the z-image seam too —
+        off means no override on the pass-B clone."""
+        model = _patched_model()
+        opts = imx.build_pass_model_options(
+            model, enabled=True, arch_profile="zimage",
+            proportional_attention=False)
+        assert "optimized_attention_override" \
+            not in opts["transformer_options"]
+
+    def test_builder_pass_a_never_carries_override(self):
+        """Pass A (enabled=False) is a clean clone — no override even for
+        the z-image profile."""
+        model = _patched_model()
+        opts = imx.build_pass_model_options(
+            model, enabled=False, arch_profile="zimage",
+            attention_anchor=self.ANCHOR)
+        assert "optimized_attention_override" \
+            not in opts["transformer_options"]
+
+    def test_builder_rejects_unknown_profile(self):
+        """An unknown profile must fail loud, not silently install the flux
+        seam on a foreign arch."""
+        model = _patched_model()
+        with pytest.raises(ValueError, match="arch_profile"):
+            imx.build_pass_model_options(model, enabled=True,
+                                         arch_profile="lumina")
+
+
+# ---------------------------------------------------------------------------
 # Text duplication patch (plan D9, phase P5)
 # ---------------------------------------------------------------------------
 
