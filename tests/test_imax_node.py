@@ -10,6 +10,10 @@ Phases 4-5 of plan 2026-10-05:
 - the text-duplication post_input patch (D9, transformer_flux.py:364-375);
 - the per-pass model_options builder (D5).
 
+v2.19.0 (plan 2026-10-06): the per-group clip mode for the lumina NextDiT
+rope_embedder (D4') — image group clips against its own group length, cap
+group takes pure NTK.
+
 Markers: @pytest.mark.unit. No ComfyUI required — nodes/imax.py imports
 comfy only lazily, and the oracles below are self-contained mirrors.
 """
@@ -255,6 +259,255 @@ class TestIMaxNTKEmbedder:
         """P4 constraint: torch-only at module scope — every comfy import
         in nodes/imax.py is lazy (inside a function)."""
         assert not [k for k in vars(imx) if k.startswith("comfy")]
+
+
+# ---------------------------------------------------------------------------
+# NTK RoPE embedder, per-group clip mode (v2.19.0 D4', plan 2026-10-06)
+# ---------------------------------------------------------------------------
+
+def _ntk_rope_reference(pos: torch.Tensor, dim: int, theta,
+                        ntk_factor: float, floor_ratio: float = 0.0):
+    """Mirror of :func:`ntk_rope_omega`'s omega + comfy's rope layout
+    (ldm/flux/math.py:20-31 + layers.py:15-30): the NTK branch, max-ed with
+    ``theta^-s/sqrt(floor_ratio)`` when ``floor_ratio > 0``."""
+    assert dim % 2 == 0
+    scale = torch.linspace(
+        0, (dim - 2) / dim, steps=dim // 2, dtype=torch.float64,
+    )
+    omega = 1.0 / ((theta * ntk_factor) ** scale)
+    if floor_ratio > 0.0:
+        omega = torch.maximum(
+            omega, 1.0 / (theta ** scale) / math.sqrt(floor_ratio))
+    out = torch.einsum("...n,d->...nd", pos.to(dtype=torch.float32), omega)
+    out = torch.stack(
+        [out.cos(), -out.sin(), out.sin(), out.cos()], dim=-1,
+    )
+    return out.reshape(*out.shape[:-1], 2, 2).to(dtype=torch.float32)
+
+
+def _zimage_cap_ids(n_tokens: int = 512, batch: int = 1) -> torch.Tensor:
+    """Cap-group ids as embed_cap builds them (comfy lumina/model.py:
+    657-674): axis 0 counts the WHOLE padded span (arange + 1), axes 1/2
+    are 0 on every row — pad rows included."""
+    ids = torch.zeros(batch, n_tokens, 3)
+    ids[..., 0] = torch.arange(1, n_tokens + 1, dtype=torch.float32)
+    return ids
+
+
+def _zimage_image_ids(grid_h: int, grid_w: int, cap_len: int = 512,
+                      pad_rows: int = 0, batch: int = 1) -> torch.Tensor:
+    """Image-group ids as pos_ids_x builds them: constant t on axis 0, an
+    h x w grid on axes 1/2; ``pad_rows`` all-zero rows appended (image pad
+    rows are all-zero, comfy lumina/model.py:730)."""
+    n = grid_h * grid_w + pad_rows
+    ids = torch.zeros(batch, n, 3)
+    real = slice(0, grid_h * grid_w)
+    ids[:, real, 0] = float(cap_len + 1)
+    rows = torch.arange(grid_h, dtype=torch.float32)
+    cols = torch.arange(grid_w, dtype=torch.float32)
+    ids[:, real, 1] = rows.repeat_interleave(grid_w)
+    ids[:, real, 2] = cols.repeat(grid_h)
+    return ids
+
+
+@pytest.mark.unit
+class TestIMaxNTKEmbedderZImage:
+    """v2.19.0 D4' — per-group clip mode: the lumina NextDiT calls its
+    rope_embedder once per token group (cap lumina/model.py:673, siglip
+    :712, image :730), so the clip floor is re-derived per group — the
+    image group against its own group length, the caption group with no
+    floor (pure NTK, the paper's model-wide Lumina scaling, plan §5)."""
+
+    Z_THETA = 256.0
+    Z_AXES_DIM = [32, 48, 48]
+
+    def _embedder(self, inner=None, ntk_factor=10.0, **kwargs):
+        if inner is None:
+            inner = _EmbedND(theta=self.Z_THETA, axes_dim=self.Z_AXES_DIM)
+        return imx.IMaxNTKEmbedder(
+            inner, ntk_factor=ntk_factor, clip_mode="per_group", **kwargs)
+
+    def _group_expected(self, ids, ntk_factor, n_group):
+        """Per-axis reference rope for one group call: ``n_group=None`` is
+        the cap group (pure NTK), an int is the image group (the per-group
+        clip floor over its own length, native grid 64 -> 4096)."""
+        ratio = 0.0 if n_group is None else n_group / 4096.0
+        return torch.cat(
+            [_ntk_rope_reference(
+                ids[..., i], self.Z_AXES_DIM[i], self.Z_THETA, ntk_factor,
+                floor_ratio=ratio)
+             for i in range(3)],
+            dim=-3,
+        ).unsqueeze(1)
+
+    def test_ntk_factor_one_is_identity_at_native_grid(self):
+        """ntk_factor=1 at the native 64x64 image grid (4096) and on the
+        cap group: bitwise equal to the plain EmbedND (the per-group floor
+        is continuous with native at N_group=4096)."""
+        emb = self._embedder(ntk_factor=1.0)
+        for ids in (_zimage_cap_ids(), _zimage_image_ids(64, 64)):
+            inner = _EmbedND(theta=self.Z_THETA, axes_dim=self.Z_AXES_DIM)
+            assert torch.equal(emb(ids), inner(ids))
+
+    def test_image_group_floor_uses_group_length(self):
+        """16384 image tokens (128x128), theta=256, ntk=10: omega is
+        max((2560)^-s, 256^-s/2) — the design's hand-computed sanity pin;
+        the floor beats the NTK branch for s > log(2)/log(10) ≈ 0.301."""
+        dim = 16
+        omega = imx.ntk_rope_omega(
+            self.Z_THETA, dim, 10.0, 16384, clip_mode="per_group")
+        scale = torch.linspace(
+            0, (dim - 2) / dim, steps=dim // 2, dtype=torch.float64,
+        )
+        ntk = 1.0 / ((self.Z_THETA * 10.0) ** scale)
+        floor = 1.0 / (self.Z_THETA ** scale) / 2.0  # sqrt(16384/4096) == 2
+        assert torch.equal(omega, torch.maximum(ntk, floor))
+        # both branches bind somewhere (the max is doing real work)
+        assert not torch.equal(omega, ntk)
+        assert not torch.equal(omega, floor)
+        # hand check: s=0.125 (10^0.125=1.33 < 2 -> NTK binds), s=0.375
+        # (10^0.375=2.37 > 2 -> floor binds)
+        assert omega[1] == pytest.approx((self.Z_THETA * 10.0) ** -0.125)
+        assert omega[3] == pytest.approx(self.Z_THETA ** -0.375 / 2.0)
+
+    def test_image_group_call_clips_each_axis(self):
+        """End-to-end image group: every axis's omega is clipped by the
+        group's OWN length (16384) — the per-group rope oracle agrees
+        bitwise."""
+        ids = _zimage_image_ids(128, 128, cap_len=512)
+        emb = self._embedder(ntk_factor=10.0)
+        assert torch.equal(emb(ids), self._group_expected(ids, 10.0, 16384))
+
+    def test_cap_group_takes_pure_ntk_no_clip(self):
+        """The cap group never clips — an all-text group's joint-style
+        numerator would vanish; omega is (theta*ntk)^-s bitwise."""
+        ids = _zimage_cap_ids(512)
+        emb = self._embedder(ntk_factor=10.0)
+        assert torch.equal(emb(ids), self._group_expected(ids, 10.0, None))
+
+    def test_detection_is_padding_proof_both_ways(self):
+        """Cap ids count the padded span on axis 0 with h/w all zero — a
+        long padded caption (8192 > 4096) must STILL take pure NTK (any
+        axis-0-based detector would misclip it); image ids with all-zero
+        pad rows still classify as the image group ('any true' over h/w,
+        the group length includes the pads)."""
+        emb = self._embedder(ntk_factor=10.0)
+        cap = _zimage_cap_ids(8192)
+        assert torch.equal(emb(cap), self._group_expected(cap, 10.0, None))
+        img = _zimage_image_ids(64, 64, pad_rows=32)  # 4096 real + 32 pads
+        assert torch.equal(
+            emb(img), self._group_expected(img, 10.0, 64 * 64 + 32))
+
+    def test_siglip_grid_lands_in_the_image_branch(self):
+        """The mask is structural (src/models/zimage.py:36-37): ANY nonzero
+        h/w row puts the call in the clip branch — siglip grids included —
+        clipped by that group's own length."""
+        sig = torch.zeros(1, 3, 3)
+        sig[0, :, 1] = torch.tensor([1.0, 3.0, 5.0])
+        sig[0, :, 2] = torch.tensor([2.0, 4.0, 6.0])
+        emb = self._embedder(ntk_factor=10.0)
+        assert torch.equal(emb(sig), self._group_expected(sig, 10.0, 3))
+
+    def test_below_native_image_group_applies_the_floor(self):
+        """The per-group formula is unconditional (defined for every group
+        length): below the native grid the floor rises ABOVE native omega
+        (10^s/0.75 > 1 for every s) — pinned literally so the degenerate
+        regime stays a decision, not an accident (pass B above native is
+        the operating point)."""
+        dim = 16
+        omega = imx.ntk_rope_omega(
+            self.Z_THETA, dim, 10.0, 2304, clip_mode="per_group")
+        scale = torch.linspace(
+            0, (dim - 2) / dim, steps=dim // 2, dtype=torch.float64,
+        )
+        floor = 1.0 / (self.Z_THETA ** scale) / math.sqrt(2304 / 4096)
+        assert torch.equal(omega, floor)
+        assert omega[0] == pytest.approx(1.0 / math.sqrt(2304 / 4096))
+
+    def test_per_group_ignores_text_tokens(self):
+        """set_text_tokens is JOINT-floor bookkeeping (D8 cap accounting) —
+        a per-group forward is unchanged by it."""
+        ids = _zimage_cap_ids(512)
+        emb = self._embedder(ntk_factor=10.0)
+        before = emb(ids).clone()
+        emb.set_text_tokens(8192)
+        assert emb.text_tokens == 8192
+        assert torch.equal(emb(ids), before)
+
+    def test_set_text_tokens_feeds_the_joint_floor(self):
+        """Joint mode: the recorded count is the floor's subtraction term.
+        Default train_seq_len - native_grid**2 = 512 keeps the FLUX joint
+        path bitwise-neutral (D7); recording 1024 at N=5120 makes the ratio
+        exactly 1 — the floor IS the native omega, so the result is the
+        PLAIN embedding (the 512 default would deviate: ratio 1.125 lifts
+        the floor above the NTK branch for s > 0.026)."""
+        emb = imx.IMaxNTKEmbedder(_EmbedND(), ntk_factor=10.0)
+        assert emb.text_tokens == 512
+        emb.set_text_tokens(1024)
+        ids = _flux_ids(n_txt=1024)  # N = 1024 + 4096 = 5120
+        assert torch.equal(emb(ids), emb.inner(ids))
+        # the 512 default genuinely differs -> the recording did the work
+        default = imx.IMaxNTKEmbedder(_EmbedND(), ntk_factor=10.0)
+        assert not torch.equal(default(ids), emb.inner(ids))
+
+    def test_per_group_uses_per_axis_thetas(self):
+        """DyPE per-axis thetas survive the per-group branch — each axis's
+        omega uses its own base (src/base.py:19-26)."""
+        inner = _PosEmbedFluxStandIn(
+            theta=self.Z_THETA, axes_dim=self.Z_AXES_DIM)
+        inner.thetas = [256.0, 300.0, 300.0]
+        emb = self._embedder(inner=inner, ntk_factor=10.0)
+        assert emb.thetas == [256.0, 300.0, 300.0]
+        ids = _zimage_image_ids(128, 128)
+        expected = torch.cat(
+            [_ntk_rope_reference(
+                ids[..., i], self.Z_AXES_DIM[i], inner.thetas[i], 10.0,
+                floor_ratio=16384 / 4096)
+             for i in range(3)],
+            dim=-3,
+        ).unsqueeze(1)
+        assert torch.equal(emb(ids), expected)
+
+    def test_takeover_warning_fires_in_per_group_mode(self, caplog):
+        """A z-image DyPE-family embedder answers set_timestep
+        (src/base.py:50-51) — the takeover warning fires in per-group mode
+        too: the static omega replaces its dynamic scaling."""
+        inner = _PosEmbedFluxStandIn(
+            theta=self.Z_THETA, axes_dim=self.Z_AXES_DIM)
+        with caplog.at_level(logging.WARNING, logger="ComfyUI-DyPE"):
+            self._embedder(inner=inner)
+        assert "positional embedder" in caplog.text
+
+    def test_unknown_clip_mode_rejected(self):
+        with pytest.raises(ValueError, match="clip_mode"):
+            imx.IMaxNTKEmbedder(_EmbedND(), clip_mode="bogus")
+        with pytest.raises(ValueError, match="clip_mode"):
+            imx.ntk_rope_omega(256, 16, 10.0, 16384, clip_mode="bogus")
+
+    def test_per_group_requires_three_axis_ids(self):
+        emb = self._embedder()
+        with pytest.raises(ValueError, match="3-axis"):
+            emb(torch.zeros(1, 8, 2))
+
+    def test_set_text_tokens_rejects_nonpositive(self):
+        emb = self._embedder()
+        with pytest.raises(ValueError, match="text_tokens"):
+            emb.set_text_tokens(0)
+
+    def test_missing_attr_message_is_attr_agnostic(self):
+        """The swap seam is attr-based (pe_embedder on Flux, rope_embedder
+        on lumina) — the requirement message must not name one attr."""
+        with pytest.raises(ValueError, match="positional embedder") as ei:
+            imx.IMaxNTKEmbedder(types.SimpleNamespace())
+        assert "pe_embedder" not in str(ei.value)
+
+    def test_per_group_omega_ignores_text_tokens_kwarg(self):
+        """The per-group ratio subtracts nothing — an explicit text_tokens
+        kwarg changes nothing."""
+        a = imx.ntk_rope_omega(256, 16, 10.0, 16384, clip_mode="per_group")
+        b = imx.ntk_rope_omega(
+            256, 16, 10.0, 16384, clip_mode="per_group", text_tokens=9999)
+        assert torch.equal(a, b)
 
 
 # ---------------------------------------------------------------------------

@@ -31,7 +31,11 @@ Toolkit items and their decisions:
   ``.theta``/``.axes_dim``, src/base.py:18-19; per-axis thetas via
   ``.thetas``). A DyPE-family embedder (anything answering ``set_timestep``,
   src/base.py:43) triggers a takeover warning: I-Max's static NTK omega
-  replaces the dynamic scaling for the duration of the pass.
+  replaces the dynamic scaling for the duration of the pass. From v2.19.0
+  a ``clip_mode="per_group"`` serves the lumina ``NextDiT`` wiring
+  (Z-Image), which calls its embedder once per token group: the image
+  group clips against its own group length, the caption group takes the
+  paper's model-wide NTK scaling with no floor (plan 2026-10-06 D4').
 - D8 — proportional self-attention. The reference overrides the SDPA scale
   with ``sqrt(log(N_joint, 4608) / head_dim)`` (attention_processor.py:1773-
   1777 AND :1889-1893 — log BASE 4608, not the natural log of the ratio a
@@ -94,6 +98,10 @@ logger = logging.getLogger("ComfyUI-DyPE")
 # these two constants.
 _TRAIN_SEQ_LEN = 4608
 _NATIVE_GRID = 64
+# D4' clip-floor variants (plan 2026-10-06): "joint" — the FLUX reference
+# port (N is the whole stream, text_tokens subtracted); "per_group" — the
+# lumina NextDiT wiring (one token group per call, no subtraction).
+_CLIP_MODES = ("joint", "per_group")
 
 
 # ---------------------------------------------------------------------------
@@ -109,6 +117,8 @@ def ntk_rope_omega(
     train_seq_len: int = _TRAIN_SEQ_LEN,
     native_grid: int = _NATIVE_GRID,
     device: torch.device | None = None,
+    clip_mode: str = "joint",
+    text_tokens: int | None = None,
 ) -> Tensor:
     """NTK-aware RoPE frequencies for one axis: ``max(NTK, clip floor)``.
 
@@ -131,6 +141,24 @@ def ntk_rope_omega(
     ``N <= text_tokens`` (512); here the clip is skipped in that degenerate
     regime instead (documented deviation, plan §1.1 defect policy).
 
+    ``clip_mode`` selects the floor's ratio (plan 2026-10-06 D4'):
+
+    - ``"joint"`` (default, FLUX): ``N`` is the JOINT stream length and the
+      ratio subtracts ``text_tokens`` — the literal port above.
+    - ``"per_group"`` (Z-Image / lumina NextDiT): the embedder is called
+      once per token group, so ``N`` is ONE group's length and the ratio
+      subtracts nothing — ``sqrt(N/native_grid^2)``. The image group clips
+      against its own grid extent; the caption group is all text (a
+      joint-style numerator would vanish), so the caller passes it with
+      ``ntk_clip=False`` — pure NTK, the paper's model-wide Lumina scaling
+      (plan §5). Without the subtraction the ratio is positive for every
+      ``seq_len >= 1``: the joint degenerate regime is unreachable in
+      per-group mode.
+
+    ``text_tokens`` overrides the joint ratio's subtracted count (derived
+    from ``train_seq_len - native_grid**2`` when None); per-group mode
+    never reads it.
+
     Returns fp64 omega of length ``dim // 2`` on ``device`` (CPU default).
     """
     if dim % 2 != 0:
@@ -141,19 +169,29 @@ def ntk_rope_omega(
         raise ValueError(f"seq_len must be >= 1; got {seq_len!r}")
     if native_grid < 1:
         raise ValueError(f"native_grid must be >= 1; got {native_grid!r}")
+    if clip_mode not in _CLIP_MODES:
+        raise ValueError(
+            f"clip_mode must be 'joint' or 'per_group'; got {clip_mode!r}")
 
     dev = torch.device("cpu") if device is None else torch.device(device)
-    text_tokens = train_seq_len - native_grid * native_grid
+    if text_tokens is None:
+        text_tokens = train_seq_len - native_grid * native_grid
+    else:
+        text_tokens = int(text_tokens)
     # comfy's own grid form (ldm/flux/math.py:27) — bitwise parity with
     # EmbedND; NOT src/rope.py's arange form (DyPE layout, unusable here).
     scale = torch.linspace(
         0, (dim - 2) / dim, steps=dim // 2, dtype=torch.float64, device=dev,
     )
     omega = 1.0 / ((theta * ntk_factor) ** scale)
-    if ntk_clip and seq_len > text_tokens:
-        ratio = (seq_len - text_tokens) / (native_grid * native_grid)
-        omega_inter = 1.0 / (theta ** scale) / math.sqrt(ratio)
-        omega = torch.max(omega, omega_inter)
+    if ntk_clip:
+        if clip_mode == "per_group":
+            ratio = seq_len / (native_grid * native_grid)
+        else:
+            ratio = (seq_len - text_tokens) / (native_grid * native_grid)
+        if ratio > 0.0:  # joint: N <= text_tokens is the degenerate regime
+            omega_inter = 1.0 / (theta ** scale) / math.sqrt(ratio)
+            omega = torch.max(omega, omega_inter)
     return omega
 
 
@@ -175,7 +213,7 @@ def _rope_compute_device(device: torch.device) -> torch.device:
 
 
 class IMaxNTKEmbedder(torch.nn.Module):
-    """I-Max NTK-aware scaled RoPE for FLUX: b' = b * ntk_factor (+ clip).
+    """I-Max NTK-aware scaled RoPE: b' = b * ntk_factor (+ clip).
 
     ``inner`` is the currently-installed embedder — a plain comfy ``EmbedND``
     or a chained DyPE/SEGA/SPA wrapper; ``theta``/``axes_dim`` (and the
@@ -187,6 +225,15 @@ class IMaxNTKEmbedder(torch.nn.Module):
     the frequency axis and ``unsqueeze(1)`` — the shape the Flux blocks feed
     to ``apply_rope``. The wrapper (P6) swaps this in for the duration of a
     forward pass and restores ``inner`` afterwards.
+
+    ``clip_mode`` (plan 2026-10-06 D4'): ``"joint"`` — the FLUX wiring, one
+    call with the whole stream, the clip floor subtracts ``text_tokens``
+    (default ``train_seq_len - native_grid**2`` = 512, bitwise-neutral;
+    :meth:`set_text_tokens` re-records it). ``"per_group"`` — the lumina
+    ``NextDiT`` wiring (Z-Image), which calls its ``rope_embedder`` once per
+    token group (cap lumina/model.py:673, siglip :712, image :730): the
+    image group clips against its own group length over the native grid,
+    the caption group takes pure NTK with no floor.
     """
 
     def __init__(
@@ -196,15 +243,19 @@ class IMaxNTKEmbedder(torch.nn.Module):
         ntk_clip: bool = True,
         train_seq_len: int = _TRAIN_SEQ_LEN,
         native_grid: int = _NATIVE_GRID,
+        clip_mode: str = "joint",
     ) -> None:
         super().__init__()
+        if clip_mode not in _CLIP_MODES:
+            raise ValueError(
+                f"clip_mode must be 'joint' or 'per_group'; got {clip_mode!r}")
         theta = getattr(inner, "theta", None)
         axes_dim = getattr(inner, "axes_dim", None)
         if theta is None or not axes_dim:
             raise ValueError(
-                "IMaxNTKEmbedder needs the installed pe_embedder to expose "
-                ".theta and .axes_dim (comfy's EmbedND and the DyPE family "
-                f"all do); got {type(inner).__name__}."
+                "IMaxNTKEmbedder needs the installed positional embedder to "
+                "expose .theta and .axes_dim (comfy's EmbedND and the DyPE "
+                f"family all do); got {type(inner).__name__}."
             )
         self.inner = inner
         self.theta = theta
@@ -214,6 +265,11 @@ class IMaxNTKEmbedder(torch.nn.Module):
         self.ntk_clip = bool(ntk_clip)
         self.train_seq_len = int(train_seq_len)
         self.native_grid = int(native_grid)
+        self.clip_mode = clip_mode
+        # D8 cap accounting: the JOINT floor's subtracted text-token count
+        # (512 on FLUX — the bitwise-neutral default); the wiring records
+        # the real count via set_text_tokens. Per-group mode never reads it.
+        self.text_tokens = int(train_seq_len) - int(native_grid) ** 2
         # Takeover warning (plan Phase 4): a DyPE-family embedder carries
         # dynamic, timestep-dependent scaling that this static omega replaces
         # for the whole pass. The family marker is structural —
@@ -228,16 +284,55 @@ class IMaxNTKEmbedder(torch.nn.Module):
                 type(inner).__name__,
             )
 
+    def set_text_tokens(self, count: int) -> None:
+        """Record the text-token count the JOINT clip floor subtracts (D8).
+
+        Bookkeeping for the wiring: the z-image path computes the padded
+        caption length and records it here alongside the attention anchor;
+        per-group :meth:`forward` never reads it (the group length carries
+        the accounting). The default ``train_seq_len - native_grid**2``
+        (512 on FLUX) keeps the joint path bitwise-neutral (D7).
+        """
+        count = int(count)
+        if count < 1:
+            raise ValueError(f"text_tokens must be >= 1; got {count!r}")
+        self.text_tokens = count
+
+    def _is_image_group(self, ids: Tensor) -> bool:
+        """Per-group discrimination — the pack's proven mask
+        (src/models/zimage.py:36-37): a call is the IMAGE group iff any row
+        carries a nonzero h/w id (axes 1/2). Caption ids are all-zero on
+        axes 1/2 across the WHOLE padded span (embed_cap writes the token
+        count on axis 0 only, comfy lumina/model.py:657-674), so the test
+        cannot fire on pad rows; image pad rows are all-zero too, but the
+        group's real grid rows fire it. Siglip grids (nonzero h/w) land in
+        the image branch.
+        """
+        if ids.shape[-1] < 3:
+            raise ValueError(
+                "per-group clip mode needs 3-axis position ids [b, n, 3]; "
+                f"got shape {tuple(ids.shape)}."
+            )
+        return bool(((ids[..., 1] != 0) | (ids[..., 2] != 0)).any())
+
     def forward(self, ids: Tensor) -> Tensor:
         """Position ids ``[b, n, axes]`` -> rope table ``[b, 1, n, D, 2, 2]``.
 
-        N is the JOINT sequence length (text + image tokens) — the clip
-        floor is a function of the whole stream, exactly as in the reference
-        where each axis's rope call sees the full position tensor.
+        Joint mode: N is the JOINT sequence length (text + image tokens) —
+        the clip floor is a function of the whole stream, exactly as in the
+        reference where each axis's rope call sees the full position tensor.
+        Per-group mode (z-image): ONE group per call — the image group clips
+        against its own length, the caption group takes pure NTK.
         """
         n_axes = int(ids.shape[-1])
         seq_len = int(ids.shape[1])
         device = _rope_compute_device(ids.device)
+        if self.clip_mode == "per_group":
+            clip = self._is_image_group(ids) and self.ntk_clip
+            clip_mode = "per_group"
+        else:
+            clip = self.ntk_clip
+            clip_mode = "joint"
         embs = []
         for axis in range(n_axes):
             theta = (
@@ -245,10 +340,12 @@ class IMaxNTKEmbedder(torch.nn.Module):
             )
             omega = ntk_rope_omega(
                 theta, self.axes_dim[axis], self.ntk_factor, seq_len,
-                ntk_clip=self.ntk_clip,
+                ntk_clip=clip,
                 train_seq_len=self.train_seq_len,
                 native_grid=self.native_grid,
                 device=device,
+                clip_mode=clip_mode,
+                text_tokens=self.text_tokens,
             )
             pos = ids[..., axis].to(dtype=torch.float32, device=device)
             out = torch.einsum("...n,d->...nd", pos, omega)
