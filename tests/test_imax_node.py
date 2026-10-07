@@ -741,11 +741,12 @@ class _PatcherFacade:
 class TestRequireFluxFlowModel:
     def test_accepts_flux(self):
         model = _mock_flux_model()
-        assert imx._require_flux_flow_model(model) == ("const", 2)
+        assert imx._require_flux_flow_model(model) == ("flux", 2)
 
     def test_rejects_non_flux_arch_with_pointer_to_hiflow(self):
         """Qwen is a flow model that also owns pe_embedder — the arch gate
-        (BaseModel MRO) is the real discriminator; the message points at
+        (BaseModel MRO) is the real discriminator, now checked against both
+        accepted families (Flux, Z-Image/Lumina2); the message points at
         HiFlow for other flow families."""
         model = _mock_flux_model(arch="qwen")
         with pytest.raises(ValueError, match="HiFlow"):
@@ -772,7 +773,78 @@ class TestRequireFluxFlowModel:
         )()
         patcher = _PatcherFacade(
             model, object_patches={"model_sampling": clean})
-        assert imx._require_flux_flow_model(patcher) == ("const", 2)
+        assert imx._require_flux_flow_model(patcher) == ("flux", 2)
+
+
+@pytest.mark.unit
+class TestImaxArchGate:
+    """v2.19.0 D1/D2 — the widened arch gate: Z-Image acceptance via the
+    Lumina2 MRO + theta-256 RoPE, and the variant rejections in D2 order
+    (MingImage by MRO name before the Lumina2 accept; ZImagePixelSpace by
+    latent-format class name; plain Lumina2 by the theta guard)."""
+
+    # model_base.Lumina2 stand-in — the MRO name IS the gate's discriminator
+    LUMINA2 = type("Lumina2", (), {})
+
+    @staticmethod
+    def _gate_model(arch="Lumina2", arch_bases=(), latent_format="ZImage",
+                    theta=256.0, with_rope=True):
+        """Minimal z-image-family gate mock: CONST flow sampling, a BaseModel
+        class named ``arch`` (optionally deriving ``arch_bases`` — the real
+        variant classes all derive model_base.Lumina2), a latent-format class
+        named ``latent_format`` and ``diffusion_model.rope_embedder.theta``.
+        """
+        class _Base:
+            def timestep(self, sigma):
+                return sigma * 1000.0
+
+        ms = type("ModelSampling", (_Base, _FLOW_MIXINS["CONST"]), {})()
+        base = type(arch, tuple(arch_bases) or (object,), {})()
+        base.model_sampling = ms
+        base.latent_format = type(latent_format, (), {})()
+        base.latent_format.latent_dimensions = 2
+        base.diffusion_model = types.SimpleNamespace()
+        if with_rope:
+            base.diffusion_model.rope_embedder = types.SimpleNamespace(
+                theta=theta)
+        model = types.SimpleNamespace()
+        model.model = base
+        model.model_options = {}
+        return model
+
+    def test_accepts_zimage_theta256(self):
+        """A theta-256 Lumina2-arch model is the Z-Image profile."""
+        model = self._gate_model()
+        assert imx._require_flux_flow_model(model) == ("zimage", 2)
+
+    def test_rejects_mingimage_before_lumina2_accept(self):
+        """D2 ordering: MingImage derives Lumina2 — the MRO-name rejection
+        must fire BEFORE the Lumina2 accept, with its own message."""
+        model = self._gate_model(
+            arch="MingImage", arch_bases=(self.LUMINA2,), theta=256.0)
+        with pytest.raises(ValueError, match="MingImage"):
+            imx._require_flux_flow_model(model)
+
+    def test_rejects_zimage_pixel_space_variant(self):
+        """ZImagePixelSpace passes a Lumina2 MRO check — rejected by its
+        latent-format class name (comfy supported_models.py:1238)."""
+        model = self._gate_model(latent_format="ZImagePixelSpace")
+        with pytest.raises(ValueError, match="pixel-space"):
+            imx._require_flux_flow_model(model)
+
+    def test_rejects_plain_lumina2_theta(self):
+        """Plain Lumina2 shares the NextDiT arch but trains theta=10000
+        (comfy model_detection.py:593) — the theta-256 guard rejects it."""
+        model = self._gate_model(theta=10000.0)
+        with pytest.raises(ValueError, match="theta"):
+            imx._require_flux_flow_model(model)
+
+    def test_zimage_swap_target_is_rope_embedder(self):
+        """The D4 seam check is attr-based: a z-image-arch model without
+        rope_embedder fails with that attr named in the message."""
+        model = self._gate_model(with_rope=False)
+        with pytest.raises(ValueError, match="rope_embedder"):
+            imx._require_flux_flow_model(model)
 
 
 @pytest.mark.unit

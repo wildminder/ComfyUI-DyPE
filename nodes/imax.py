@@ -66,6 +66,7 @@ from __future__ import annotations
 
 import logging
 import math
+from dataclasses import dataclass
 from typing import Callable
 
 import torch
@@ -438,7 +439,7 @@ def build_pass_model_options(
 
 
 # ---------------------------------------------------------------------------
-# Model gate (plan P6 / D1 — FLUX-family flow models only in v1)
+# Model gate (plan P6 / D1 — FLUX-family flow models; Z-Image from v2.19.0)
 # ---------------------------------------------------------------------------
 
 def _resolve_diffusion_model(model):
@@ -457,24 +458,117 @@ def _resolve_diffusion_model(model):
     return getattr(getattr(model, "model", None), "diffusion_model", None)
 
 
-def _require_flux_flow_model(model) -> tuple[str, int]:
-    """Gate I-Max to FLUX-arch rectified-flow models (plan D1 scope).
+@dataclass(frozen=True)
+class _ArchProfile:
+    """The static per-arch facts the gate resolves once (plan D1/D2).
 
-    I-Max v1 is written against the Flux MMDiT wiring — the ``pe_embedder``
-    RoPE seam, the ``attn1_patch``/``post_input`` patch contracts and the
-    3-axis ``txt_ids`` grid. Three checks, in the order a user can act on:
+    ``name`` is the arch id the gate returns (``"flux"`` | ``"zimage"``);
+    ``embedder_attr`` is the RoPE seam I-Max swaps on the diffusion model —
+    Flux MMDiT: ``pe_embedder``; Lumina2 ``NextDiT``: ``rope_embedder``
+    (comfy ldm/lumina/model.py:634, called per token group, never joint).
+    """
+
+    name: str
+    embedder_attr: str
+
+
+_FLUX_PROFILE = _ArchProfile(name="flux", embedder_attr="pe_embedder")
+_ZIMAGE_PROFILE = _ArchProfile(name="zimage", embedder_attr="rope_embedder")
+
+# Z-Image's RoPE base (comfy model_detection.py:604). Plain Lumina2 shares
+# the NextDiT arch but trains with theta=10000 (model_detection.py:593) and
+# different axes_lens — the theta on the installed embedder is what
+# discriminates a Z-Image checkpoint from the Lumina2 arch it derives from.
+_Z_IMAGE_ROPE_THETA = 256.0
+
+
+def _resolve_arch_profile(model, diffusion_model) -> _ArchProfile:
+    """Resolve the arch profile from the BaseModel MRO (plan D1/D2).
+
+    Order is the order a user can act on:
+
+    1. Flux MRO — the v1 profile, accepted outright;
+    2. ``MingImage`` (the multi-frame Z-Image variant, comfy
+       supported_models.py:1246) — rejected BY MRO NAME before the Lumina2
+       accept, with its own message;
+    3. Lumina2 MRO — the Z-Image family, behind two guards: the pixel-space
+       variant (``ZImagePixelSpace`` latent format — rejected by that class
+       name since it passes a Lumina2 MRO check) and the rope theta (plain
+       Lumina2 passes MRO but trains theta=10000). A theta-256 embedder is
+       Z-Image; a missing ``rope_embedder`` is left to the seam check so it
+       gets the swap-target message instead;
+    4. anything else — the rejection pointing at HiFlow.
+    """
+    base = getattr(model, "model", None)
+    base_mro = [c.__name__ for c in type(base).__mro__]
+    if "Flux" in base_mro:
+        return _FLUX_PROFILE
+
+    if "MingImage" in base_mro:
+        raise ValueError(
+            "I-Max does not support MingImage (the multi-frame Z-Image "
+            "variant): its ref_frames conditioning and pad geometry differ "
+            "from the Z-Image base arch the z-image profile is calibrated "
+            "against."
+        )
+
+    if "Lumina2" in base_mro:
+        latent_format_name = type(
+            getattr(base, "latent_format", None)).__name__
+        if latent_format_name == "ZImagePixelSpace":
+            raise ValueError(
+                "I-Max does not support the Z-Image pixel-space variant "
+                "(ZImagePixelSpace operates on raw RGB patches, no VAE "
+                "latents): the dual-pass x0 path decodes and re-encodes "
+                "VAE latents."
+            )
+        rope_embedder = getattr(diffusion_model, "rope_embedder", None)
+        if rope_embedder is not None:
+            found_theta = getattr(rope_embedder, "theta", None)
+            try:
+                theta = float(found_theta)
+            except (TypeError, ValueError):
+                theta = None
+            if theta != _Z_IMAGE_ROPE_THETA:
+                raise ValueError(
+                    "I-Max's z-image profile is calibrated to Z-Image's "
+                    f"RoPE base theta={_Z_IMAGE_ROPE_THETA} (comfy "
+                    "model_detection.py:604); this Lumina2-arch model's "
+                    f"rope_embedder reports theta={found_theta!r} (plain "
+                    "Lumina2 trains at theta=10000 with different "
+                    "axes_lens)."
+                )
+        return _ZIMAGE_PROFILE
+
+    raise ValueError(
+        "I-Max supports the FLUX and Z-Image families (its NTK RoPE, text "
+        "duplication and guidance math are written against their MMDiT "
+        "wiring); this model's arch is "
+        f"{type(getattr(model, 'model', None)).__name__}. For other "
+        f"flow models (Qwen-Image, AuraFlow, ...) use the HiFlow node."
+    )
+
+
+def _require_flux_flow_model(model) -> tuple[str, int]:
+    """Gate I-Max to the supported rectified-flow arches (plan D1 scope).
+
+    I-Max is written against two MMDiT wirings — the Flux family (the
+    ``pe_embedder`` RoPE seam, the ``attn1_patch``/``post_input`` patch
+    contracts and the 3-axis ``txt_ids`` grid) and, from v2.19.0, Z-Image
+    (the Lumina2 ``rope_embedder`` seam, per-group RoPE ids, plan
+    2026-10-06). Checks, in the order a user can act on:
 
     1. flow prediction (rectified flow: CONST / img_to_img_flow /
        cosmos_rflow — the HiFlow gate, resolved through the patcher);
-    2. FLUX arch: the BaseModel is comfy's ``model_base.Flux`` family
-       (Flux/Flux2/FluxSchnell/LongCatImage). Qwen models also own a
-       ``pe_embedder`` (src/patch_utils.py:239) but a completely different
-       forward — the MRO name is the real discriminator;
-    3. the D4 swap target exists: ``diffusion_model.pe_embedder``
-       (nunchaku builds route RoPE through ``model.pos_embed`` instead).
+    2. arch profile (:func:`_resolve_arch_profile` — Flux MRO, or Lumina2
+       MRO behind the ZImagePixelSpace / MingImage / theta-256 guards);
+    3. the D4 swap target exists:
+       ``diffusion_model.<profile.embedder_attr>`` (nunchaku builds route
+       RoPE through ``model.pos_embed`` instead).
 
     3D-FORMAT latent models (Wan21) would pass 1 but die at 2 — the v1
-    answer for them is HiFlow. Returns the detected flow family.
+    answer for them is HiFlow. Returns ``(profile.name,
+    latent_dimensions)``.
     """
     # Patch-resolved (KSampler semantics): a schedule leaked by a previous
     # run's patch node must not flip this gate.
@@ -493,22 +587,16 @@ def _require_flux_flow_model(model) -> tuple[str, int]:
             f"the PixelRush node instead."
         )
 
-    base_mro = [c.__name__ for c in type(getattr(model, "model", None)).__mro__]
-    if "Flux" not in base_mro:
-        raise ValueError(
-            "I-Max v1 supports the FLUX family only (its NTK RoPE, text "
-            "duplication and guidance math are written against the Flux "
-            "MMDiT wiring); this model's arch is "
-            f"{type(getattr(model, 'model', None)).__name__}. For other "
-            f"flow models (Qwen-Image, AuraFlow, ...) use the HiFlow node."
-        )
-
     diffusion_model = _resolve_diffusion_model(model)
-    if diffusion_model is None or not hasattr(diffusion_model, "pe_embedder"):
+    profile = _resolve_arch_profile(model, diffusion_model)
+
+    if diffusion_model is None or not hasattr(
+            diffusion_model, profile.embedder_attr):
         raise ValueError(
-            "I-Max could not find diffusion_model.pe_embedder on this model "
-            "(nunchaku builds route RoPE through model.pos_embed). The D4 "
-            "positional scaling has no seam to install on."
+            f"I-Max could not find diffusion_model.{profile.embedder_attr} "
+            "on this model (nunchaku builds route RoPE through "
+            "model.pos_embed). The D4 positional scaling has no seam to "
+            "install on."
         )
 
     latent_dimensions = getattr(
@@ -518,7 +606,7 @@ def _require_flux_flow_model(model) -> tuple[str, int]:
             f"I-Max supports 2D or 3D-format image latents; this model "
             f"reports latent_dimensions={latent_dimensions}."
         )
-    return detected, int(latent_dimensions)
+    return profile.name, int(latent_dimensions)
 
 
 def _apply_guidance_override(conditioning, guidance_value) -> list:
