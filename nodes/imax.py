@@ -60,7 +60,11 @@ Toolkit items and their decisions:
   past a whole number of native tiles; the two agree at every power-of-two
   target). Downstream slicing stays correct because the Flux forward cuts
   with the POST-patch txt length (ldm/flux/model.py:306,407). At/below the
-  native grid the patch is a provable no-op (nh = nw = 1).
+  native grid the patch is a provable no-op (nh = nw = 1). From v2.19.0 the
+  patch is FLUX-only — the paper applies text duplication to MMDiT Flux
+  (Lumina-Next uses cross-attention) and lumina blocks have no
+  ``post_input`` seam — so the z-image wiring warns and installs nothing
+  (plan 2026-10-06 D5).
 - D5 — per-pass model options. :func:`build_pass_model_options` nested-clones
   ``model.model_options`` (comfy's own ``create_model_options_clone`` when
   importable, a local mirror otherwise) and APPENDS the toolkit patches —
@@ -827,7 +831,7 @@ def _apply_guidance_override(conditioning, guidance_value) -> list:
 
 
 # ---------------------------------------------------------------------------
-# D4 unet function wrapper — the per-pass pe_embedder swap
+# D4 unet function wrapper — the per-pass positional-embedder swap (D10)
 # ---------------------------------------------------------------------------
 
 def _make_imax_unet_wrapper(
@@ -835,6 +839,9 @@ def _make_imax_unet_wrapper(
     ntk_factor: float = 10.0,
     ntk_clip: bool = True,
     previous_wrapper: Callable | None = None,
+    embedder_attr: str = "pe_embedder",
+    clip_mode: str = "joint",
+    text_tokens: int | None = None,
 ) -> Callable:
     """Build the ``model_function_wrapper`` that swaps the RoPE embedder.
 
@@ -842,8 +849,10 @@ def _make_imax_unet_wrapper(
     ``wrapper(model.apply_model, {"input","timestep","c","cond_or_uncond"})``
     (samplers.py:332-335) — so the wrapper receives the BaseModel (via the
     bound method's ``__self__``; the ``pass_state["inner_model"]`` fallback
-    covers plain test callables) and can swap ``diffusion_model.pe_embedder``
-    around each forward:
+    covers plain test callables) and can swap the positional embedder around
+    each forward. The seam is arch-dependent (D10): ``embedder_attr`` is
+    ``pe_embedder`` on the Flux MMDiT, ``rope_embedder`` on the lumina
+    ``NextDiT`` (comfy ldm/lumina/model.py:634).
 
     - pass A (``pass_state["high_pass"] is False``): call through unchanged —
       the model runs exactly as installed (D4: pass A is unmodified);
@@ -854,6 +863,10 @@ def _make_imax_unet_wrapper(
       restore the original in ``finally``. No ``add_object_patch``, no
       patch/unpatch window, nothing to leak (D4).
 
+    ``clip_mode`` feeds the embedder's constructor (``"per_group"`` serves the
+    lumina per-token-group wiring, plan 2026-10-06 D4'); ``text_tokens``
+    records the D8 padded caption length on the constructed embedder
+    (``None`` — the default — keeps the embedder's flux default, D7).
     ``previous_wrapper`` (a chained DyPE wrapper found on the cloned
     model_options) is called THROUGH: our swap happens first, then the
     previous wrapper keeps its per-forward state updates and performs the
@@ -873,24 +886,27 @@ def _make_imax_unet_wrapper(
             or pass_state.get("inner_model")
         diffusion_model = getattr(inner_model, "diffusion_model", None)
         if diffusion_model is None or not hasattr(
-                diffusion_model, "pe_embedder"):
+                diffusion_model, embedder_attr):
             raise ValueError(
-                "I-Max could not find diffusion_model.pe_embedder on the "
-                "model for the high-resolution pass."
+                f"I-Max could not find diffusion_model.{embedder_attr} on "
+                "the model for the high-resolution pass."
             )
-        installed = diffusion_model.pe_embedder
+        installed = getattr(diffusion_model, embedder_attr)
         imax_embedder = pass_state.get("imax_embedder")
         if imax_embedder is None or pass_state.get("embedder_inner") \
                 is not installed:
             imax_embedder = IMaxNTKEmbedder(
-                installed, ntk_factor=ntk_factor, ntk_clip=ntk_clip)
+                installed, ntk_factor=ntk_factor, ntk_clip=ntk_clip,
+                clip_mode=clip_mode)
+            if text_tokens is not None:
+                imax_embedder.set_text_tokens(text_tokens)
             pass_state["imax_embedder"] = imax_embedder
             pass_state["embedder_inner"] = installed
-        diffusion_model.pe_embedder = imax_embedder
+        setattr(diffusion_model, embedder_attr, imax_embedder)
         try:
             return _call_through(model_function, params)
         finally:
-            diffusion_model.pe_embedder = installed
+            setattr(diffusion_model, embedder_attr, installed)
 
     return wrapper
 
@@ -1125,6 +1141,52 @@ def _wrap_final_x0_call(
 
 
 # ---------------------------------------------------------------------------
+# D8 cap-token accounting (plan 2026-10-06 — the z-image caption padding)
+# ---------------------------------------------------------------------------
+
+# Z-Image's caption pad multiple: comfy sets pad_tokens_multiple=32 exactly
+# when cap_pad_token is in the state dict (model_detection.py:613-614) and
+# embed_cap applies it via pad_zimage (ldm/lumina/model.py:418-420, 663-665).
+# The value is not stored as a runtime attribute, so it is pinned here.
+_CAP_PAD_MULTIPLE = 32
+
+
+def _cap_padded_length(positive, diffusion_model) -> int:
+    """D8 cap accounting: the caption length the model will actually see.
+
+    Z-Image pads its text tokens to :data:`_CAP_PAD_MULTIPLE` (``pad_zimage``
+    appends ``(-len) % multiple`` pad rows, comfy ldm/lumina/model.py:418-420)
+    and the PADDED length is what drives ``cap_pos_ids``, ``cap_size`` and the
+    image start-t (``embed_cap``, model.py:663-673) — so it is the length the
+    per-group RoPE groups and the D4 attention anchor must count. The padding
+    applies iff the diffusion model carries the ``cap_pad_token`` nn.Parameter
+    (NextDiT.__init__ creates it exactly when ``pad_tokens_multiple`` is set);
+    without it (older checkpoints / plain-Lumina2 shape) the raw count is used.
+
+    ``context_len`` is the positive conditioning's token count — max over the
+    entries: ``opts["num_tokens"]`` when an entry carries it (best effort:
+    stock comfy derives num_tokens the other way, as an extra_conds
+    CONDConstant, model_base.py:1519-1525), else the text tensor's token axis
+    (dim 1).
+    """
+    context_len = 0
+    for entry in positive or []:
+        if not (isinstance(entry, (tuple, list)) and len(entry) == 2):
+            continue
+        tensor, opts = entry
+        count = None
+        if isinstance(opts, dict) and opts.get("num_tokens") is not None:
+            count = int(opts["num_tokens"])
+        elif torch.is_tensor(tensor) and tensor.ndim >= 2:
+            count = int(tensor.shape[1])
+        if count is not None:
+            context_len = max(context_len, count)
+    if context_len < 1 or not hasattr(diffusion_model, "cap_pad_token"):
+        return context_len
+    return context_len + (-context_len % _CAP_PAD_MULTIPLE)
+
+
+# ---------------------------------------------------------------------------
 # I-Max node (plan D1, D11-D15)
 # ---------------------------------------------------------------------------
 
@@ -1275,9 +1337,37 @@ class IMaxNode(io.ComfyNode):
                 low_res_scale=1.0) -> io.NodeOutput:
         import comfy.utils
 
-        # Gate BEFORE any model calls: FLUX-family rectified flow only (D1).
+        # Gate BEFORE any model calls: FLUX/Z-Image rectified flow only (D1).
         _, latent_dimensions = _require_flux_flow_model(model)
         warn_if_stale_leak(model, "I-Max")
+
+        # ---- Arch profile branch (plan 2026-10-06 D5/D6/D8/D10). ----------
+        # The gate just accepted this model, so re-resolving the profile is
+        # pure (the same MRO/attr reads — no guard can fire twice).
+        diffusion_model = _resolve_diffusion_model(model)
+        profile = _resolve_arch_profile(model, diffusion_model)
+        is_zimage = profile.name == "zimage"
+        # D8 cap accounting: the PADDED caption length z-image's embed_cap
+        # produces drives the D4 attention anchor (native image grid 64x64 +
+        # cap) and the embedder's text-token bookkeeping; the flux joint
+        # route reads neither.
+        cap_padded = (
+            _cap_padded_length(positive, diffusion_model)
+            if is_zimage else 0
+        )
+        attention_anchor = _NATIVE_GRID * _NATIVE_GRID + cap_padded
+        # D5: text duplication is FLUX-only — the paper applies it to MMDiT
+        # Flux (Lumina-Next uses cross-attention) and lumina blocks have no
+        # post_input seam. Warn once per run and install nothing.
+        duplication_enabled = bool(text_duplication)
+        if duplication_enabled and is_zimage:
+            logger.warning(
+                "I-Max: text duplication is ignored for Z-Image — the paper "
+                "applies text duplication to MMDiT Flux only (Lumina-Next "
+                "uses cross-attention) and the lumina blocks have no "
+                "post_input seam."
+            )
+            duplication_enabled = False
 
         # Clone FIRST: the unet wrapper and per-pass options are run-scoped
         # and must never outlive this node onto the caller's patcher (D4).
@@ -1347,6 +1437,11 @@ class IMaxNode(io.ComfyNode):
         model.set_model_unet_function_wrapper(_make_imax_unet_wrapper(
             pass_state, ntk_factor=float(ntk_factor),
             previous_wrapper=previous_wrapper,
+            embedder_attr=profile.embedder_attr,
+            clip_mode="per_group" if is_zimage else "joint",
+            # D8 bookkeeping: record the padded caption length on the
+            # constructed embedder (None keeps the flux default, D7).
+            text_tokens=cap_padded if is_zimage and cap_padded >= 1 else None,
         ))
         # Build the pass clones AFTER installing the wrapper: it rides inside
         # model_options, so BOTH pass dicts must carry it (D5/P6).
@@ -1354,20 +1449,26 @@ class IMaxNode(io.ComfyNode):
         options_high = build_pass_model_options(
             model, enabled=True,
             proportional_attention=bool(proportional_attention),
-            text_duplication=bool(text_duplication),
+            text_duplication=duplication_enabled,
+            arch_profile=profile.name,
+            attention_anchor=attention_anchor,
         )
 
         # ---- Pass-bound x0 adapters (D5, D12). -----------------------------
+        # D6: the guidance cond key is FLUX-only — lumina extra_conds has no
+        # guidance entry (Z-Image is guidance-distilled); 0.0 = passthrough.
+        guidance_low_override = float(guidance_low) if not is_zimage else 0.0
+        guidance_high_override = float(guidance_high) if not is_zimage else 0.0
         predict_x0_low = _make_predict_x0(
             model, positive, negative, cfg_scale=float(cfg),
             model_options=options_low, pass_state=pass_state,
-            high_pass=False, guidance_override=float(guidance_low),
+            high_pass=False, guidance_override=guidance_low_override,
             latent_dimensions=latent_dimensions,
         )
         predict_x0_high = _make_predict_x0(
             model, positive, negative, cfg_scale=float(cfg),
             model_options=options_high, pass_state=pass_state,
-            high_pass=True, guidance_override=float(guidance_high),
+            high_pass=True, guidance_override=guidance_high_override,
             latent_dimensions=latent_dimensions,
         )
 

@@ -1136,6 +1136,63 @@ def _mock_flux_vae(ratio=8, counts=None, latent_channels=16):
         decode=decode, encode=encode, downscale_ratio=ratio)
 
 
+def _mock_zimage_model(with_rope=True, with_cap_pad=True):
+    """Z-Image ModelPatcher stand-in — the _mock_flux_model shape on the
+    lumina wiring: a BaseModel class NAMED Lumina2 (the MRO name IS the arch
+    gate), CONST flow sampling, the shared Flux latent format, and a
+    diffusion_model exposing rope_embedder (theta 256 = the z-image EmbedND
+    config, comfy model_detection.py:604; axes [32,48,48], :605) and
+    cap_pad_token (the D8 hasattr probe)."""
+    class _Base:
+        def timestep(self, sigma):
+            return sigma * 1000.0  # ModelSamplingDiscreteFlow multiplier
+
+    ms = type("ModelSampling", (_Base, _FLOW_MIXINS["CONST"]), {})()
+
+    class Lumina2:  # model_base.Lumina2 stand-in — the MRO name IS the gate
+        pass
+
+    base = Lumina2()
+    base.model_sampling = ms
+    base.latent_format = types.SimpleNamespace(
+        latent_dimensions=2, latent_channels=16)
+    base.process_latent_in = lambda t: (t - 0.1159) * 0.3611
+    base.process_latent_out = lambda t: (t / 0.3611) + 0.1159
+    dm = types.SimpleNamespace()
+    if with_rope:
+        dm.rope_embedder = _EmbedND(theta=256.0, axes_dim=[32, 48, 48])
+    if with_cap_pad:
+        # next_pad_token's sibling: the nn.Parameter NextDiT.__init__ creates
+        # exactly when pad_tokens_multiple is set (comfy lumina/model.py)
+        dm.cap_pad_token = torch.nn.Parameter(torch.zeros(1))
+    base.diffusion_model = dm
+
+    model = types.SimpleNamespace()
+    model.model = base
+    model.model_options = {}
+    model.load_device = torch.device("cpu")
+    model.pre_run = lambda: None
+    # model_patcher.py:656-657 — the wrapper rides inside model_options
+    model.set_model_unet_function_wrapper = (
+        lambda fn, m=model: m.model_options.__setitem__(
+            "model_function_wrapper", fn))
+
+    def _clone(_self=model):
+        out = types.SimpleNamespace(**vars(_self))
+        out.model_options = {
+            k: (v.copy() if isinstance(v, dict) else v)
+            for k, v in _self.model_options.items()
+        }
+        # each patcher instance writes its OWN options (the real method does)
+        out.set_model_unet_function_wrapper = (
+            lambda fn, m=out: m.model_options.__setitem__(
+                "model_function_wrapper", fn))
+        return out
+
+    model.clone = _clone
+    return model
+
+
 def _install_fake_comfy(monkeypatch):
     """Register the comfy.* fakes the node adapters touch (the hiflow test
     pattern), including comfy.utils (ProgressBar / repeat_to_batch_size)."""
@@ -1929,3 +1986,231 @@ class TestIMaxNodeExecute:
         _ = pbar_type
         # total = steps_low + 1 (roundtrip) + steps_high
         assert fx.sampling_calls, "engine ran through the fake sampler"
+
+
+# ---------------------------------------------------------------------------
+# Z-Image node wiring (v2.19.0 Phase 4, plan 2026-10-06 D5/D6/D8/D10)
+# ---------------------------------------------------------------------------
+
+@pytest.mark.unit
+class TestIMaxZImageWiring:
+    """The execute wiring on the lumina arch: the D4 swap parametrized onto
+    the rope_embedder seam with the per-group clip mode and the D8 padded-
+    caption bookkeeping, the D4 attention anchor fed native grid + cap_padded,
+    text duplication warned and skipped (D5), the guidance cond override
+    skipped (D6), and the shared dual-pass path regression-pinned on a
+    z-image mock."""
+
+    def test_zimage_end_to_end_returns_target_latent(self, monkeypatch):
+        samples, fx, _, _ = _run_execute(
+            monkeypatch, model=_mock_zimage_model(), latent=_ABOVE_NATIVE)
+        assert samples.shape == _ABOVE_NATIVE
+        assert torch.isfinite(samples).all()
+
+    def test_deterministic_for_equal_inputs(self, monkeypatch):
+        a, _, _, _ = _run_execute(
+            monkeypatch, model=_mock_zimage_model(), seed=123)
+        b, _, _, _ = _run_execute(
+            monkeypatch, model=_mock_zimage_model(), seed=123)
+        assert torch.equal(a, b)
+
+    def test_rope_embedder_swapped_during_high_pass(self, monkeypatch):
+        """D10: execute installs the D4 swap on the rope_embedder seam with
+        the per-group clip mode. Driving the pass-B options' installed
+        wrapper (execute's last call was a pass-B step, so the state cell is
+        still high_pass=True) shows an IMaxNTKEmbedder over the currently
+        installed embedder during the forward, with the D8 padded caption
+        recorded, and the original restored afterwards."""
+        model = _mock_zimage_model()
+        _, fx, _, _ = _run_execute(
+            monkeypatch, model=model, latent=_ABOVE_NATIVE)
+        wrapper = fx.sampling_calls[-1]["model_options"][
+            "model_function_wrapper"]
+        dm = model.model.diffusion_model
+        original = dm.rope_embedder
+        seen = []
+
+        def model_function(x, t, **c):
+            seen.append(dm.rope_embedder)
+            return x
+
+        params = {"input": torch.zeros(1, 4),
+                  "timestep": torch.tensor([0.5]), "c": {}}
+        wrapper(model_function, params)
+        assert isinstance(seen[0], imx.IMaxNTKEmbedder)
+        assert seen[0].clip_mode == "per_group"
+        assert seen[0].ntk_factor == 10.0
+        assert seen[0].theta == 256.0
+        assert seen[0].inner is original
+        assert seen[0].text_tokens == 32  # D8: 4 cond tokens -> padded 32
+        assert dm.rope_embedder is original
+
+    def test_embedder_restored_after_exception(self, monkeypatch):
+        """The finally-restore holds on the rope_embedder seam too — a
+        failing pass-B forward leaves the installed embedder in place."""
+        model = _mock_zimage_model()
+        _, fx, _, _ = _run_execute(
+            monkeypatch, model=model, latent=_ABOVE_NATIVE)
+        wrapper = fx.sampling_calls[-1]["model_options"][
+            "model_function_wrapper"]
+        dm = model.model.diffusion_model
+        original = dm.rope_embedder
+
+        def boom(x, t, **c):
+            raise RuntimeError("boom")
+
+        params = {"input": torch.zeros(1, 4),
+                  "timestep": torch.tensor([0.5]), "c": {}}
+        with pytest.raises(RuntimeError):
+            wrapper(boom, params)
+        assert dm.rope_embedder is original
+
+    def test_override_rides_pass_b_only(self, monkeypatch):
+        """D5: pass A is a clean clone, pass B carries the global override;
+        the z-image pass-B patch lists get NO additions (no attn1_patch, no
+        post_input), and the unet wrapper rides both pass dicts."""
+        _, fx, _, _ = _run_execute(
+            monkeypatch, model=_mock_zimage_model(), latent=_ABOVE_NATIVE)
+        low = fx.sampling_calls[0]["model_options"]
+        high = fx.sampling_calls[-1]["model_options"]
+        assert "optimized_attention_override" \
+            not in low["transformer_options"]
+        assert callable(
+            high["transformer_options"]["optimized_attention_override"])
+        assert "attn1_patch" not in high["transformer_options"]["patches"]
+        assert "post_input" not in high["transformer_options"]["patches"]
+        assert callable(low.get("model_function_wrapper"))
+        assert callable(high.get("model_function_wrapper"))
+
+    def test_attention_anchor_is_native_grid_plus_cap_padded(self, monkeypatch):
+        """D8 feed: the pass-B override's anchor is the native image grid
+        (64x64 = 4096) + the padded caption — 4 cond tokens -> 32 -> 4128.
+        Clamped exactly at the joint anchor, scaled above it by the
+        reference formula."""
+        _, fx, _, _ = _run_execute(
+            monkeypatch, model=_mock_zimage_model(), latent=_ABOVE_NATIVE)
+        override = fx.sampling_calls[-1]["model_options"][
+            "transformer_options"]["optimized_attention_override"]
+        anchor = 4096 + 32
+        q, k, v = (torch.randn(1, 8, anchor, 4) for _ in range(3))
+        out = _call_as_wrap_attn(override, q, k, v, 8, "mask", {})
+        assert out[1] is q  # clamped AT the joint anchor
+        n = 2 * anchor
+        q2, k2, v2 = (torch.randn(1, 8, n, 4) for _ in range(3))
+        out = _call_as_wrap_attn(override, q2, k2, v2, 8, "mask", {})
+        expected = math.sqrt(math.log(n) / math.log(anchor))
+        assert torch.equal(out[1], q2 * expected)
+
+    def test_attention_anchor_counts_unpadded_cap_without_pad_token(
+            self, monkeypatch):
+        """D8 fallback: no cap_pad_token attr (older checkpoints) — the RAW
+        caption count drives the anchor (4 tokens -> 4100)."""
+        _, fx, _, _ = _run_execute(
+            monkeypatch, model=_mock_zimage_model(with_cap_pad=False),
+            latent=_ABOVE_NATIVE)
+        override = fx.sampling_calls[-1]["model_options"][
+            "transformer_options"]["optimized_attention_override"]
+        anchor = 4096 + 4
+        q = torch.randn(1, 8, anchor, 4)
+        out = _call_as_wrap_attn(override, q, q, q, 8, "mask", {})
+        assert out[1] is q  # clamped at the unpadded anchor
+        q2 = torch.randn(1, 8, anchor + 1, 4)
+        out = _call_as_wrap_attn(override, q2, q2, q2, 8, "mask", {})
+        assert out[1] is not q2  # above it the scale applies
+
+    def test_text_duplication_warns_and_is_ignored(self, monkeypatch, caplog):
+        """D5: the toggle is real on flux but cannot exist on lumina — one
+        warning names Z-Image and no post_input patch is installed."""
+        import logging
+        with caplog.at_level(logging.WARNING, logger="ComfyUI-DyPE"):
+            _, fx, _, _ = _run_execute(
+                monkeypatch, model=_mock_zimage_model(),
+                latent=_ABOVE_NATIVE, text_duplication=True)
+        assert any(
+            "text duplication is ignored for Z-Image" in r.message
+            for r in caplog.records
+        )
+        patches = fx.sampling_calls[-1]["model_options"][
+            "transformer_options"]["patches"]
+        assert "post_input" not in patches
+
+    def test_guidance_cond_untouched_for_zimage(self, monkeypatch):
+        """D6: no guidance cond key is written for z-image — even with the
+        nonzero schema defaults, the conditioning copies reach convert_cond
+        unmodified (Z-Image is guidance-distilled)."""
+        _, fx, _, _ = _run_execute(
+            monkeypatch, model=_mock_zimage_model(), latent=_ABOVE_NATIVE,
+            guidance_low=3.5, guidance_high=5.0)
+        assert fx.convert_calls
+        assert all("guidance" not in call for call in fx.convert_calls)
+
+    def test_guidance_override_still_applies_for_flux(self, monkeypatch):
+        """D6/D7 regression: the flux route still writes the guidance embed
+        per pass (3.5 low, 5.0 high on the defaults)."""
+        _, fx, _, _ = _run_execute(monkeypatch, latent=_ABOVE_NATIVE)
+        assert fx.convert_calls[0]["guidance"] == 3.5
+        assert fx.convert_calls[2]["guidance"] == 5.0
+
+    def test_negative_empty_cfg_autoskip(self, monkeypatch):
+        """The Z-Image guidance-distilled convention: a token-less negative
+        forces the conditional branch only (CFG skipped) — the shared
+        adapter behavior, pinned on the z-image mock (adapter level, the
+        TestPredictX0Adapter shape)."""
+        fx = _install_fake_comfy(monkeypatch)
+        adapter = imx._make_predict_x0(
+            _mock_zimage_model(), COND_POS,
+            [(torch.zeros(1, 0), {"side": "negative"})], cfg_scale=3.5,
+            model_options={}, pass_state={}, high_pass=False)
+        adapter(torch.randn(1, 16, 8, 8), sigma=0.5)
+        assert fx.sampling_calls[-1]["cond_scale"] == 1.0
+
+    def test_multiframe_latent_rejected(self, monkeypatch):
+        with pytest.raises(ValueError, match="multi-frame"):
+            _run_execute(
+                monkeypatch, model=_mock_zimage_model(),
+                latent=(1, 16, 2, 16, 16))
+
+    def test_below_native_resolution_warns(self, monkeypatch, caplog):
+        """512 px target on z-image: the shared engine warning surfaces and
+        pass A runs at the target."""
+        import logging
+        with caplog.at_level(logging.WARNING, logger="ComfyUI-DyPE"):
+            samples, _, _, _ = _run_execute(
+                monkeypatch, model=_mock_zimage_model(),
+                latent=(1, 16, 64, 64))
+        assert any("at/below the native" in r.message for r in caplog.records)
+        assert samples.shape == (1, 16, 64, 64)
+
+    # ---- D8 cap accounting helper ---------------------------------------
+
+    @pytest.mark.parametrize("tokens,padded", [(5, 32), (64, 64), (33, 64)])
+    def test_cap_padded_rounds_to_32_multiple(self, tokens, padded):
+        dm = types.SimpleNamespace(
+            cap_pad_token=torch.nn.Parameter(torch.zeros(1)))
+        positive = [(torch.ones(1, tokens), {})]
+        assert imx._cap_padded_length(positive, dm) == padded
+
+    def test_cap_padded_skipped_without_pad_token_attr(self):
+        positive = [(torch.ones(1, 33), {})]
+        assert imx._cap_padded_length(
+            positive, types.SimpleNamespace()) == 33
+
+    def test_cap_padded_prefers_opts_num_tokens(self):
+        """opts['num_tokens'] wins over the tensor's token axis when an
+        entry carries it (best effort — stock comfy derives num_tokens the
+        other way, as an extra_conds CONDConstant, model_base.py:1519-1525)."""
+        dm = types.SimpleNamespace(
+            cap_pad_token=torch.nn.Parameter(torch.zeros(1)))
+        positive = [(torch.ones(1, 999), {"num_tokens": 5})]
+        assert imx._cap_padded_length(positive, dm) == 32
+
+    def test_cap_padded_takes_max_over_entries(self):
+        dm = types.SimpleNamespace(
+            cap_pad_token=torch.nn.Parameter(torch.zeros(1)))
+        positive = [(torch.ones(1, 5), {}), (torch.ones(2, 40), {})]
+        assert imx._cap_padded_length(positive, dm) == 64
+
+    def test_cap_padded_is_zero_for_unmeasurable_conditioning(self):
+        """No measurable tokens -> 0: the anchor degenerates to the native
+        grid and the wrapper skips the set_text_tokens bookkeeping."""
+        assert imx._cap_padded_length([], types.SimpleNamespace()) == 0
