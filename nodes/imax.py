@@ -1102,6 +1102,12 @@ def _build_guidance_latent(
     sampling is stochastic: same inputs, a fresh guidance draw — accepted
     (plan §5; same as HiFlow), fingerprint_inputs keeps the node uncached.
 
+    Only called when pass A ran BELOW the target geometry (something to
+    upsample): when pass A already ran at the target latent geometry, the
+    caller uses the pass-A output directly — the round trip would be the
+    identity bicubic plus a pure-detail-loss VAE pass (z_image_turbo
+    measurements, 2026-10-08).
+
     ``target_size`` is in PIXELS ``(H, W)``; bicubic runs on a channels-FIRST
     view of the channels-last decode output (F.interpolate treats dim 1 as
     channels).
@@ -1368,6 +1374,19 @@ class IMaxNode(io.ComfyNode):
                 "post_input seam."
             )
             duplication_enabled = False
+        # Distilled z-image (Turbo) re-sharpens far less than Flux after
+        # each projected-flow pull, so the guided final keeps the low-pass
+        # result's character at some cost in contrast (z_image_turbo
+        # measurements, 2026-10-08). Point the user at the native look.
+        if is_zimage and guidance_schedule != "disable":
+            logger.warning(
+                "I-Max: on Z-Image, guidance schedules trade some contrast "
+                "for low-pass structure-following (distilled checkpoints "
+                "re-sharpen less than Flux after each pull). Use "
+                "guidance_schedule=disabled for the model's native look; on "
+                "Turbo, steps_low 8-12 with time_shift_low=3.0 keeps the "
+                "low pass sharp."
+            )
 
         # Clone FIRST: the unet wrapper and per-pass options are run-scoped
         # and must never outlive this node onto the caller's patcher (D4).
@@ -1480,8 +1499,24 @@ class IMaxNode(io.ComfyNode):
         vae_decode, vae_encode = _make_vae_adapters(vae, device)
         guidance_buffer = torch.zeros_like(content_latent)
         target_px = (h_t * vae_ratio, w_t * vae_ratio)
+        target_shape = tuple(content_latent.shape)
 
         def _fill_guidance(x0_low: Tensor) -> None:
+            # Pass A at the target latent geometry: the bicubic would be the
+            # identity, so the VAE round trip is pure detail loss (measured on
+            # z_image_turbo 2026-10-08: it roughly halved the low-pass
+            # result's edge energy, and the guidance schedules propagated
+            # that softness into the final). Use the pass-A output directly.
+            if tuple(x0_low.shape) == target_shape:
+                logger.info(
+                    "I-Max: pass A ran at the target geometry — the "
+                    "guidance latent IS the pass-A output (no VAE round "
+                    "trip: nothing to upsample)."
+                )
+                guidance_buffer.copy_(x0_low.to(
+                    device=guidance_buffer.device,
+                    dtype=guidance_buffer.dtype))
+                return
             guidance_buffer.copy_(_build_guidance_latent(
                 x0_low, vae_decode, vae_encode, target_px,
             ).to(device=guidance_buffer.device, dtype=guidance_buffer.dtype))

@@ -1606,11 +1606,37 @@ class TestGuidanceLatent:
 
     def test_guidance_is_fixed_across_the_whole_high_pass(self, monkeypatch):
         """The round trip runs ONCE per generation — the guidance is fixed
-        for all of pass B (decode/encode call counts pin it)."""
+        for all of pass B (decode/encode call counts pin it). Extrapolated
+        geometry: pass A ran below the target, so the round trip is real."""
         counts = {"decode": 0, "encode": 0}
         vae = _mock_flux_vae(counts=counts)
-        _run_execute(monkeypatch, vae=vae, steps_low=2, steps_high=3)
+        _run_execute(monkeypatch, vae=vae, latent=_ABOVE_NATIVE,
+                     steps_low=2, steps_high=3)
         assert counts == {"decode": 1, "encode": 1}
+
+    def test_native_geometry_skips_the_round_trip(self, monkeypatch, caplog):
+        """Pass A at the target geometry: nothing to upsample, so the VAE
+        round trip is pure detail loss (z_image_turbo repro 2026-10-08: it
+        roughly halved the low-pass result's edge energy and the schedules
+        propagated the softness). The guidance latent IS the pass-A output
+        and the VAE stays untouched."""
+        import logging
+        counts = {"decode": 0, "encode": 0}
+        vae = _mock_flux_vae(counts=counts)
+        with caplog.at_level(logging.INFO, logger="ComfyUI-DyPE"):
+            _run_execute(monkeypatch, vae=vae, steps_low=2, steps_high=2)
+        assert counts == {"decode": 0, "encode": 0}
+        assert any("no VAE round trip" in r.message
+                   for r in caplog.records)
+
+    def test_native_geometry_never_calls_the_builder(self, monkeypatch):
+        """The skip must be structural: even if _build_guidance_latent were
+        reachable at the target geometry, execute must not call it."""
+        def boom(*args, **kwargs):
+            raise AssertionError(
+                "round trip must not run at the target geometry")
+        monkeypatch.setattr(imx, "_build_guidance_latent", boom)
+        _run_execute(monkeypatch, steps_low=2, steps_high=2)  # must not raise
 
     def test_channels_last_vae_layout(self):
         seen = {}
@@ -2013,6 +2039,37 @@ class TestIMaxZImageWiring:
         b, _, _, _ = _run_execute(
             monkeypatch, model=_mock_zimage_model(), seed=123)
         assert torch.equal(a, b)
+
+    def test_active_schedule_advises_on_zimage(self, monkeypatch, caplog):
+        """Distilled z-image re-sharpens less than Flux after each pull —
+        an active schedule gets the measured-trade-off advisory pointing
+        at the disabled native look."""
+        import logging
+        with caplog.at_level(logging.WARNING, logger="ComfyUI-DyPE"):
+            _, _, _, _ = _run_execute(
+                monkeypatch, model=_mock_zimage_model(), latent=_ABOVE_NATIVE,
+                guidance_schedule="cosine_decay")
+        assert any("guidance_schedule=disabled" in r.message
+                   for r in caplog.records)
+
+    def test_disabled_schedule_gets_no_advisory(self, monkeypatch, caplog):
+        import logging
+        with caplog.at_level(logging.WARNING, logger="ComfyUI-DyPE"):
+            _, _, _, _ = _run_execute(
+                monkeypatch, model=_mock_zimage_model(), latent=_ABOVE_NATIVE,
+                guidance_schedule="disable")
+        assert not any("guidance_schedule=disabled" in r.message
+                       for r in caplog.records)
+
+    def test_flux_active_schedule_gets_no_advisory(self, monkeypatch, caplog):
+        """The advisory is z-image-only: the FLUX-paper regime (base model,
+        CFG refinement between pulls) is where the schedules come from."""
+        import logging
+        with caplog.at_level(logging.WARNING, logger="ComfyUI-DyPE"):
+            _, _, _, _ = _run_execute(
+                monkeypatch, latent=_ABOVE_NATIVE)  # default cosine_decay
+        assert not any("guidance_schedule=disabled" in r.message
+                       for r in caplog.records)
 
     def test_rope_embedder_swapped_during_high_pass(self, monkeypatch):
         """D10: execute installs the D4 swap on the rope_embedder seam with
