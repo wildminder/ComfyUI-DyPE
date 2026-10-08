@@ -177,6 +177,7 @@ def projected_flow_x0(
     schedule: str,
     dwt_level: int,
     p_guidance: Tensor | None = None,
+    strength: float = 1.0,
 ) -> Tensor:
     """One Projected-Flow correction of the clean prediction x̂₁ (plan D6).
 
@@ -201,6 +202,16 @@ def projected_flow_x0(
     constant across pass B, so the dual-pass engine computes it a single
     time); when omitted it is derived from ``guidance`` here. Unknown
     schedules raise. Returns ``x̂₁'`` in ``x0.dtype``.
+
+    ``strength`` linearly blends the scheduled correction toward the
+    uncorrected prediction — ``x̂₁ + s·(x̂₁_corrected − x̂₁)`` — so it
+    dampens every schedule uniformly without touching the schedule's
+    shape (0.0 ≡ disable, 1.0 = the paper's unscaled correction).
+    Measured on z_image_turbo at 1536 px (2026-10-08): full-strength
+    corrections reach |δ|/|x0| ≈ 0.74 per early step at extrapolated
+    geometry and the distilled sampler hallucinates (swirls, flat-region
+    noise 2.5-4× the unguided control); s = 0.25-0.5 keeps the low-band
+    anchoring at ≈ control-level noise.
     """
     if schedule not in _VALID_SCHEDULES:
         raise ValueError(
@@ -216,11 +227,15 @@ def projected_flow_x0(
         else haar_lowpass(guidance, dwt_level)
     )
     if schedule == "cosine_decay":
-        return x0 + cosine * (p_g - p_x0)
-    if schedule == "cosine_shift":
-        return x0 - cosine * (x0 - guidance) - (1.0 - cosine) * (p_x0 - p_g)
-    # "constant" — full-strength pull toward the low-passed guidance.
-    return x0 + p_g - p_x0
+        corrected = x0 + cosine * (p_g - p_x0)
+    elif schedule == "cosine_shift":
+        corrected = x0 - cosine * (x0 - guidance) - (1.0 - cosine) * (p_x0 - p_g)
+    else:
+        # "constant" — full-strength pull toward the low-passed guidance.
+        corrected = x0 + p_g - p_x0
+    if strength != 1.0:
+        corrected = x0 + strength * (corrected - x0)
+    return corrected
 
 
 # ---------------------------------------------------------------------------
@@ -307,6 +322,10 @@ class IMaxConfig:
     dwt_level             Haar low-pass level of the guidance projection P
     guidance_schedule     one of ``_VALID_SCHEDULES`` (default
                           "cosine_decay" — README + gradio agree on it)
+    guidance_strength     linear scale on the Projected-Flow correction
+                          (default 1.0 = the paper's unscaled pull; <1
+                          dampens it per-step — distilled models want
+                          0.25-0.5 at extrapolated targets)
     denoise               pass-B img2img strength (KSampler convention;
                           pass A always starts from pure noise)
     low_res_scale         multiplies the low pass AREA (1.0 = the paper's
@@ -323,6 +342,7 @@ class IMaxConfig:
     time_shift_high: float = 6.0
     dwt_level: int = 1
     guidance_schedule: str = "cosine_decay"
+    guidance_strength: float = 1.0
     denoise: float = 1.0
     low_res_scale: float = 1.0
     native_resolution: int = 1024
@@ -510,6 +530,7 @@ def imax_dual_pass(
         x0 = projected_flow_x0(
             x, x0, guidance, sigma, cosine,
             cfg.guidance_schedule, cfg.dwt_level, p_guidance=p_guidance,
+            strength=cfg.guidance_strength,
         )
         v = (x - x0) / max(sigma, _EPS)
         x = x + v * (float(sig_b[i + 1]) - sigma)

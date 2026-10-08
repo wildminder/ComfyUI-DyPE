@@ -1901,6 +1901,38 @@ class TestIMaxNodeExecute:
             x_vae = x_vae + (x_vae - x0_vae) / max(s, 1e-6) * (s_next - s)
         assert torch.allclose(samples, x_vae, atol=1e-4)
 
+    def test_guidance_strength_zero_equals_disable(self, monkeypatch):
+        """guidance_strength=0.0 damps every scheduled correction to zero,
+        so the whole generation must be bit-identical to schedule=disable
+        (same seed). The scale is the distilled-model hallucination lever:
+        probe evidence 2026-10-08, z_image_turbo @ 1536 px — full-strength
+        corrections put flat-region noise at 2.5-4× the unguided control,
+        strength 0.25 lands on the control."""
+        disabled, _, _, _ = _run_execute(
+            monkeypatch, latent=_ABOVE_NATIVE, steps_low=2, steps_high=3,
+            guidance_schedule="disable")
+        zeroed, _, _, _ = _run_execute(
+            monkeypatch, latent=_ABOVE_NATIVE, steps_low=2, steps_high=3,
+            guidance_schedule="cosine_decay", guidance_strength=0.0)
+        assert torch.equal(disabled, zeroed)
+
+    def test_guidance_strength_reaches_the_engine_correction(self, monkeypatch):
+        """The input plumbs into projected_flow_x0's strength kwarg."""
+        import src.imax as engine
+        seen = []
+        orig = engine.projected_flow_x0
+
+        def spy(x, x0, guidance, sigma, cosine, schedule, dwt_level,
+                p_guidance=None, strength=1.0):
+            seen.append(strength)
+            return orig(x, x0, guidance, sigma, cosine, schedule, dwt_level,
+                        p_guidance=p_guidance, strength=strength)
+
+        monkeypatch.setattr(engine, "projected_flow_x0", spy)
+        _run_execute(monkeypatch, latent=_ABOVE_NATIVE, steps_low=2,
+                     steps_high=3, guidance_strength=0.35)
+        assert seen and all(s == 0.35 for s in seen)
+
     def test_proportional_attention_toggle_reaches_pass_b(self, monkeypatch):
         """The D5 wiring under the toggle: pass B's model options carry our
         attn1_patch only when the toggle is on (mock predictors can't show

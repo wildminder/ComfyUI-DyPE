@@ -1258,6 +1258,14 @@ class IMaxNode(io.ComfyNode):
                     tooltip="Projected-Flow guidance schedule (paper §2.2): "
                             "cosine_decay is the README/gradio default; "
                             "disable runs pass B as plain Euler."),
+                io.Float.Input(
+                    "guidance_strength", default=1.0, min=0.0, max=2.0,
+                    step=0.05,
+                    tooltip="Linear scale on the Projected-Flow correction "
+                            "(1.0 = the paper's unscaled pull; 0 = disable). "
+                            "Distilled checkpoints (Z-Image Turbo) hallucinate "
+                            "swirls/noise at extrapolated targets at full "
+                            "strength — use 0.25-0.5 there."),
                 io.Boolean.Input(
                     "proportional_attention", default=True,
                     tooltip="Scale the attention temperature with the joint "
@@ -1298,7 +1306,7 @@ class IMaxNode(io.ComfyNode):
                 steps_low=30, steps_high=20, guidance_low=3.5,
                 guidance_high=5.0, time_shift_low=3.0, time_shift_high=6.0,
                 ntk_factor=10.0, dwt_level=1,
-                guidance_schedule="cosine_decay",
+                guidance_schedule="cosine_decay", guidance_strength=1.0,
                 proportional_attention=True, text_duplication=True,
                 low_res_scale=1.0) -> io.NodeOutput:
         import comfy.utils
@@ -1335,17 +1343,20 @@ class IMaxNode(io.ComfyNode):
             )
             duplication_enabled = False
         # Distilled z-image (Turbo) re-sharpens far less than Flux after
-        # each projected-flow pull, so the guided final keeps the low-pass
-        # result's character at some cost in contrast (z_image_turbo
-        # measurements, 2026-10-08). Point the user at the native look.
+        # each projected-flow pull, and full-strength corrections
+        # hallucinate swirls at extrapolated targets (z_image_turbo
+        # measurements, 2026-10-08: |δ|/|x0| up to 0.74 per early step;
+        # strength 0.25-0.5 keeps the anchoring at control-level noise).
         if is_zimage and guidance_schedule != "disable":
             logger.warning(
                 "I-Max: on Z-Image, guidance schedules trade some contrast "
                 "for low-pass structure-following (distilled checkpoints "
-                "re-sharpen less than Flux after each pull). Use "
-                "guidance_schedule=disabled for the model's native look; on "
-                "Turbo, steps_low 8-12 with time_shift_low=3.0 keeps the "
-                "low pass sharp."
+                "re-sharpen less than Flux after each pull, and full-"
+                "strength corrections hallucinate swirls at extrapolated "
+                "targets). Set guidance_strength 0.25-0.5 for clean "
+                "structure-following, or guidance_schedule=disabled for the "
+                "model's native look; on Turbo, steps_low 8-12 with "
+                "time_shift_low=3.0 keeps the low pass sharp."
             )
 
         # Clone FIRST: the unet wrapper and per-pass options are run-scoped
@@ -1487,6 +1498,7 @@ class IMaxNode(io.ComfyNode):
             time_shift_high=float(time_shift_high),
             dwt_level=int(dwt_level),
             guidance_schedule=str(guidance_schedule),
+            guidance_strength=float(guidance_strength),
             denoise=float(denoise), low_res_scale=float(low_res_scale),
             pixels_per_latent=vae_ratio,
         )

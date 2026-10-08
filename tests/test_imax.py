@@ -266,6 +266,32 @@ class TestProjectedFlowX0:
         out = projected_flow_x0(x0, x0, x0, 0.5, 0.7, "cosine_decay", 1)
         assert torch.allclose(out, x0)
 
+    def test_strength_scales_the_correction_linearly(self):
+        """strength blends the correction toward the uncorrected x0 —
+        the hallucination lever measured on z_image_turbo 2026-10-08
+        (full-strength |δ|/|x0| ≈ 0.74/step at extrapolated geometry
+        hallucinates; 0.25-0.5 anchors at control-level noise)."""
+        x0, guidance = _hand_case()
+        base = projected_flow_x0(x0, x0, guidance, 0.5, 0.5, "cosine_decay", 1)
+        half = projected_flow_x0(
+            x0, x0, guidance, 0.5, 0.5, "cosine_decay", 1, strength=0.5)
+        assert torch.allclose(half, x0 + 0.5 * (base - x0))
+
+    def test_strength_zero_equals_disable_for_every_schedule(self):
+        x0, guidance = _hand_case()
+        for schedule in ("cosine_decay", "cosine_shift", "constant"):
+            out = projected_flow_x0(
+                x0, x0, guidance, 0.5, 0.5, schedule, 1, strength=0.0)
+            assert torch.equal(out, x0), schedule
+
+    def test_strength_default_is_the_unscaled_correction(self):
+        x0, guidance = _hand_case()
+        for schedule in ("cosine_decay", "cosine_shift", "constant"):
+            out = projected_flow_x0(
+                x0, x0, guidance, 0.5, 0.5, schedule, 1, strength=1.0)
+            base = projected_flow_x0(x0, x0, guidance, 0.5, 0.5, schedule, 1)
+            assert torch.allclose(out, base), schedule
+
 
 # ---------------------------------------------------------------------------
 # Parity with the reference velocity-space loop (plan D6)
