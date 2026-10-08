@@ -1597,91 +1597,68 @@ class TestPredictX0Adapter:
 
 @pytest.mark.unit
 class TestGuidanceLatent:
-    def test_roundtrip_returns_target_resolution_latent(self):
-        vae = _mock_flux_vae()
-        dec, enc = imx._make_vae_adapters(vae, torch.device("cpu"))
+    def test_upsample_returns_target_geometry_latent(self):
         low = torch.randn(1, 16, 64, 64)
-        out = imx._build_guidance_latent(low, dec, enc, (1024, 1024))
-        assert out.shape == (1, 16, 128, 128)
+        out = imx._upsample_guidance_latent(low, (80, 56))
+        assert out.shape == (1, 16, 80, 56)
 
-    def test_guidance_is_fixed_across_the_whole_high_pass(self, monkeypatch):
-        """The round trip runs ONCE per generation — the guidance is fixed
-        for all of pass B (decode/encode call counts pin it). Extrapolated
-        geometry: pass A ran below the target, so the round trip is real."""
-        counts = {"decode": 0, "encode": 0}
-        vae = _mock_flux_vae(counts=counts)
-        _run_execute(monkeypatch, vae=vae, latent=_ABOVE_NATIVE,
+    def test_upsample_matches_reference_bicubic(self):
+        low = torch.randn(2, 16, 32, 32)
+        out = imx._upsample_guidance_latent(low, (64, 48))
+        ref = torch.nn.functional.interpolate(
+            low, size=(64, 48), mode="bicubic", align_corners=False)
+        assert torch.allclose(out, ref)
+        assert out.dtype == low.dtype
+
+    def test_upsample_preserves_latent_statistics(self):
+        """The manifold regression pin (z_image_turbo, 2026-10-08): the
+        image-space round trip re-encoded the guidance at ~1.8x the natural
+        latent std with ~35x the high-frequency energy (VAE encoder
+        re-normalization + sampling noise), and the schedules injected that
+        off-manifold signal into every step. The latent-space upsample must
+        keep the guidance on pass A's statistics. The probe field is
+        spatially correlated like a real latent (bicubic averaging shrinks
+        WHITE noise std to ~0.86 — a property of the noise, not a defect)."""
+        field = torch.randn(1, 16, 16, 16)
+        low = torch.nn.functional.interpolate(
+            field, size=(64, 64), mode="bilinear", align_corners=False)
+        up = imx._upsample_guidance_latent(low, (128, 128))
+        ratio = float(up.std() / low.std())
+        assert 0.9 < ratio < 1.1
+
+    def test_guidance_is_built_once_per_generation(self, monkeypatch):
+        """The upsample runs ONCE per generation — the guidance is fixed
+        for all of pass B. Extrapolated geometry: pass A ran below the
+        target, so the upsample is real."""
+        calls = {"n": 0}
+        orig = imx._upsample_guidance_latent
+
+        def spy(low, hw):
+            calls["n"] += 1
+            return orig(low, hw)
+
+        monkeypatch.setattr(imx, "_upsample_guidance_latent", spy)
+        _run_execute(monkeypatch, latent=_ABOVE_NATIVE,
                      steps_low=2, steps_high=3)
-        assert counts == {"decode": 1, "encode": 1}
+        assert calls["n"] == 1
 
-    def test_native_geometry_skips_the_round_trip(self, monkeypatch, caplog):
-        """Pass A at the target geometry: nothing to upsample, so the VAE
-        round trip is pure detail loss (z_image_turbo repro 2026-10-08: it
-        roughly halved the low-pass result's edge energy and the schedules
-        propagated the softness). The guidance latent IS the pass-A output
-        and the VAE stays untouched."""
+    def test_native_geometry_skips_the_upsample(self, monkeypatch, caplog):
+        """Pass A at the target geometry: nothing to upsample — the guidance
+        latent IS the pass-A output, verbatim (no interpolation, no VAE)."""
         import logging
-        counts = {"decode": 0, "encode": 0}
-        vae = _mock_flux_vae(counts=counts)
-        with caplog.at_level(logging.INFO, logger="ComfyUI-DyPE"):
-            _run_execute(monkeypatch, vae=vae, steps_low=2, steps_high=2)
-        assert counts == {"decode": 0, "encode": 0}
-        assert any("no VAE round trip" in r.message
-                   for r in caplog.records)
+        calls = {"n": 0}
 
-    def test_native_geometry_never_calls_the_builder(self, monkeypatch):
-        """The skip must be structural: even if _build_guidance_latent were
-        reachable at the target geometry, execute must not call it."""
-        def boom(*args, **kwargs):
+        def boom(low, hw):
+            calls["n"] += 1
             raise AssertionError(
-                "round trip must not run at the target geometry")
-        monkeypatch.setattr(imx, "_build_guidance_latent", boom)
-        _run_execute(monkeypatch, steps_low=2, steps_high=2)  # must not raise
+                "upsample must not run at the target geometry")
 
-    def test_channels_last_vae_layout(self):
-        seen = {}
-
-        def decode(z):
-            seen["decode_in"] = tuple(z.shape)
-            return torch.randn(1, 64, 64, 3)
-
-        def encode(im):
-            seen["encode_in"] = tuple(im.shape)
-            return {"samples": torch.randn(1, 16, 8, 8)}
-
-        vae = types.SimpleNamespace(
-            decode=decode, encode=encode, downscale_ratio=8)
-        dec, enc = imx._make_vae_adapters(vae, torch.device("cpu"))
-        img = dec(torch.randn(1, 16, 8, 8))
-        assert seen["decode_in"] == (1, 16, 8, 8), "4D latent in"
-        lat = enc(img)
-        assert seen["encode_in"] == (1, 64, 64, 3), (
-            "encode must receive the channels-last image untouched")
-        assert lat.shape == (1, 16, 8, 8)
-
-    def test_3d_format_vae_returns_frame_zero(self):
-        """Krea2-plan S4 dance copied from hiflow: the 5D decode output
-        slices to the first temporal frame on both sides."""
-        def decode(z):
-            b, c, t, h, w = z.shape
-            assert t == 1, "decode must receive the 5D latent"
-            return torch.randn(b, 3, t, h * 16, w * 16).movedim(1, -1)
-
-        def encode(im):
-            b = im.shape[0]
-            return torch.randn(b, 16, 1, im.shape[-3] // 16,
-                               im.shape[-2] // 16)
-
-        vae = types.SimpleNamespace(
-            decode=decode, encode=encode, latent_dim=3,
-            downscale_ratio=(lambda a: a, 16, 16))
-        dec, enc = imx._make_vae_adapters(vae, torch.device("cpu"))
-        lat_in = torch.randn(1, 16, 8, 8)
-        img = dec(lat_in)
-        assert img.dim() == 4, "first temporal frame only"
-        lat_out = enc(img)
-        assert lat_out.shape == (1, 16, 8, 8), "4D latent back"
-
+        monkeypatch.setattr(imx, "_upsample_guidance_latent", boom)
+        with caplog.at_level(logging.INFO, logger="ComfyUI-DyPE"):
+            _run_execute(monkeypatch, steps_low=2, steps_high=2)  # no raise
+        assert calls["n"] == 0
+        assert any("guidance latent IS the pass-A output" in r.message
+                   for r in caplog.records)
 
 # ---------------------------------------------------------------------------
 # D4 unet wrapper state (plan P6)

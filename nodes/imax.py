@@ -92,12 +92,10 @@ try:
     from ..src.effective_sampling import effective_model_sampling, warn_if_stale_leak
     from ..src.imax import IMaxConfig, build_flow_sigmas, imax_dual_pass
     from ..src.prefix_cache import disable_prefix_kv_cache
-    from ..src.vae_channels import pad_to_vae_channels, strip_alpha_channel
 except ImportError:  # flat repo layout (tests / CLI)
     from src.effective_sampling import effective_model_sampling, warn_if_stale_leak
     from src.imax import IMaxConfig, build_flow_sigmas, imax_dual_pass
     from src.prefix_cache import disable_prefix_kv_cache
-    from src.vae_channels import pad_to_vae_channels, strip_alpha_channel
 
 from .pixelrush import _detect_prediction_type
 
@@ -1044,79 +1042,37 @@ def _downscale_ratio(vae) -> int:
     return int(ratio)
 
 
-def _make_vae_adapters(vae, device):
-    """Create (vae_decode, vae_encode) callables in VAE latent space.
-
-    Same contract as ``nodes/hiflow.py:207-269``: channels-LAST at the ComfyUI
-    VAE boundary (decode returns [B, H, W, 3], encode expects it and applies
-    ``movedim(-1, 1)`` itself), no latent-format conversions here (the engine
-    and the x0 adapter own the format), and the 3D-format VAE dance — 5D
-    latent in on decode, first temporal frame out; channels-last 4D image in
-    on encode, first frame of the 5D latent back.
-    """
-    latent_dim = getattr(vae, "latent_dim", 2)
-
-    def vae_decode(latent: Tensor) -> Tensor:
-        """latent [B,C,h,w] (or 5D [B,C,1,h,w]) -> image [B, H, W, 3]."""
-        if isinstance(latent, dict):
-            latent = latent["samples"]
-        latent = latent.to(device)
-        if latent_dim == 3 and latent.dim() == 4:
-            latent = latent.unsqueeze(2)  # [B, C, 1, h, w]
-        decoded = vae.decode(latent)
-        if isinstance(decoded, dict):
-            decoded = decoded["samples"]
-        if decoded.ndim == 5:
-            decoded = decoded[:, 0]     # first temporal frame [B, H, W, 3]
-        elif decoded.ndim == 3:
-            decoded = decoded.unsqueeze(0)
-        decoded = strip_alpha_channel(decoded, vae, "I-Max")
-        return decoded  # [B, H, W, 3] channels-last, untouched
-
-    def vae_encode(image: Tensor) -> Tensor:
-        """image [B, H, W, 3] -> latent [B, C, h, w] (4D for the core)."""
-        image = image.to(device)
-        image = pad_to_vae_channels(image, vae)
-        encoded = vae.encode(image)
-        if isinstance(encoded, dict):
-            encoded = encoded["samples"]
-        if latent_dim == 3 and encoded.ndim == 5:
-            encoded = encoded[:, :, 0]  # first temporal frame -> 4D
-        return encoded
-
-    return vae_decode, vae_encode
-
-
-def _build_guidance_latent(
+def _upsample_guidance_latent(
     low_latent: Tensor,
-    vae_decode: Callable[[Tensor], Tensor],
-    vae_encode: Callable[[Tensor], Tensor],
-    target_size: tuple[int, int],
+    target_hw: tuple[int, int],
 ) -> Tensor:
-    """Pass-A result -> the FIXED target-resolution guidance latent.
+    """Pass-A result -> the FIXED target-geometry guidance latent.
 
-    The reference's upsample (pipeline_flux_imax.py:711-718): VAE decode,
-    bicubic resize to the target PIXEL size, VAE re-encode. Runs ONCE per
-    generation — the result is fixed for the whole pass B, and the engine
-    derives P(G) from it exactly once more (haar_lowpass). ``vae.encode``
-    sampling is stochastic: same inputs, a fresh guidance draw — accepted
-    (plan §5; same as HiFlow), fingerprint_inputs keeps the node uncached.
+    Latent-space bicubic upsample of pass A's clean prediction — the
+    reference (pipeline_flux_imax.py:711-718) upsamples in IMAGE space
+    (VAE decode -> bicubic -> re-encode), but re-encoding does not preserve
+    latent statistics: on z_image_turbo the re-encoded G carried ~1.8x the
+    natural latent std and ~35x the high-frequency energy (the encoder
+    re-normalizes contrast and its sampling adds broadband noise), and the
+    schedules injected that off-manifold signal into every step — the
+    "noisy / muted / needs more denoise steps" failure at 1024 (round trip
+    at identity size, fixed first) and at extrapolated targets alike
+    (measured 2026-10-08: latent-space G keeps std within ~0.5% of pass A's
+    and the final gains 2.7x the edge energy at 1536 px).
 
-    Only called when pass A ran BELOW the target geometry (something to
-    upsample): when pass A already ran at the target latent geometry, the
-    caller uses the pass-A output directly — the round trip would be the
-    identity bicubic plus a pure-detail-loss VAE pass (z_image_turbo
-    measurements, 2026-10-08).
+    Runs ONCE per generation — the result is fixed for the whole pass B,
+    and the engine derives P(G) from it exactly once more (haar_lowpass).
+    Fully deterministic (no VAE sampling draw); fingerprint_inputs still
+    keeps the node uncached for ComfyUI-cache safety.
 
-    ``target_size`` is in PIXELS ``(H, W)``; bicubic runs on a channels-FIRST
-    view of the channels-last decode output (F.interpolate treats dim 1 as
-    channels).
+    ``target_hw`` is the TARGET LATENT grid ``(H, W)`` (pass B runs there);
+    interpolation is per-channel on the [B, C, h, w] latent.
     """
-    image = vae_decode(low_latent)          # [B, H_low, W_low, 3]
     up = torch.nn.functional.interpolate(
-        image.movedim(-1, 1), size=tuple(target_size), mode="bicubic",
+        low_latent, size=tuple(target_hw), mode="bicubic",
+        align_corners=False,
     )
-    return vae_encode(up.movedim(1, -1))    # [B, C, h_t, w_t]
+    return up.to(dtype=low_latent.dtype)    # [B, C, h_t, w_t]
 
 
 def _wrap_final_x0_call(
@@ -1126,11 +1082,11 @@ def _wrap_final_x0_call(
 ) -> Callable[[Tensor, float], Tensor]:
     """Fire ``on_final(x0)`` on the adapter's LAST scheduled call.
 
-    The bridge that lets the node own the VAE round trip while the engine
+    The bridge that lets the node own the guidance build while the engine
     owns the loop: the engine's final Euler step of pass A lands on σ=0,
     and x + (x − x̂₁)/σ · (0 − σ) = x̂₁ analytically — the model's last clean
     prediction IS the final low-res latent (fp32 deviation ~1e-7, far below
-    the VAE round-trip noise). ``on_final`` therefore runs inside the last
+    any later processing). ``on_final`` therefore runs inside the last
     pass-A step, BEFORE the engine computes P(G) from the guidance buffer
     the callback fills (see IMaxNode.execute).
     """
@@ -1200,11 +1156,13 @@ class IMaxNode(io.ComfyNode):
     """I-Max — tuning-free resolution extrapolation for FLUX (arXiv 2410.07536).
 
     Pass A generates at the native-area low resolution unpatched; its final
-    clean prediction is VAE round-tripped (decode -> bicubic -> encode) into
-    a FIXED guidance latent; pass B at the target resolution runs with the
-    NTK RoPE embedder + proportional attention + text duplication active and
-    its clean predictions pulled toward the low pass of the guidance
-    (Projected Flow, paper §2.2).
+    clean prediction becomes a FIXED guidance latent at the target geometry
+    (used directly at the target geometry, latent-space bicubic upsampled
+    below it — no VAE round trip: re-encoding distorts latent statistics,
+    measured on z_image_turbo 2026-10-08); pass B at the target resolution
+    runs with the NTK RoPE embedder + proportional attention + text
+    duplication active and its clean predictions pulled toward the low pass
+    of the guidance (Projected Flow, paper §2.2).
     """
 
     @classmethod
@@ -1225,8 +1183,9 @@ class IMaxNode(io.ComfyNode):
                 io.Model.Input("model", tooltip="The FLUX-family flow model."),
                 io.Vae.Input(
                     "vae",
-                    tooltip="VAE for the guidance round trip (decode -> "
-                            "bicubic -> encode, once per generation)."),
+                    tooltip="VAE — used for the latent/pixel geometry "
+                            "(downscale ratio); the guidance latent itself "
+                            "is built in latent space."),
                 io.Conditioning.Input(
                     "positive", tooltip="Positive conditioning."),
                 io.Conditioning.Input(
@@ -1325,10 +1284,11 @@ class IMaxNode(io.ComfyNode):
     def fingerprint_inputs(cls, **kwargs) -> float:
         """Never serve this node from the cache (D15).
 
-        The guidance latent's ``vae.encode`` is stochastic: identical inputs
-        still yield a fresh draw, so a cached result would silently repeat
-        the previous image. NaN compares unequal to itself — the canonical
-        always-rerun fingerprint.
+        The guidance latent is deterministic (no VAE sampling since the
+        latent-space upsample), but the node stays always-rerun for
+        ComfyUI-cache safety — model/option patches can change results
+        without changing visible inputs. NaN compares unequal to itself —
+        the canonical always-rerun fingerprint.
         """
         return float("nan")
 
@@ -1495,30 +1455,26 @@ class IMaxNode(io.ComfyNode):
         # The engine takes the guidance as a static argument, but it is a
         # function of pass A's output — so the buffer below is filled IN the
         # last pass-A step (see _wrap_final_x0_call), before the engine
-        # computes P(G) from it. Built exactly once per generation.
-        vae_decode, vae_encode = _make_vae_adapters(vae, device)
+        # computes P(G) from it. Built exactly once per generation, entirely
+        # in latent space (see _upsample_guidance_latent).
         guidance_buffer = torch.zeros_like(content_latent)
-        target_px = (h_t * vae_ratio, w_t * vae_ratio)
+        target_hw = (h_t, w_t)
         target_shape = tuple(content_latent.shape)
 
         def _fill_guidance(x0_low: Tensor) -> None:
-            # Pass A at the target latent geometry: the bicubic would be the
-            # identity, so the VAE round trip is pure detail loss (measured on
-            # z_image_turbo 2026-10-08: it roughly halved the low-pass
-            # result's edge energy, and the guidance schedules propagated
-            # that softness into the final). Use the pass-A output directly.
+            # Pass A at the target latent geometry: nothing to upsample —
+            # the guidance latent IS the pass-A output (no interpolation).
             if tuple(x0_low.shape) == target_shape:
                 logger.info(
                     "I-Max: pass A ran at the target geometry — the "
-                    "guidance latent IS the pass-A output (no VAE round "
-                    "trip: nothing to upsample)."
+                    "guidance latent IS the pass-A output."
                 )
                 guidance_buffer.copy_(x0_low.to(
                     device=guidance_buffer.device,
                     dtype=guidance_buffer.dtype))
                 return
-            guidance_buffer.copy_(_build_guidance_latent(
-                x0_low, vae_decode, vae_encode, target_px,
+            guidance_buffer.copy_(_upsample_guidance_latent(
+                x0_low, target_hw,
             ).to(device=guidance_buffer.device, dtype=guidance_buffer.dtype))
 
         predict_x0_low = _wrap_final_x0_call(
