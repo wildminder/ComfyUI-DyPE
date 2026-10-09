@@ -57,6 +57,7 @@ Training-free methods that push pre-trained DiT models far beyond their native r
 | **❖ [PixelRush](#user-content-pixelrush)** | Cascade patch refinement of an existing base image. |
 | **❖ [FreeScale](#user-content-freescale)** | Tuning-free self-cascade upscaling. |
 | **❖ [HiFlow](#user-content-hiflow)** | Trajectory-guided flow upscaling for rectified-flow models (FLUX, Qwen-Image, Krea2, Z-Image, …). |
+| **❖ [I-Max](#user-content-imax)** | Dual-pass resolution extrapolation for FLUX and Z-Image — a native-resolution pass guides the target pass. |
 
 ### Which method when?
 
@@ -71,19 +72,22 @@ Two families: **model patches** alter how your own KSampler run attends (no imag
 | **PixelRush** | Any (SDXL, SD1.5, FLUX, Qwen, …) | Patch-wise low-denoise img2img cascade | ✓ | Faithful upscale + refinement |
 | **FreeScale** | FLUX-family DiTs | Scale-fused attention + self-cascade | ✓ | Regenerative hi-res, mostly new content |
 | **HiFlow** | Flow models (FLUX, Qwen-Image, Krea2, Z-Image, …) | Time-matched reference trajectory guidance | ✓ | Structure-faithful flow upscale |
+| **I-Max** | FLUX, Z-Image | Dual-pass Projected-Flow guidance (low-res pass → target pass) | ✗ | Native high-res generation |
 
 > [!TIP]
-> **Quick picker:** starting from noise → DyPE (or SEGA), add SPA if you see repeated/collapsed structures, add HAP for speed. Starting from an existing image → PixelRush to keep it faithful, FreeScale to re-imagine it at high res (lower its `noise_timestep` for more fidelity), HiFlow for FLUX-family flow models — it reuses the whole base-resolution denoising trajectory as guidance, so structure survives while detail is re-synthesized.
+> **Quick picker:** starting from noise → DyPE (or SEGA), add SPA if you see repeated/collapsed structures, add HAP for speed. Starting from an existing image → PixelRush to keep it faithful, FreeScale to re-imagine it at high res (lower its `noise_timestep` for more fidelity), HiFlow for FLUX-family flow models — it reuses the whole base-resolution denoising trajectory as guidance, so structure survives while detail is re-synthesized. For FLUX or Z-Image at 2K+ from noise, **I-Max** is the dual-pass alternative — it runs its own low-resolution guidance pass instead of patching the sampler.
 
 #### Model support
 
-| Architecture | DyPE | SEGA | SPA | HAP | PixelRush / FreeScale / HiFlow |
-|:---|:--:|:--:|:--:|:--:|:--:|
-| FLUX (incl. Nunchaku) | ✅ | ✅ | ✅ | ✅ | ✅ |
-| Qwen-Image 1.0, Krea-2 | ✅ | ✅ | ✅ | ✅ | ✅ |
-| Qwen-Image 2.1 | ✅  | ✅ | ✅  | ❌ | ✅ |
-| Z-Image, Anima/Cosmos | ✅ | ✅ | ✅ | ✅ | ✅ |
-| SDXL / SD1.5 | — | — | — | — | ✅ (PixelRush) |
+| Architecture | DyPE | SEGA | SPA | HAP | I-Max | PixelRush / FreeScale / HiFlow |
+|:---|:--:|:--:|:--:|:--:|:--:|:--:|
+| FLUX (incl. Nunchaku) | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ |
+| Qwen-Image 1.0, Krea-2 | ✅ | ✅ | ✅ | ✅ | ❌ | ✅ |
+| Qwen-Image 2.1 | ✅  | ✅ | ✅  | ❌ | ❌ | ✅ |
+| Z-Image, Anima/Cosmos | ✅ | ✅ | ✅ | ✅ | ✅ * | ✅ |
+| SDXL / SD1.5 | — | — | — | — | — | ✅ (PixelRush) |
+
+\* **Z-Image only** (new in v2.19.0) — Anima/Cosmos are not supported by I-Max. The Z-Image wiring skips the FLUX-specific extras: text duplication is ignored (Lumina-Next uses cross-attention) and `guidance_low`/`guidance_high` apply to FLUX only. See the [I-Max section](#user-content-imax).
 
 **Qwen-Image 2.1 notes**
 
@@ -337,6 +341,44 @@ Training-free high-resolution upscaling for **rectified-flow models** (FLUX, Qwe
 > **HiFlow inherits the reference's structure** — including its mistakes. Generate a good base first; `tau` lower keeps more of it, higher re-imagines. 3D-latent image models (Krea2, Qwen-Image — Wan21 format, Qwen VAE) work as single-frame (T=1) latents; actual multi-frame/video input is rejected.
 <p align="right"><a href="#readme-top" title="back to top">⟔ ▲ ⟓</a></p>
 
+<a id="user-content-imax"></a>
+### ❖ I-Max
+
+Tuning-free resolution extrapolation for **FLUX and Z-Image** ([paper](https://arxiv.org/abs/2410.07536)): instead of patching your sampler, the node runs **two passes itself**. Pass A generates at the native-area low resolution; its result becomes the fixed guidance latent — verbatim when pass A already ran at the target geometry, otherwise bicubic-upsampled **in latent space** to the target grid (no VAE round trip: re-encoding distorts latent statistics). Its Haar low-pass becomes the guidance target. Pass B generates at the target resolution while its clean predictions are pulled toward that target (Projected Flow, paper §2.2) — and an inference toolkit compensates the resolution gap: an NTK-aware RoPE base multiplier, proportional attention scaling and per-tile text duplication (paper §2.3).
+
+**Usage:** connect `model`, `vae`, `positive`, `negative` and an **empty latent at the TARGET resolution** (e.g. `EmptySD3LatentImage` at 2048×2048) → set `noise_seed` → decode. A content latent + `denoise < 1` runs img2img at the target size. Works out of the box with the shipped [example workflow](example_workflows/imax-flux.json).
+
+**Z-Image (v2.19.0):** the toolkit adapts to Z-Image's Lumina2 `NextDiT` arch, which calls its RoPE embedder once per token group instead of over the joint stream — the NTK clip applies **per group** (the image grid clips against its own length; the caption takes the paper's model-wide NTK scaling with no floor), and proportional attention rides the global attention seam so chained SPA/DyPE patches keep composing. The padded caption length (Z-Image pads text to multiples of 32) feeds the attention anchor, and a chained DyPE/SEGA/SPA embedder still triggers the takeover warning. Two FLUX-specific extras are skipped: text duplication is **ignored** with a console warning (Lumina-Next uses cross-attention) and `guidance_low`/`guidance_high` are **FLUX-only** (Z-Image is guidance-distilled). Same empty latent — Z-Image shares Flux's 16-channel 8× latent format, so `EmptySD3LatentImage` works there too.
+
+> [!TIP]
+> **Z-Image Turbo:** guidance schedules trade some contrast for low-pass structure-following — distilled checkpoints re-sharpen less than FLUX between pulls, and full-strength corrections hallucinate swirls at extrapolated targets. Set `guidance_strength` 0.25–0.5 for clean structure-following, prefer `steps_low` 8–12 with `time_shift_low` 3.0 for a sharp low pass, or use `guidance_schedule=disable` for the model's native look.
+
+<details>
+<summary><b>Inputs & Parameters</b></summary>
+
+| Parameter | Default | Description |
+|:---|:---:|:---|
+| `noise_seed` | 0 | One shared generator: pass A's start noise, then pass B's img2img noise. |
+| `denoise` | 1.0 | Img2img strength for pass B only (ignored for an empty latent — that always runs the full schedule). |
+| `cfg` | 1.0 | CFG for both passes. FLUX-dev: leave at 1.0; auto-skipped when the negative carries no tokens. |
+| `steps_low` / `steps_high` | 30 / 20 | Steps of the low-res guidance pass / the target-resolution pass (paper values). |
+| `guidance_low` / `guidance_high` | 3.5 / 5.0 | FLUX guidance embed written into copies of the conditioning per pass (FLUX only — ignored for Z-Image, which is guidance-distilled). `0.0` keeps whatever a chained FluxGuidance set. |
+| `time_shift_low` / `time_shift_high` | 3.0 / 6.0 | Static flow shift of each pass's sigma schedule — the node owns both schedules, no `model_sampling` patch is involved. |
+| `ntk_factor` | 10.0 | NTK-aware RoPE base multiplier for the high pass (paper: 10 for Flux.1-dev); `1.0` = plain RoPE. |
+| `dwt_level` | 1 | Haar low-pass level of the guidance projection; higher = coarser guidance detail. |
+| `guidance_schedule` | cosine_decay | Projected-Flow guidance schedule: `cosine_decay` (paper default), `cosine_shift`, `constant`, or `disable` (plain Euler). |
+| `guidance_strength` | 1.0 | Linear scale on the Projected-Flow correction (1.0 = the paper's unscaled pull; 0 = `disable`). Distilled checkpoints (Z-Image Turbo) hallucinate swirls/noise at extrapolated targets at full strength — use 0.25–0.5 there. |
+| `proportional_attention` | True | Scale the attention temperature with the joint sequence length (no-op at/below the native 1024 px). |
+| `text_duplication` | True | Duplicate text tokens per native 1024 px tile to keep the image/text token ratio in distribution (FLUX only — ignored for Z-Image, which cross-attends text). |
+| `low_res_scale` | 1.0 | Scales the low-res pass area (`1.0` = the paper's native-area guidance). |
+
+</details>
+
+> [!NOTE]
+> The node runs its own sampling (both passes) — place it where a `KSampler` would sit, feeding an empty latent at the target size. Only FLUX and Z-Image are accepted; other architectures are rejected with an actionable error — including `MingImage` (multi-frame Z-Image), the pixel-space Z-Image variant (no VAE round trip) and plain Lumina2 (trained at a different RoPE base).
+
+<p align="right"><a href="#readme-top" title="back to top">⟔ ▲ ⟓</a></p>
+
 ## ▓ Node Reference
 
 All nodes registered by this pack (V3 schema ids):
@@ -351,6 +393,7 @@ All nodes registered by this pack (V3 schema ids):
 | `PixelRushNode` | PixelRush | Cascade refinement for existing latents. |
 | `FreeScaleNode` | FreeScale | Tuning-free scale-fusion + self-cascade upscaling. |
 | `HiFlowNode` | HiFlow | Trajectory-guided flow upscaling (initialization + direction + acceleration alignment). |
+| `IMaxNode` (`IMax`) | I-Max | Dual-pass resolution extrapolation for FLUX and Z-Image (Projected-Flow guidance + NTK RoPE + proportional attention). |
 | `EmptyQwenImage21LatentImage` | Empty Qwen Image 2.1 Latent | Empty 64-channel latent at 16× for Qwen-Image 2.1 text-to-image sampling (core ships none). |
 
 <p align="right"><a href="#readme-top" title="back to top">⟔ ▲ ⟓</a></p>
@@ -384,6 +427,18 @@ Restart ComfyUI. No further dependency installation is required.
 <p align="right"><a href="#readme-top" title="back to top">⟔ ▲ ⟓</a></p>
 
 ## ▓ Changelog
+
+### v2.19.0 — 2026-10-07
+- **I-Max now supports Z-Image** (previously FLUX-only). The model gate widens to Z-Image's Lumina2 `NextDiT` arch behind explicit guards: `MingImage` (multi-frame Z-Image), the pixel-space `ZImagePixelSpace` variant (operates on raw RGB patches, no VAE round trip) and plain Lumina2 (trained at RoPE theta=10000 vs. Z-Image's 256) are each rejected with an actionable error naming the reason and the remedy.
+- **Per-group NTK RoPE clip.** Lumina's `NextDiT` calls its RoPE embedder once per token group (caption, siglip, image ids) instead of over the joint stream, so the NTK-aware clip re-derives **per group**: the image group clips against its own group length, the caption group takes the paper's model-wide NTK scaling with no floor (the Flux `(N − 512)` numerator would be zero on text t-ids). `ntk_factor=1` stays a bitwise identity to the installed `EmbedND`, and a chained DyPE/SEGA/SPA embedder still triggers the takeover warning.
+- **Proportional attention on the global seam.** Lumina blocks have no `attn1_patch`, so the z-image profile installs the same `q *= sqrt(log(N, anchor))` scale as a `transformer_options["optimized_attention_override"]` instead: the anchor is the native 64×64 image grid plus the padded caption (Z-Image pads text to multiples of 32 — that length feeds the anchor), the scale clamps to an exact no-op at/below it, a pre-existing comfy attention override is chained with the scaled q, and the call resolves the lumina `optimized_attention_masked` symbol lazily so chained SPA rebindings compose. The per-call sequence-length approximation at refiner scales is bounded (≤1% ratio error) and documented in the override.
+- **FLUX extras skipped for Z-Image.** Text duplication warns once and installs nothing (the paper applies it to MMDiT Flux; Lumina-Next uses cross-attention and lumina blocks have no `post_input` seam), and the guidance embeds (`guidance_low` / `guidance_high`) are FLUX-only — Z-Image is guidance-distilled, so its conditioning passes through untouched. Flow schedules, NTK factor, guidance projection and the dual-pass engine are unchanged, and the FLUX route (`attn1_patch` / `post_input` / guidance override / joint clip) is byte-identical to v2.18.0.
+- **Guidance latent built in latent space (no VAE round trip).** Pass A's clean prediction becomes the guidance latent directly: verbatim when pass A already ran at the target geometry (a console note marks it), or bicubic-upsampled in latent space to the target grid when it ran below. The v2.18.0 image-space round trip (decode → bicubic → re-encode) re-encoded the guidance at ~1.8× the natural latent std with ~35× the high-frequency energy (VAE encoder re-normalization + sampling noise) — measured on z_image_turbo, that off-manifold guidance was the "noisy / muted / needs more denoise steps" failure of every guidance schedule, at native and extrapolated targets alike; the latent-space build keeps the guidance on pass A's statistics and roughly tripled the final's edge energy at extrapolated targets. An advisory still notes that on Z-Image the schedules trade some contrast for structure-following (distilled Turbo re-sharpen less than FLUX between pulls).
+- **`guidance_strength` input (correction scale).** At extrapolated targets the Projected-Flow correction reaches ~0.74 of the prediction's magnitude per early step — FLUX's undistilled sampler absorbs that, but distilled Z-Image Turbo hallucinated swirls and flat-region noise (2.5–4× the unguided control, measured at 1536 px; `dwt_level` and step/shift changes don't touch it). The input linearly blends every scheduled correction toward the uncorrected prediction (1.0 = the paper's unscaled pull, 0 ≡ `disable`); on Turbo at 2K+ use 0.25–0.5 — the low-band anchoring holds at control-level noise.
+
+### v2.18.0 — 2026-10-06
+- **New `I-Max` node** — tuning-free resolution extrapolation for FLUX (arXiv 2410.07536). The node runs a dual pass itself: a native-area low-resolution pass builds a fixed guidance latent (decode → bicubic → encode → Haar low-pass), and the target-resolution pass runs with **Projected-Flow** guidance pulling every clean prediction toward it (paper §2.2). The resolution gap is compensated in the target pass by an NTK-aware RoPE base multiplier, proportional attention and per-tile text duplication (paper §2.3). I-Max owns both flow schedules (`time_shift_low` / `time_shift_high`) — no `model_sampling` patch, and the target-pass patches ride per-pass model options that leave chained SPA/HAP/DyPE patches untouched. Feed an **empty latent at the target resolution** (`EmptySD3LatentImage`); non-FLUX models are rejected with an actionable error.
+- **Shipped example workflow** [`imax-flux.json`](example_workflows/imax-flux.json): loaders → I-Max → VAEDecode for FLUX-dev.
 
 ### v2.17.1 — 2026-10-06
 - **Fixed the cascade crash on Qwen-Image 2.1** (`Boolean value of Tensor with more than one value is ambiguous`, user-reported on HiFlow): 2.1 keys its prefix K/V cache on the latent shape, so a cascade's shape change allocates a second cache slot and core's LRU eviction then compares two tensor-valued dicts. PixelRush, FreeScale and HiFlow now switch that cache off — it buys a cascade nothing, and the override wins over an upstream `QwenImage21Cache` node.
@@ -516,6 +571,7 @@ Restart ComfyUI. No further dependency installation is required.
 * **The HRDiT team** — [HRDiT](https://arxiv.org/abs/2608.07003) ([code](https://github.com/zylwithxy/HRDiT-HAP)) — basis for SPA & HAP
 * **The PixelRush authors** — [PixelRush](https://arxiv.org/abs/2602.12769)
 * **The HiFlow authors** — [HiFlow](https://arxiv.org/abs/2504.06232) ([code](https://github.com/Bujiazi/HiFlow))
+* **The I-Max authors** — [I-Max](https://arxiv.org/abs/2410.07536) — basis for the I-Max node
 * **Yanhong Zeng et al.** — [FreeScale](https://github.com/ali-vilab/FreeScale) ([paper](https://arxiv.org/abs/2412.09626))
 * **The ComfyUI team** — for the platform
 
