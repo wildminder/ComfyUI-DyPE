@@ -806,6 +806,8 @@ def collect_scope_scores_for_model(
 
         def chunked_attn(q, k, v, heads, mask=None, attn_precision=None,
                          skip_reshape=False, skip_output_reshape=False, **kwargs):
+            if not isinstance(q, torch.Tensor):
+                q, k, v = q.take(), k.take(), v.take()
             def _passthrough():
                 return orig_fn(q, k, v, heads, mask, attn_precision,
                                skip_reshape, skip_output_reshape, **kwargs)

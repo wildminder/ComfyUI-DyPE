@@ -992,6 +992,9 @@ def _make_hrdit_wrapper(orig, is_masked: bool):
 
     def _wrapper(q, k, v, heads, mask=None, attn_precision=None,
                  skip_reshape=False, skip_output_reshape=False, **kw):
+        container_type = None if isinstance(q, torch.Tensor) else type(q)
+        if container_type is not None:
+            q, k, v = q.take(), k.take(), v.take()
         # QWEN-IMAGE-2.1 JOINT MODE ("causal_prefix").  2.1's block-causal
         # attention issues ONE ``optimized_attention`` call per SEQUENCE SEGMENT
         # per block (a text chunk with a causal mask, then the image chunk
@@ -1176,6 +1179,9 @@ def _make_hrdit_wrapper(orig, is_masked: bool):
             # convention: slots 5-8 == mask, attn_precision, skip_reshape,
             # skip_output_reshape.  Everything else (transformer_options, ...)
             # rides **kw exactly as the backend sent it.
+            # Each attention pass consumes its own containers.
+            if container_type is not None:
+                qq, kk, vv = container_type(qq), container_type(kk), container_type(vv)
             return orig(qq, kk, vv, heads, mask, attn_precision, skip_reshape,
                         skip_output_reshape, **kw)
 

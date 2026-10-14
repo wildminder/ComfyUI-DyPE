@@ -738,6 +738,8 @@ def collect_scope_scores(
     records: List[List[torch.Tensor]] = []  # records[layer] = chunk leaves
 
     def chunked_attn(q, k, v, heads, *args, **kwargs):
+        if not isinstance(q, torch.Tensor):
+            q, k, v = q.take(), k.take(), v.take()
         out, chunks = chunked_attention(q, k, v, scale=scale, chunk=chunk)
         records.append(chunks)
         return out
