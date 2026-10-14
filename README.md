@@ -428,6 +428,9 @@ Restart ComfyUI. No further dependency installation is required.
 
 ## ▓ Changelog
 
+### v2.19.1 — 2026-10-14
+- **Fixed SPA/HAP crash on current ComfyUI** (`AttentionTensorContainer' object has no attribute 'shape'`). Core's `wrap_attn` normally unwraps the single-owner containers itself, but the HRDiT wrapper patches the *bound* backend symbols and therefore sits outside `wrap_attn` — it now unwraps at the boundary and wraps each delegated pass in fresh containers (Krea-2 produces containers at its attention call), and HAP calibration unwraps at its two chunked-attention replacements.
+
 ### v2.19.0 — 2026-10-07
 - **I-Max now supports Z-Image** (previously FLUX-only). The model gate widens to Z-Image's Lumina2 `NextDiT` arch behind explicit guards: `MingImage` (multi-frame Z-Image), the pixel-space `ZImagePixelSpace` variant (operates on raw RGB patches, no VAE round trip) and plain Lumina2 (trained at RoPE theta=10000 vs. Z-Image's 256) are each rejected with an actionable error naming the reason and the remedy.
 - **Per-group NTK RoPE clip.** Lumina's `NextDiT` calls its RoPE embedder once per token group (caption, siglip, image ids) instead of over the joint stream, so the NTK-aware clip re-derives **per group**: the image group clips against its own group length, the caption group takes the paper's model-wide NTK scaling with no floor (the Flux `(N − 512)` numerator would be zero on text t-ids). `ntk_factor=1` stays a bitwise identity to the installed `EmbedND`, and a chained DyPE/SEGA/SPA embedder still triggers the takeover warning.
