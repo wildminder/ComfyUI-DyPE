@@ -16,6 +16,7 @@ from .freescale import FreeScaleNode
 from .hiflow import HiFlowNode
 from .imax import IMaxNode
 from .qwen21_latent import EmptyQwenImage21LatentImage
+from .area import AReA
 
 __all__ = [
     "DyPE_FLUX",
@@ -28,4 +29,5 @@ __all__ = [
     "HiFlowNode",
     "IMaxNode",
     "EmptyQwenImage21LatentImage",
+    "AReA",
 ]

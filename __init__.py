@@ -7,6 +7,7 @@ Node definitions live in ``nodes/``; engines/implementation in ``src/``
 from comfy_api.latest import ComfyExtension, io
 
 from .nodes import (
+    AReA,
     DyPE_FLUX,
     EmptyQwenImage21LatentImage,
     FreeScaleNode,
@@ -27,7 +28,7 @@ class DyPEExtension(ComfyExtension):
         install_qwen2d_patch()
 
     async def get_node_list(self) -> list[type[io.ComfyNode]]:
-        return [DyPE_FLUX, SEGA, SPA, HAP, HAPCalibrate, PixelRushNode, FreeScaleNode, HiFlowNode, IMaxNode, EmptyQwenImage21LatentImage]
+        return [DyPE_FLUX, SEGA, SPA, HAP, HAPCalibrate, PixelRushNode, FreeScaleNode, HiFlowNode, IMaxNode, EmptyQwenImage21LatentImage, AReA]
 
 
 async def comfy_entrypoint() -> DyPEExtension:
