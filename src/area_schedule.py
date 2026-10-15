@@ -1,0 +1,308 @@
+"""AReA per-step schedule and Phase II window math — port of ``area/schedule.py``.
+
+Literal port of the reference's ``schedule.py``
+(``.dev/data/area/AReA/area/schedule.py``) plus the pure-math tiling primitives
+of its ``tiling.py``: the window box, the clipped-box/geometry helpers and the
+coverage/dedupe predicates.  The tensor-producing tiling (DWT detail map,
+jittered starts, adaptive splits, halo rings, merge weights) lives in
+:mod:`src.area_attn`; the model patcher that builds one schedule per forward
+lives in :mod:`src.area`.
+
+Everything here is pure numpy/int math with no tensor layout, so it is testable
+GPU-free and shared by both attention phases.  The reference works in
+diffusers' ``[B, S, H, D]`` layout while ComfyUI FLUX reaches the attention seam
+as ``[b, heads, S, D]``; nothing in this module touches the axis order — the
+boxes and token indices it produces are layout-agnostic and serve both.
+
+Determinism: the only randomness is :func:`step_rng`, keyed by
+``(seed, step, salt)``.  ComfyUI batches cond and uncond into ONE forward
+(``comfy/samplers.py``), so a keyed layout must serve both CFG branches and
+nothing here may read the global RNG (theory.md:496, "Synchronize randomness
+under classifier-free guidance").
+
+Deviations from the reference, all deliberate and pinned by
+``tests/test_area_schedule.py``:
+* ``Schedule`` is named :class:`AreaSchedule` — ``src`` is a flat shared
+  namespace and a bare ``Schedule`` would collide with the next port.
+* :meth:`AreaSchedule.at` holds the last **factor** on an all-coarse schedule
+  (``phase1_steps == steps``) instead of indexing ``windows[-1]`` on an empty
+  tuple the way the reference does; every in-range answer is unchanged.
+* :func:`build_schedule` does not short-circuit at or below the native extent;
+  the caller (``src/area.py``) owns that gate, mirroring the reference's
+  ``Backbone.schedule`` (``backbones/base.py:59-68``).  A native-size grid still
+  builds a well-formed schedule here (one full-grid window per fine step).
+"""
+from __future__ import annotations
+
+import math
+from dataclasses import dataclass
+from typing import Sequence
+
+import numpy as np
+import torch
+
+F_MIN = 2          # Eq. 4: Phase I never pools past 2x2 blocks
+DEDUPE_COVER = 0.8  # Appendix C: split windows covering each other by this much merge
+
+
+# ---------------------------------------------------------------------------
+# Window geometry (reference tiling.py)
+# ---------------------------------------------------------------------------
+
+
+@dataclass
+class Window:
+    """Inclusive box on the patch grid."""
+
+    r0: int
+    c0: int
+    r1: int
+    c1: int
+    split: bool = False
+
+    @property
+    def height(self) -> int:
+        return self.r1 - self.r0 + 1
+
+    @property
+    def width(self) -> int:
+        return self.c1 - self.c0 + 1
+
+    @property
+    def area(self) -> int:
+        return self.height * self.width
+
+
+def step_rng(seed: int, step: int, salt: int) -> np.random.Generator:
+    """The RNG stream of one (seed, step, salt) draw — never the global stream.
+
+    Keying on the step (not a running cursor) is what lets cond and uncond share
+    one layout: both CFG branches resolve the same step index, so both draw from
+    the identical stream.
+    """
+    return np.random.default_rng((int(seed) & 0x7FFFFFFF) + int(step) * 2_654_435_761 + salt)
+
+
+def _grown_box(win: Window, depth: int | Sequence[int], h: int, w: int) -> tuple[int, int, int, int]:
+    """The window's box grown by ``depth`` and clipped to the grid, as inclusive ``(r0, r1, c0, c1)``.
+
+    ``depth`` is one width for all four sides or ``(top, bottom, left, right)``.
+    """
+    top, bottom, left, right = (depth,) * 4 if isinstance(depth, int) else depth
+    return (max(0, win.r0 - top), min(h - 1, win.r1 + bottom),
+            max(0, win.c0 - left), min(w - 1, win.c1 + right))
+
+
+def ring_size(win: Window, depth: int | Sequence[int], h: int, w: int) -> int:
+    """Number of tokens in ``halo_ring(win, depth, ...)`` (the Halo, sans the window itself)."""
+    r0, r1, c0, c1 = _grown_box(win, depth, h, w)
+    return (r1 - r0 + 1) * (c1 - c0 + 1) - win.area
+
+
+def window_tokens(win: Window, w: int, device) -> torch.Tensor:
+    """Row-major flat token indices of ``win`` on an ``h x w`` grid."""
+    rows = torch.arange(win.r0, win.r1 + 1, device=device)
+    cols = torch.arange(win.c0, win.c1 + 1, device=device)
+    return (rows[:, None] * w + cols[None, :]).reshape(-1)
+
+
+def _cover(a: Window, b: Window) -> float:
+    """Fraction of the smaller window that the overlap of ``a`` and ``b`` fills."""
+    r0, c0, r1, c1 = max(a.r0, b.r0), max(a.c0, b.c0), min(a.r1, b.r1), min(a.c1, b.c1)
+    if r1 < r0 or c1 < c0:
+        return 0.0
+    return (r1 - r0 + 1) * (c1 - c0 + 1) / min(a.area, b.area)
+
+
+def _dedupe(windows: list[Window]) -> list[Window]:
+    """Replace split windows that cover each other by at least ``DEDUPE_COVER`` with their union."""
+    split = [win for win in windows if win.split]
+    kept = [win for win in windows if not win.split]
+    while len(split) >= 2:
+        best, pair = DEDUPE_COVER, None
+        for i in range(len(split)):
+            for j in range(i + 1, len(split)):
+                f = _cover(split[i], split[j])
+                if f >= best:
+                    best, pair = f, (i, j)
+        if pair is None:
+            break
+        b = split.pop(pair[1])
+        a = split.pop(pair[0])
+        split.append(Window(min(a.r0, b.r0), min(a.c0, b.c0), max(a.r1, b.r1), max(a.c1, b.c1), split=True))
+    return kept + split
+
+
+# ---------------------------------------------------------------------------
+# Phase I: the pooling ramp (reference schedule.py)
+# ---------------------------------------------------------------------------
+
+
+def even_starts(total: int, size: int) -> list[int]:
+    """Starts of the fewest ``size``-wide windows covering ``total``, spaced evenly.
+
+    Both end windows are pinned (first start 0, last start ``total - size``) so
+    the axis stays covered, and the slack between them is spread evenly.
+    Python's :func:`round` (banker's rounding) is part of the reference's
+    contract — the jittered placement in :mod:`src.area_attn` reproduces these
+    exact starts, so rounding them differently would change the draw's support.
+    """
+    total, size = int(total), int(size)
+    if total <= size:
+        return [0]
+    n = (total - 1) // size + 1
+    return [round(i * (total - size) / (n - 1)) for i in range(n)]
+
+
+def window_count(h: int, w: int, size: int) -> int:
+    """N(w) of Eq. 6: base windows of one Phase II step."""
+    return len(even_starts(h, size)) * len(even_starts(w, size))
+
+
+def window_step_cost(h: int, w: int, size: int, txt_len: int = 0) -> float:
+    """C(w) of Eq. 7: one windowed step in units of one full-attention pass.
+
+    Every window runs its ``txt_len`` text tokens as queries and keys, so it
+    costs ``(size^2 + T)^2`` against ``(h*w + T)^2`` for full attention.
+    """
+    t = float(txt_len)
+    return window_count(h, w, size) * (float(size) ** 2 + t) ** 2 / (float(h * w) + t) ** 2
+
+
+def grid_divisors(h: int, w: int) -> list[int]:
+    """Every divisor of gcd(h, w): the pooling factors that tile the grid exactly."""
+    g = math.gcd(int(h), int(w))
+    return [d for d in range(1, g + 1) if g % d == 0]
+
+
+def initial_factor(h: int, w: int, native: int) -> int:
+    """f_0 of Eq. 5: the smallest grid divisor >= 2 whose pooled grid fits the native extent."""
+    divisors = [d for d in grid_divisors(h, w) if d >= 2]
+    if not divisors:
+        raise ValueError(
+            f"the patch grid {h}x{w} has no common divisor >= 2; choose a height and width "
+            "whose patch counts share a factor"
+        )
+    fits = [d for d in divisors if max(h, w) / d <= native]
+    return min(fits) if fits else max(divisors)
+
+
+def pooling_ramp(f0: int, steps: int, h: int, w: int, f_min: int = F_MIN) -> list[int]:
+    """Eqs. 2 and 4: f decreases linearly from f_0 to f_min, snapped to non-increasing grid divisors."""
+    divisors = [d for d in grid_divisors(h, w) if d <= f0]
+    if f_min not in divisors:
+        f_min = min(divisors, key=lambda d: (abs(d - f_min), -d))
+    if steps <= 1:
+        return [f0]
+    plan, prev = [], f0
+    for target in np.linspace(float(f0), float(f_min), steps):
+        candidates = [d for d in divisors if d <= prev]
+        plan.append(min(candidates, key=lambda d: (abs(d - target), -d)))
+        prev = plan[-1]
+    plan[0], plan[-1] = f0, f_min
+    return plan
+
+
+def start_window(h: int, w: int, lo: int, txt_len: int = 0) -> int:
+    """w_start of Eq. 8: the largest window whose step is cheaper than full attention.
+
+    ``lo`` is the floor — Phase II must not start below the pooled grid Phase I
+    handed over (``extent // f_last``).  Falls back to ``lo`` when no size below
+    the full grid is both cheaper than full attention and split into >1 window.
+    """
+    for size in range(max(h, w), lo - 1, -1):
+        if window_step_cost(h, w, size, txt_len) < 1.0 and window_count(h, w, size) > 1:
+            return size
+    return lo
+
+
+def _geometric_sizes(steps: int, start: int, floor: int) -> list[int]:
+    if steps == 1:
+        return [start]
+    sizes = [
+        max(floor, int(round(np.exp(np.log(start) + float(t) * (np.log(floor) - np.log(start))))))
+        for t in np.linspace(0.0, 1.0, steps)
+    ]
+    sizes[0], sizes[-1] = start, floor
+    return sizes
+
+
+def window_sizes(h: int, w: int, steps: int, start: int, floor: int, txt_len: int = 0) -> list[int]:
+    """Eqs. 10 and 11: geometric shrink from w_start to w_min, each rung snapped down so it
+    never costs more than the first one and sizes strictly decrease."""
+    if steps <= 0:
+        return []
+    ideal = _geometric_sizes(steps, start, floor)
+    if start - floor < steps - 1:
+        return ideal
+    cap = window_step_cost(h, w, start, txt_len)
+    sizes: list[int] = []
+    for i, target in enumerate(ideal):
+        lo = floor + steps - i - 1
+        hi = start if not sizes else min(int(target), sizes[-1] - 1)
+        hi = max(hi, lo)
+        pick = next((s for s in range(hi, lo - 1, -1) if window_step_cost(h, w, s, txt_len) <= cap + 1e-12),
+                    None)
+        if pick is None:
+            pick = min(range(lo, hi + 1), key=lambda s: window_step_cost(h, w, s, txt_len))
+        sizes.append(pick)
+    return sizes
+
+
+# ---------------------------------------------------------------------------
+# The schedule (reference schedule.py)
+# ---------------------------------------------------------------------------
+
+
+@dataclass(frozen=True)
+class AreaSchedule:
+    """What every denoising step runs: Phase I with pooling factor f, or Phase II with window side w."""
+
+    grid: tuple[int, int]
+    factors: tuple[int, ...]
+    windows: tuple[int, ...]
+
+    @property
+    def steps(self) -> int:
+        return len(self.factors) + len(self.windows)
+
+    def at(self, step: int) -> tuple[str, int]:
+        """``("coarse", f)`` for the first steps, then ``("fine", w)``.
+
+        An index past the end holds the last rung, so a sampler that runs more
+        steps than the schedule was built for degrades instead of raising.  (The
+        reference indexes ``windows[-1]`` unconditionally, which raises
+        ``IndexError`` on an all-coarse schedule; this port reports the last
+        factor instead.)
+        """
+        if step < len(self.factors):
+            return "coarse", self.factors[step]
+        if self.windows:
+            return "fine", self.windows[min(step - len(self.factors), len(self.windows) - 1)]
+        if self.factors:
+            return "coarse", self.factors[-1]
+        raise ValueError("the schedule covers no denoising steps")
+
+
+def build_schedule(
+    h: int, w: int, steps: int, phase1_steps: int, native: int, w_min: int | None = None,
+    txt_len: int = 0,
+) -> AreaSchedule:
+    """Schedule for an ``h x w`` patch grid over ``steps`` denoising steps.
+
+    ``phase1_steps`` is clamped to ``[0, steps]`` (the node clamps its widget the
+    same way, and 0 means "all Phase II"), ``w_min`` defaults to the native
+    extent, and the Phase I/II handoff is the pooled grid the last ramp rung
+    leaves behind (``extent // f_last``) — Phase II never starts below it.
+    """
+    phase1_steps = max(0, min(int(phase1_steps), int(steps)))
+    extent = max(h, w)
+    w_min = min(int(w_min or native), extent)
+    factors = pooling_ramp(initial_factor(h, w, native), phase1_steps, h, w) if phase1_steps else []
+    phase2_steps = steps - phase1_steps
+    windows: list[int] = []
+    if phase2_steps:
+        handoff = extent // (factors[-1] if factors else 1)
+        lo = max(w_min, min(handoff, extent))
+        windows = window_sizes(h, w, phase2_steps, start_window(h, w, lo, txt_len), w_min, txt_len)
+    return AreaSchedule((h, w), tuple(factors), tuple(windows))
