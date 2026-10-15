@@ -58,6 +58,7 @@ Training-free methods that push pre-trained DiT models far beyond their native r
 | **❖ [FreeScale](#user-content-freescale)** | Tuning-free self-cascade upscaling. |
 | **❖ [HiFlow](#user-content-hiflow)** | Trajectory-guided flow upscaling for rectified-flow models (FLUX, Qwen-Image, Krea2, Z-Image, …). |
 | **❖ [I-Max](#user-content-imax)** | Dual-pass resolution extrapolation for FLUX and Z-Image — a native-resolution pass guides the target pass. |
+| **❖ [AReA](#user-content-area)** | Two-phase attention replacement for FLUX — coarse cross-scale attention, then detail-map-guided windows. |
 
 ### Which method when?
 
@@ -73,21 +74,24 @@ Two families: **model patches** alter how your own KSampler run attends (no imag
 | **FreeScale** | FLUX-family DiTs | Scale-fused attention + self-cascade | ✓ | Regenerative hi-res, mostly new content |
 | **HiFlow** | Flow models (FLUX, Qwen-Image, Krea2, Z-Image, …) | Time-matched reference trajectory guidance | ✓ | Structure-faithful flow upscale |
 | **I-Max** | FLUX, Z-Image | Dual-pass Projected-Flow guidance (low-res pass → target pass) | ✗ | Native high-res generation |
+| **AReA** | FLUX | Two-phase attention replacement (pooled cross-scale → DWT-guided windows) | ✗ | Native high-res generation |
 
 > [!TIP]
-> **Quick picker:** starting from noise → DyPE (or SEGA), add SPA if you see repeated/collapsed structures, add HAP for speed. Starting from an existing image → PixelRush to keep it faithful, FreeScale to re-imagine it at high res (lower its `noise_timestep` for more fidelity), HiFlow for FLUX-family flow models — it reuses the whole base-resolution denoising trajectory as guidance, so structure survives while detail is re-synthesized. For FLUX or Z-Image at 2K+ from noise, **I-Max** is the dual-pass alternative — it runs its own low-resolution guidance pass instead of patching the sampler.
+> **Quick picker:** starting from noise → DyPE (or SEGA), add SPA if you see repeated/collapsed structures, add HAP for speed. Starting from an existing image → PixelRush to keep it faithful, FreeScale to re-imagine it at high res (lower its `noise_timestep` for more fidelity), HiFlow for FLUX-family flow models — it reuses the whole base-resolution denoising trajectory as guidance, so structure survives while detail is re-synthesized. For FLUX or Z-Image at 2K+ from noise, **I-Max** is the dual-pass alternative — it runs its own low-resolution guidance pass instead of patching the sampler. For FLUX, **AReA** takes the other road: it replaces image self-attention itself, so it layers on top of (not instead of) DyPE/SEGA positioning.
 
 #### Model support
 
-| Architecture | DyPE | SEGA | SPA | HAP | I-Max | PixelRush / FreeScale / HiFlow |
-|:---|:--:|:--:|:--:|:--:|:--:|:--:|
-| FLUX (incl. Nunchaku) | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ |
-| Qwen-Image 1.0, Krea-2 | ✅ | ✅ | ✅ | ✅ | ❌ | ✅ |
-| Qwen-Image 2.1 | ✅  | ✅ | ✅  | ❌ | ❌ | ✅ |
-| Z-Image, Anima/Cosmos | ✅ | ✅ | ✅ | ✅ | ✅ * | ✅ |
-| SDXL / SD1.5 | — | — | — | — | — | ✅ (PixelRush) |
+| Architecture | DyPE | SEGA | SPA | HAP | I-Max | AReA | PixelRush / FreeScale / HiFlow |
+|:---|:--:|:--:|:--:|:--:|:--:|:--:|:--:|
+| FLUX (incl. Nunchaku) | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ * | ✅ |
+| Qwen-Image 1.0, Krea-2 | ✅ | ✅ | ✅ | ✅ | ❌ | ❌ | ✅ |
+| Qwen-Image 2.1 | ✅  | ✅ | ✅  | ❌ | ❌ | ❌ | ✅ |
+| Z-Image, Anima/Cosmos | ✅ | ✅ | ✅ | ✅ | ✅ * | ❌ | ✅ |
+| SDXL / SD1.5 | — | — | — | — | — | ❌ | ✅ (PixelRush) |
 
 \* **Z-Image only** (new in v2.19.0) — Anima/Cosmos are not supported by I-Max. The Z-Image wiring skips the FLUX-specific extras: text duplication is ignored (Lumina-Next uses cross-attention) and `guidance_low`/`guidance_high` apply to FLUX only. See the [I-Max section](#user-content-imax).
+
+\* **AReA** — FLUX only, and not Nunchaku: its quantized/fused attention kernels bypass the attention seam, so the node warns and returns the model unchanged. See the [AReA section](#user-content-area).
 
 **Qwen-Image 2.1 notes**
 
@@ -379,6 +383,40 @@ Tuning-free resolution extrapolation for **FLUX and Z-Image** ([paper](https://a
 
 <p align="right"><a href="#readme-top" title="back to top">⟔ ▲ ⟓</a></p>
 
+<a id="user-content-area"></a>
+### ❖ AReA
+
+Training-free two-phase replacement of FLUX image self-attention ([arXiv 2610.17227](https://arxiv.org/abs/2610.17227)). Instead of one dense attention over the whole canvas, the denoising run gets a **time-dependent attention graph** that follows the coarse-to-fine shape of sampling itself:
+
+* **Phase I (coarse).** The first `phase1_steps` steps pool image keys/values to one token per `f x f` block (`f` ramps `f₀ → 2` over the phase) and run cross-scale attention on the pooled position grid, while the queries stay at full resolution. Keys are pooled **before** the position rotation, so the pooled tokens live in the query's frame.
+* **Phase II (fine).** The remaining steps run windowed attention: the window sizes come from the image's **Haar-DWT detail map** (smooth tiles split into quadrants), each window is widened by a **Halo** ring whose four sides draw their own width in `[0, halo]` — and each row/column its own reach — at every step, and each also attends a **bridge** of `round(rho·w)²` of the canvas's most distinctive unrotated keys spread over an 8×8 cell grid. Overlapping windows merge with centre-weighted (raised-cosine) blending.
+
+Window sizes and the bridge/Halo budget are chosen to keep a windowed step at or below the cost of full attention, and the schedule is built per canvas and cached across the run. At or below the native **64-patch (1024 px)** extent AReA is a **provable no-op** — nothing is patched and attention is delegated untouched.
+
+**Usage:** Load an unmodified FLUX model → add `AReA` (under `WMNodes/image`) → set `width`/`height` to match your empty latent (multiples of 16) → connect to KSampler. Keep going past 1024 px on the longer side for AReA to engage.
+
+<details>
+<summary><b>Inputs & Parameters</b></summary>
+
+| Parameter | Default | Description |
+|:---|:---|:---|
+| `model_type` | auto | Architecture detection (`auto` / `flux`). **FLUX only** in v1 — other architectures are refused with an actionable error. |
+| `width` / `height` | 2048 | Target resolution (multiples of 16). These decide the apply-time checks — the native-extent no-op and the geometry pre-check — so keep them in step with your latent; at each forward AReA re-derives the patch grid from the latent itself and validates the token count against its schedule. |
+| `enable_area` | True | Disable to pass the model through unchanged. |
+| `phase1_steps` | 8 | Leading denoising steps that run Phase I, clamped to the total step count. `8` is the reference's FLUX constant (of 28); `0` = all Phase II (windowed attention from the first step). |
+| `pooling` | subsample | Which token of each `f x f` block the pooled key/value comes from: `subsample` (block centre), `mean` (block average), `medoid` (the token closest to the block-mean key), `random` (drawn per seed, step and block). |
+| `halo` | 8 | Widest Halo ring a Phase II window may draw, in patches (`0`–`64`). Each side draws its own fresh width every step; AReA narrows it only when a windowed step would otherwise cost more than full attention. |
+| `bridge_ratio` | 0.5 | Rho of the bridge: each window also attends `round(rho·w)²` of the canvas's most distinctive keys, spread over an 8×8 cell grid so no region is starved. `0` = no bridge. |
+| `seed` | 0 | Seed of every draw (tile placement, Halo widths and reaches, random pooling). |
+
+> [!TIP]
+> **Determinism:** every draw is keyed by `(seed, step)` — no global RNG is read — and cond and uncond share one batched forward, so both CFG branches attend through **identical** windows, halos and bridges. Same seed, same layout.
+
+> [!IMPORTANT]
+> **Model support:** FLUX only. **Nunchaku is not supported** — its quantized/fused attention kernels bypass the attention seam, so the node warns and returns the model unchanged. AReA replaces attention itself, so on the steps it runs it takes precedence over an installed SPA/HAP hook (plain-attention steps and the native extent still delegate to it), and a chained DyPE/SEGA positional embedder composes — AReA's coarse positions ride on whichever embedder is installed, with a one-time warning when that embedder is dynamic.
+
+<p align="right"><a href="#readme-top" title="back to top">⟔ ▲ ⟓</a></p>
+
 ## ▓ Node Reference
 
 All nodes registered by this pack (V3 schema ids):
@@ -395,6 +433,7 @@ All nodes registered by this pack (V3 schema ids):
 | `HiFlowNode` | HiFlow | Trajectory-guided flow upscaling (initialization + direction + acceleration alignment). |
 | `IMaxNode` (`IMax`) | I-Max | Dual-pass resolution extrapolation for FLUX and Z-Image (Projected-Flow guidance + NTK RoPE + proportional attention). |
 | `EmptyQwenImage21LatentImage` | Empty Qwen Image 2.1 Latent | Empty 64-channel latent at 16× for Qwen-Image 2.1 text-to-image sampling (core ships none). |
+| `AReA` | AReA | Two-phase attention replacement for FLUX (pooled cross-scale Phase I, DWT-guided windowed Phase II with Halo rings and a global-KV bridge). |
 
 <p align="right"><a href="#readme-top" title="back to top">⟔ ▲ ⟓</a></p>
 
@@ -427,6 +466,12 @@ Restart ComfyUI. No further dependency installation is required.
 <p align="right"><a href="#readme-top" title="back to top">⟔ ▲ ⟓</a></p>
 
 ## ▓ Changelog
+
+### v2.20.0 — 2026-10-15
+- **New `AReA` node** — training-free two-phase replacement of FLUX image self-attention ([arXiv 2610.17227](https://arxiv.org/abs/2610.17227)). The leading `phase1_steps` steps (default `8`, the reference's FLUX constant, clamped to the total step count) pool image keys/values to one token per `f x f` block — with `f` ramping `f₀ → 2` across the phase — and run cross-scale attention on the pooled position grid while the queries stay at full resolution; the remaining steps run windowed attention whose window sizes come from the image's Haar-DWT detail map (smooth tiles split into quadrants), each window widened by a per-side randomized Halo ring (every side draws its own width, every row/column its own reach, at every step) and extended with a bridge of `round(rho·w)²` of the canvas's most distinctive unrotated keys spread over an 8×8 cell grid, merged back with centre-weighted (raised-cosine) blending. The window ramp is priced against full attention — bridge tokens are cut first, the Halo narrows only if the step is still above the dense cost.
+- **Deterministic by construction.** Every tile, Halo and RNG-pooling draw is keyed by `(seed, step)` — no global RNG is read — and cond/uncond share one batched forward, so both CFG branches attend through identical windows, halos and bridges. The step index is located from the sampler's own sigma table; a path that exposes no sigma schedule degrades to a one-time warning plus plain attention instead of a guessed schedule.
+- **Composition.** AReA replaces the FLUX attention call itself (`comfy.ldm.flux.layers.attention`), so it composes with rather than collides with the SPA/HAP hooks one level below — plain-attention steps and the native extent still delegate to them — and its coarse-grid positions ride on whichever positional embedder is installed, so a chained DyPE/SEGA embedder keeps composing (one-time takeover warning when that embedder is dynamic).
+- **Scope.** FLUX only, v1: other architectures are refused with an actionable error naming the remedy, and Nunchaku — whose quantized/fused kernels bypass the attention seam — warns and returns the model unchanged. At or below the native 64-patch (1024 px) extent AReA is a provable no-op and nothing is patched.
 
 ### v2.19.1 — 2026-10-14
 - **Fixed SPA/HAP crash on current ComfyUI** (`AttentionTensorContainer' object has no attribute 'shape'`). Core's `wrap_attn` normally unwraps the single-owner containers itself, but the HRDiT wrapper patches the *bound* backend symbols and therefore sits outside `wrap_attn` — it now unwraps at the boundary and wraps each delegated pass in fresh containers (Krea-2 produces containers at its attention call), and HAP calibration unwraps at its two chunked-attention replacements.
