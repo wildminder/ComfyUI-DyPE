@@ -4,30 +4,56 @@ Node definitions live in ``nodes/``; engines in ``src/`` (pack layout plan
 2026-09-08). This module is importable both inside the ComfyUI-loaded pack
 package (relative ``..src`` imports) and flat from the repo root (tests).
 
-AReA (arXiv 2610.17227) replaces FLUX image self-attention with a time-dependent
-attention graph: the first ``phase1_steps`` steps pool image K/V to one token per
-``f x f`` block and run cross-scale attention (Phase I), the remaining steps run
-windowed attention whose windows follow the image's Haar-DWT detail map, each
-extended by a randomized Halo ring and a global-KV bridge (Phase II).  At or
-below the native 1024 px extent it is a provable no-op.
+AReA (arXiv 2610.17227) replaces FLUX / Z-Image image self-attention with a
+time-dependent attention graph: the first ``phase1_steps`` (or, in ``sigma``
+mode, the leading steps still above ``phase1_sigma``) steps pool image K/V to
+one token per ``f x f`` block and run cross-scale attention (Phase I), the
+remaining steps run windowed attention whose windows follow the image's
+Haar-DWT detail map, each extended by a randomized Halo ring and a global-KV
+bridge (Phase II).  At or below the native 1024 px extent it is a provable
+no-op.
 """
+
+import inspect
 
 from comfy_api.latest import io
 
 try:  # loaded as pack package (ComfyUI loader)
     from ..src.area import PHASE1_STEPS, apply_area_to_model
+    from ..src.area_zimage import ZIMAGE_SIGMA_STAR
     from ..src.area_attn import POOLING
     from ..src.validation import validate_resolution
 except ImportError:  # flat repo layout (tests / CLI)
     from src.area import PHASE1_STEPS, apply_area_to_model
+    from src.area_zimage import ZIMAGE_SIGMA_STAR
     from src.area_attn import POOLING
     from src.validation import validate_resolution
+
+
+def _phase1_switch_kwargs(phase1_mode: str, phase1_sigma: float) -> dict:
+    """The Phase I switch, forwarded only where the engine declares it.
+
+    The node's schema is deliberately a SUPERSET of
+    ``apply_area_to_model``'s signature: the engine takes ``phase1_mode`` /
+    ``phase1_sigma`` from the model-side wiring, and forwarding the two names
+    before that would raise a ``TypeError`` on every forward.  The pair is
+    therefore filtered against the installed signature, so the knobs start
+    flowing the moment the engine declares them (and so does nothing at all
+    before it, which is what keeps the FLUX path byte-identical).
+
+    Both defaults — ``"steps"`` and ``0.89`` — reproduce the reference's
+    ``config.phase1_steps`` behaviour (``phase1_steps`` is the switch in
+    step mode), so nothing changes for a graph that never touches them.
+    """
+    accepted = inspect.signature(apply_area_to_model).parameters
+    wanted = {"phase1_mode": str(phase1_mode), "phase1_sigma": float(phase1_sigma)}
+    return {name: value for name, value in wanted.items() if name in accepted}
 
 
 class AReA(io.ComfyNode):
     """
     Applies AReA (arXiv 2610.17227) to a model: a training-free, time-dependent
-    replacement of FLUX image self-attention.
+    replacement of FLUX / Z-Image image self-attention.
 
     Phase I pools image keys/values to one token per f x f block and runs
     cross-scale attention on a coarse position grid while the queries stay at
@@ -37,6 +63,14 @@ class AReA(io.ComfyNode):
     window. Chaining with DyPE / I-Max positional scaling composes (AReA's
     coarse positions ride on the installed rope embedder); below 1024 px AReA is
     an automatically a no-op.
+
+    ``model_type`` selects the backbone profile (``src.area_arch``): ``auto``
+    reads it off the model, and the two supported backbones — FLUX and Z-Image
+    (Lumina2 / NextDiT) — share the same 16 px patch grid, so one width/height
+    pair serves either.  ``phase1_mode`` picks how the Phase I -> Phase II
+    switch is expressed: the leading ``steps`` (the reference's constant) or
+    the leading steps whose noise level is still at or above
+    ``phase1_sigma``.
     """
 
     @classmethod
@@ -45,11 +79,11 @@ class AReA(io.ComfyNode):
             node_id="AReA",
             display_name="AReA",
             category="WMNodes/image",
-            description="AReA (arXiv 2610.17227). Replaces FLUX image self-attention with a time-dependent attention graph: coarse cross-scale attention on leading steps, DWT-guided windowed attention (Halo + bridge tokens) on the rest. Training-free; a no-op at or below 1024 px.",
+            description="AReA (arXiv 2610.17227). Replaces FLUX / Z-Image image self-attention with a time-dependent attention graph: coarse cross-scale attention on leading steps, DWT-guided windowed attention (Halo + bridge tokens) on the rest. Training-free; a no-op at or below 1024 px.",
             inputs=[
                 io.Model.Input(
                     "model",
-                    tooltip="The model to patch with AReA. FLUX only in v1.",
+                    tooltip="The model to patch with AReA. FLUX and Z-Image (Lumina2) share the same patch grid, so the same width/height serve either.",
                 ),
                 io.Int.Input(
                     "width",
@@ -63,9 +97,9 @@ class AReA(io.ComfyNode):
                 ),
                 io.Combo.Input(
                     "model_type",
-                    options=["auto", "flux"],
+                    options=["auto", "flux", "zimage"],
                     default="auto",
-                    tooltip="Specify the model architecture. 'auto' usually works; AReA supports FLUX only in v1 (Nunchaku's fused kernels bypass the attention seam, so it is reported unchanged).",
+                    tooltip="Specify the model architecture. 'auto' usually works. FLUX and Z-Image (Lumina2 / NextDiT) share a 16 px patch grid, so the same width/height serve either; Nunchaku's fused kernels bypass the attention seam, so it is reported unchanged.",
                 ),
                 io.Boolean.Input(
                     "enable_area",
@@ -77,7 +111,18 @@ class AReA(io.ComfyNode):
                 io.Int.Input(
                     "phase1_steps",
                     default=PHASE1_STEPS, min=0, max=100, step=1,
-                    tooltip="Number of leading denoising steps that run Phase I (coarse cross-scale attention), clamped to the total step count. 8 = the reference's FLUX constant (of 28). 0 = all Phase II (windowed attention from the first step).",
+                    tooltip="Number of leading denoising steps that run Phase I (coarse cross-scale attention), clamped to the total step count. 8 = the reference's FLUX constant (of 28). 0 = all Phase II (windowed attention from the first step). Only read when phase1_mode is 'steps'.",
+                ),
+                io.Combo.Input(
+                    "phase1_mode",
+                    options=["steps", "sigma"],
+                    default="steps",
+                    tooltip="How the Phase I -> Phase II switch is expressed. 'steps' = the leading phase1_steps steps run Phase I (the reference's mode). 'sigma' = the leading steps whose noise level is still at or above phase1_sigma run Phase I, so the switch follows the schedule rather than a fixed count (8 of 28 sits at a sigma of roughly 0.88 on a shift-3.0 flow). The paper's sigma is a FLUX value and is advisory for the distilled Z-Image schedule.",
+                ),
+                io.Float.Input(
+                    "phase1_sigma",
+                    default=ZIMAGE_SIGMA_STAR, min=0.0, max=1.0, step=0.01,
+                    tooltip="Noise level at which Phase I gives way to Phase II, when phase1_mode is 'sigma'. 0.89 = the paper's value for its first backbone; 0.86 was its Qwen-Image value, so treat this as per-schedule calibration rather than a universal constant.",
                 ),
                 io.Combo.Input(
                     "pooling",
@@ -124,7 +169,7 @@ class AReA(io.ComfyNode):
         return validate_resolution(width, height)
 
     @classmethod
-    def execute(cls, model, width: int, height: int, model_type: str, enable_area: bool, phase1_steps: int = PHASE1_STEPS, pooling: str = "subsample", halo: int = 8, bridge_ratio: float = 0.5, seed: int = 0) -> io.NodeOutput:
+    def execute(cls, model, width: int, height: int, model_type: str, enable_area: bool, phase1_steps: int = PHASE1_STEPS, pooling: str = "subsample", halo: int = 8, bridge_ratio: float = 0.5, seed: int = 0, phase1_mode: str = "steps", phase1_sigma: float = ZIMAGE_SIGMA_STAR) -> io.NodeOutput:
         # Fallback for unlinked/None inputs
         width = 2048 if width is None else int(width)
         height = 2048 if height is None else int(height)
@@ -137,5 +182,6 @@ class AReA(io.ComfyNode):
             halo=int(halo),
             bridge_ratio=float(bridge_ratio),
             seed=int(seed),
+            **_phase1_switch_kwargs(phase1_mode, phase1_sigma),
         )
         return io.NodeOutput(patched_model)

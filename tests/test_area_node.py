@@ -306,14 +306,20 @@ class TestAReASchema:
         schema = AReA.define_schema()
         inputs = {i.name: i for i in schema.inputs}
         assert list(inputs) == ["model", "width", "height", "model_type", "enable_area",
-                                "phase1_steps", "pooling", "halo", "bridge_ratio", "seed"]
-        assert inputs["model_type"].kwargs["options"] == ["auto", "flux"]
+                                "phase1_steps", "phase1_mode", "phase1_sigma",
+                                "pooling", "halo", "bridge_ratio", "seed"]
+        assert inputs["model_type"].kwargs["options"] == ["auto", "flux", "zimage"]
         assert inputs["phase1_steps"].kwargs["default"] == PHASE1      # backbones/flux.py:16
         assert inputs["pooling"].kwargs["options"] == ["subsample", "mean", "medoid", "random"]
         assert inputs["pooling"].kwargs["default"] == "subsample"
         assert inputs["halo"].kwargs["default"] == 8
         assert inputs["bridge_ratio"].kwargs["default"] == 0.5
         assert inputs["enable_area"].kwargs["default"] is True
+        # the z-image switch's defaults reproduce the reference's step-count
+        # behaviour, so a graph that never touches them is unchanged
+        assert inputs["phase1_mode"].kwargs["options"] == ["steps", "sigma"]
+        assert inputs["phase1_mode"].kwargs["default"] == "steps"
+        assert inputs["phase1_sigma"].kwargs["default"] == 0.89
 
     def test_outputs_patched_model(self):
         schema = AReA.define_schema()
