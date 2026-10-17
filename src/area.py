@@ -724,6 +724,12 @@ def _zimage_layout_for(rt: Optional[_AreaRuntime], q):
         _warn_once("zimage-layout", "AReA: %s", exc)
         return None
     rt.joint = layout
+    # The joint stream's two groups are already in, so anything the model ropes
+    # from here on is the seam's own coarse builder, never AReA's business.
+    # Closing the window here too — not only in the refiner hook — keeps the
+    # arming independent of that hook's firing.
+    if recorder is not None:
+        recorder.armed = False
     return layout
 
 
@@ -816,6 +822,26 @@ def _zimage_attention(rt: _AreaRuntime, ctx: AreaContext, layout, q, k, v, heads
     return out.permute(0, 2, 1, 3).reshape(q.shape[0], q.shape[2], heads * q.shape[3])
 
 
+def _zimage_refiner_handles(refiner) -> tuple:
+    """Forward-hook handles covering every ``noise_refiner`` layer.
+
+    A plain Z-Image forward runs the refiner as ``for layer in
+    self.noise_refiner: x = layer(x, ...)`` (``comfy/ldm/lumina/model.py:816``),
+    so a hook registered on the ModuleList itself never fires — only the layers'
+    hooks do.  A refiner that is a plain module (not a container) is its own
+    target, and a container with no hookable children yields nothing so the
+    caller can warn instead of staying silent.
+    """
+    if refiner is None:
+        return ()
+    layers = list(refiner.children()) or [refiner]
+    return tuple(
+        layer.register_forward_hook(_zimage_refiner_hook)
+        for layer in layers
+        if hasattr(layer, "register_forward_hook")
+    )
+
+
 def _zimage_refiner_hook(module, args, output):
     """Close the rope window, and capture the Phase II detail-map input.
 
@@ -891,9 +917,13 @@ def _zimage_install_seam(m, dm):
                 "forward runs plain attention.",
             )
         _ZSEAM["recorder"] = recorder
-        refiner = getattr(dm, "noise_refiner", None)
-        if refiner is not None and hasattr(refiner, "register_forward_hook"):
-            handles.append(refiner.register_forward_hook(_zimage_refiner_hook))
+        # lumina ITERATES the refiner ModuleList
+        # (``comfy/ldm/lumina/model.py:816``) instead of calling it, so a forward
+        # hook on the container never fires — register on every layer.  A plain
+        # module (a refiner that is not a container) is its own target.
+        refiner_hooks = _zimage_refiner_handles(getattr(dm, "noise_refiner", None))
+        if refiner_hooks:
+            handles.extend(refiner_hooks)
         else:
             _warn_once(
                 "no-zimage-refiner",

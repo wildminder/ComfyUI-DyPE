@@ -30,7 +30,8 @@ What this file pins:
   follows ``sigma_prefix_count`` on the sampler's own table;
 * the per-forward hooks: the rope recorder captures the model's two groups in
   call order and the ``noise_refiner`` hook feeds the detail map the real image
-  tokens only, never the pad;
+  tokens only, never the pad — registered on every refiner LAYER, because lumina
+  iterates the ModuleList (``model.py:816``) instead of calling it;
 * the computation: comfy-shaped output, RNG keyed by ``(seed, step)``, and ONE
   layout shared by cond and uncond of a batched forward;
 * the FLUX seam is untouched by a Z-Image install, and vice versa.
@@ -62,6 +63,9 @@ except ImportError:  # pragma: no cover - mock env always provides it
 # enough that a whole sampled forward runs in well under a second on CPU.
 WIDTH, HEIGHT = 1040, 1040
 GRID = 65
+# How many layers the refiner ModuleList holds — ``n_refiner_layers``
+# (``comfy/ldm/lumina/model.py:453``, the ModuleList at ``:497-514``).
+REFINER_LAYERS = 2
 # A canvas that exercises the pad policy: 20 prompt tokens pad to a 32-token
 # caption block, and a 65x65 (4225-token) image pads to 4256 — so both pad spans
 # are non-empty (the same geometry ``tests/test_area_zimage.py`` uses).
@@ -161,7 +165,7 @@ class MockEmbedND(torch.nn.Module):
 
 
 class MockNoiseRefiner(torch.nn.Module):
-    """``NextDiT.noise_refiner`` (``model.py:497-514``): image-only blocks.
+    """One ``NextDiT.noise_refiner`` block (``model.py:497-514``): image-only.
 
     Each refiner block runs attention over the IMAGE BLOCK ALONE through the very
     symbol AReA patches, so this mock calls the bound symbol once with a short
@@ -203,8 +207,15 @@ class NextDiT(torch.nn.Module):
         self.pad_tokens_multiple = 32
         self.masked_pad_multiple = None
         self.rope_embedder = MockEmbedND()
-        self.noise_refiner = MockNoiseRefiner(
-            lambda: sys.modules["comfy.ldm.lumina.model"].optimized_attention_masked)
+        # An nn.ModuleList, like the real one (``model.py:497-514``), and for the
+        # same reason the mock forward LOOPS over it: a forward hook on the
+        # container never fires when the model iterates its layers
+        # (``model.py:816``).  A plain module here would hide that bug.
+        self.noise_refiner = torch.nn.ModuleList([
+            MockNoiseRefiner(
+                lambda: sys.modules["comfy.ldm.lumina.model"].optimized_attention_masked)
+            for _ in range(REFINER_LAYERS)
+        ])
 
 
 def mock_zimage_model() -> ModelPatcher:
@@ -291,10 +302,15 @@ class SimulatedZImage:
         # 2. embed_all: rope group #2, the padded image (model.py:722-727).
         img_table = dm.rope_embedder(_img_ids())
         full = torch.cat((cap_table, img_table), dim=2)      # model.py:731/:805
-        # 3. noise_refiner over the image block alone; its hook fires here.
-        img_block = torch.randn(self.b, IMG_TOKENS + IMG_PAD, HIDDEN)
-        dm.noise_refiner(img_block)
-        self.refiner_calls = dm.noise_refiner.calls
+        # 3. noise_refiner over the image block alone, layer by layer — the real
+        # forward LOOPS the ModuleList (``model.py:816``) rather than calling it,
+        # so only the layers' own hooks fire.  The last layer's output is the
+        # detail map's input, and the block is kept for the tests to compare.
+        self.img_block = torch.randn(self.b, IMG_TOKENS + IMG_PAD, HIDDEN)
+        x = self.img_block
+        for layer in dm.noise_refiner:
+            x = layer(x)
+        self.refiner_calls = sum(layer.calls for layer in dm.noise_refiner)
         # 4. the joint layer loop: the seam sees the whole padded stream, rotated.
         q, k, v = _joint(self.b, seed=self.seed)
         q, k = apply_rope1(q, full), apply_rope1(k, full)
@@ -426,10 +442,14 @@ class TestSeamInstall:
             assert area._ZSEAM["consumers"] == 1
             # the FLUX twin seam was never touched
             assert area._SEAM["consumers"] == 0
-            # both per-forward hooks are registered on the model itself
+            # the rope hook sits on the model's own embedder; the refiner hooks
+            # on every LAYER — the ModuleList is iterated, never called
+            # (``model.py:816``), so a hook on the container itself never fires
             dm = patched.model.diffusion_model
             assert len(dm.rope_embedder._forward_hooks) == 1
-            assert len(dm.noise_refiner._forward_hooks) == 1
+            assert dm.noise_refiner._forward_hooks == {}
+            for layer in dm.noise_refiner:
+                assert len(layer._forward_hooks) == 1
         finally:
             restore_area_attention_hook(patched)
 
@@ -475,7 +495,7 @@ class TestSeamInstall:
 
         assert area._ZRUNTIME is None            # context cleared after the forward
         # the refiner pass delegated too (its stream is never the joint stream)
-        assert sim.refiner_calls == 1
+        assert sim.refiner_calls == REFINER_LAYERS
         # every delegation carried the real positional slots and kw untouched
         joint = [c for c in calls if c["seq"] == SEQ_LEN]
         assert joint, "the joint stream never reached the seam"
@@ -509,6 +529,8 @@ class TestSeamInstall:
                               "hook": None, "recorder": None, "consumers": 0}
         assert dm.rope_embedder._forward_hooks == {}
         assert dm.noise_refiner._forward_hooks == {}
+        for layer in dm.noise_refiner:
+            assert layer._forward_hooks == {}
         assert patched._area_config is None
         # idempotent — a second restore is a no-op, not a crash
         restore_area_attention_hook(patched)
@@ -619,6 +641,7 @@ class TestPerForwardHooks:
         def spy(hidden_states, h, w):
             captured["shape"] = tuple(hidden_states.shape)
             captured["batch"] = hidden_states.shape[0]
+            captured["hidden"] = hidden_states.detach().clone()
             return real_detail(hidden_states, h, w)
 
         monkeypatch.setattr(area, "detail_map", spy)
@@ -626,16 +649,99 @@ class TestPerForwardHooks:
                                       phase1_steps=4, seed=5)
         try:
             sim, out = _run_forward(patched, step=STEPS - 1)     # a fine step
-            # the refiner pass fired once, and its own seam calls delegated
-            assert sim.refiner_calls == 1
+            # the refiner pass fired per layer, and its own seam calls delegated
+            assert sim.refiner_calls == REFINER_LAYERS
             # the detail map got exactly h*w image tokens — no caption, no pad
             assert captured["shape"] == (1, IMG_TOKENS, HIDDEN)
+            # it was the refiner's OWN last-layer output, not the projected-keys
+            # fallback (which would have warned "no-img-in" and re-derived the
+            # map from the rotated keys)
+            assert torch.equal(captured["hidden"], sim.img_block[:, :IMG_TOKENS])
+            assert "no-img-in" not in area._warned
             # ... and the recorder holds the model's own two groups in call order
             rt = area._ZRUNTIME
             assert rt is None                     # cleared after the forward
         finally:
             restore_area_attention_hook(patched)
         assert out.shape == (1, SEQ_LEN, HEADS * HEAD_DIM)
+
+
+@pytest.mark.unit
+class TestRefinerHookRegistration:
+    """The refiner hook sits on the LAYERS, not the ModuleList.
+
+    ``comfy/ldm/lumina/model.py:816`` runs ``for layer in self.noise_refiner`` —
+    it iterates, it does not call the container — so a forward hook on the
+    ModuleList never fires.  That was a real defect, found by the GPU repro of
+    ``docs/2026-10-17-area-zimage-ripple-diagnosis.md``: the arming window stayed
+    open, the seam's own coarse-rope calls were recorded as extra groups (the
+    table stopped matching the stream) and the first coarse forward's blocks fell
+    back to plain attention, while Phase II always used the projected-keys
+    fallback instead of the detail map.  These tests pin the per-layer
+    registration the fix uses, against a mock that iterates like the real model.
+    """
+
+    def test_hooks_sit_on_every_layer_not_the_container(self, lumina_model):
+        patched = apply_area_to_model(mock_zimage_model(), "zimage", WIDTH, HEIGHT,
+                                      phase1_steps=PHASE1, seed=3)
+        dm = patched.model.diffusion_model
+        try:
+            assert len(dm.noise_refiner) == REFINER_LAYERS
+            assert dm.noise_refiner._forward_hooks == {}      # never fires
+            for layer in dm.noise_refiner:
+                assert len(layer._forward_hooks) == 1
+            # one removable handle per layer, next to the rope embedder's
+            assert len(area._ZSEAM["hook"]) == REFINER_LAYERS + 1
+        finally:
+            restore_area_attention_hook(patched)
+        for layer in dm.noise_refiner:                       # all removed
+            assert layer._forward_hooks == {}
+
+    def test_detail_map_comes_from_the_hooked_refiner_output(self, lumina_model,
+                                                             monkeypatch):
+        """End to end: the iterating pass feeds the map, no fallback warning."""
+        seen = {}
+        real_detail = area.detail_map
+
+        def spy(hidden_states, h, w):
+            seen["hidden"] = hidden_states.detach().clone()
+            return real_detail(hidden_states, h, w)
+
+        monkeypatch.setattr(area, "detail_map", spy)
+        patched = apply_area_to_model(mock_zimage_model(), "zimage", WIDTH, HEIGHT,
+                                      phase1_steps=4, seed=5)
+        try:
+            sim, out = _run_forward(patched, step=STEPS - 1)
+        finally:
+            restore_area_attention_hook(patched)
+        assert torch.equal(seen["hidden"], sim.img_block[:, :IMG_TOKENS])
+        assert "no-img-in" not in area._warned
+
+    def test_coarse_builders_ropes_are_never_recorded(self, lumina_model, monkeypatch):
+        """The arming window closes before the seam's own coarse builder runs.
+
+        With the window leak, the coarse builder's re-roping was captured as
+        extra groups, so ``full_table()`` no longer matched the joint stream and
+        every block after the first fell back to plain attention — a silent
+        quality loss, only visible as a missing Phase I computation per block.
+        """
+        pooled = []
+        real_pool = area.pool_keys_values
+
+        def spy(*a, **kw):
+            pooled.append(1)
+            return real_pool(*a, **kw)
+
+        monkeypatch.setattr(area, "pool_keys_values", spy)
+        patched = apply_area_to_model(mock_zimage_model(), "zimage", WIDTH, HEIGHT,
+                                      phase1_steps=PHASE1, seed=7)
+        try:
+            _run_forward(patched, step=0, blocks=3)      # a coarse step
+        finally:
+            restore_area_attention_hook(patched)
+        assert len(pooled) == 3                          # every block pooled
+        assert "zimage-table" not in area._warned        # the table still matched
+        assert "no-img-in" not in area._warned
 
 # ---------------------------------------------------------------------------
 # The computation
