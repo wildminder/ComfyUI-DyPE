@@ -7,6 +7,21 @@ and :mod:`src.area_attn` instead of dense attention.  The node
 (``nodes/area.py``) is a thin schema/execute shell over
 :func:`apply_area_to_model`.
 
+**Two seams, one engine.**  FLUX and Z-Image (Lumina2) are different backbones with
+different seams, so :func:`apply_area_to_model` resolves an
+:class:`~src.area_arch._ArchProfile` once and installs exactly one of them:
+
+* FLUX — the bound ``attention`` of ``comfy.ldm.flux.layers`` (below);
+* Z-Image — the bound ``optimized_attention_masked`` of
+  ``comfy.ldm.lumina.model`` (``comfy/ldm/lumina/model.py:14`` binds the name, ``:182``
+  calls it), because ``JointAttention.forward`` applies rope ITSELF (``:159-173``) and
+  hands the seam **rotated** q/k with no rope table.  The z-image adapter
+  (:mod:`src.area_zimage`) un-rotates them with the model's own captured table, slices
+  the 32-token pad spans out of the stream, and rebuilds the coarse tables from
+  lumina's ids; this module owns the ref-counted install and the per-forward state.
+  Unlike FLUX — where SPA binds a *different* symbol — SPA patches this very symbol for
+  Z-Image too (``src/spa.py:590-591``), so the install refuses to wrap a foreign hook.
+
 Phase I ("coarse") pools image K/V to one token per ``f x f`` block and runs
 cross-scale attention on a coarse rope grid while the queries stay at full
 resolution.  Phase II ("fine") runs windowed attention whose windows come from
@@ -99,7 +114,26 @@ from .area_attn import (
     tiling_rng,
     windowed_attention,
 )
+from .area_arch import (
+    FLUX_PROFILE,
+    ZIMAGE_PROFILE,
+    _ArchProfile,
+    resolve_area_arch,
+)
 from .area_schedule import AreaSchedule, build_schedule, initial_factor
+from .area_zimage import (
+    ZIMAGE_GROUP_ORDER,
+    ZIMAGE_SEAM_MODULE,
+    ZIMAGE_SEAM_SYMBOL,
+    ZIMAGE_SIGMA_STAR,
+    ZImageRopeRecorder,
+    capture_tables,
+    coarse_ropes_zimage,
+    sigma_prefix_count,
+    stitch_fine_zeros,
+    unrotate1,
+    zimage_layout,
+)
 from .model_detect import resolve_model_type
 from .patch_utils import _snap_to_multiple
 
@@ -114,6 +148,13 @@ PATCH_PX = 16          # VAE 8 x patch 2 — the node's geometry multiple
 # The seam: the bound symbol the FLUX blocks actually call (layers.py:10,244,349).
 FLUX_ATTENTION_MODULE = "comfy.ldm.flux.layers"
 FLUX_ATTENTION_SYMBOL = "attention"
+
+# The Z-Image seam: the symbol ``JointAttention.forward`` calls after applying rope
+# itself — imported into the backend module at comfy/ldm/lumina/model.py:14, called
+# at :182, so the *bound* name is the only symbol patching it moves (the same trap
+# SPA documents at src/spa.py:558-567).  Named by the adapter (plan §4,
+# ``src/area_zimage.ZIMAGE_SEAM_MODULE`` / ``ZIMAGE_SEAM_SYMBOL``) and imported
+# above, so the interface has one definition.
 
 #: AReA-private patcher attrs, carried across a later clone (``ModelPatcher.clone()``
 #: drops custom attrs; same reason as SPA/HAP's carry-over).
@@ -131,11 +172,34 @@ def _warn_once(key: str, message: str, *args) -> None:
     logger.warning(message, *args)
 
 
+def _warn_dynamic_embedder(embedder) -> None:
+    """Warn once about a timestep-dependent positional embedder (both seams).
+
+    A DyPE-family embedder carries dynamic, per-step scaling, so AReA's coarse
+    positions now ride on it and its scaling also moves the pooled keys — the
+    I-Max takeover warning (``nodes/imax.py:287-294``).
+    """
+    if hasattr(embedder, "set_timestep"):
+        _warn_once(
+            "dynamic-embedder",
+            "AReA: the installed positional embedder is a dynamic scaling "
+            "wrapper (%s) — AReA's coarse-grid rope positions now ride on it, so "
+            "its per-step scaling also moves the pooled keys. Chain only one of "
+            "DyPE / I-Max / SEGA positional scaling.",
+            type(embedder).__name__,
+        )
+
+
 @dataclass(frozen=True)
 class AreaConfig:
     """Everything AReA needs that is not resolved per forward."""
 
     phase1_steps: int = PHASE1_STEPS
+    #: How the Phase I -> II switch is expressed: ``"steps"`` (the reference's
+    #: ``phase1_steps``) or ``"sigma"`` (the leading steps whose noise level is
+    #: still at or above :attr:`phase1_sigma`, theory.md:240-246 / Q4).
+    phase1_mode: str = "steps"
+    phase1_sigma: float = ZIMAGE_SIGMA_STAR
     pooling: str = "subsample"
     halo: int = 8
     bridge_ratio: float = 0.5
@@ -149,40 +213,71 @@ class _AreaRuntime:
     ``dm`` is the diffusion model the patcher patches (resolved once at apply
     time so the per-forward rope lookup sees the *installed* embedder — comfy
     applies ``object_patches`` in place around model use, so a chained DyPE/SEGA
-    embedder is visible at forward time).
+    embedder is visible at forward time).  ``profile`` is the backbone that
+    patcher resolved to; the seam install, the rope tables and the pad policy
+    all branch on it.
 
     Per forward: ``ctx`` is the current step (``None`` phase = plain attention,
-    delegated untouched), ``hidden`` is the ``img_in`` output of that forward,
+    delegated untouched), ``hidden`` is the ``img_in`` output of a FLUX forward or
+    the ``noise_refiner`` output of a Z-Image one (its Phase II detail-map input),
     and ``block`` counts attention calls so the reference's per-block ``random``
     pooling stream is reproduced (double-stream blocks 0..N then single-stream,
     the same order as the reference's
     ``list(transformer_blocks) + list(single_transformer_blocks)``).
     ``ropes`` / ``schedules`` are per-canvas caches (the reference's
     ``self._ropes`` / ``self._schedule``).
+
+    Z-Image adds two fields: ``recorder`` captures the model's own rope groups in
+    call order (``src/area_zimage.py``, built by its :func:`capture_tables`) and
+    owns the arming window through :attr:`~src.area_zimage.ZImageRopeRecorder.armed`
+    — open from the start of the forward and closed by the ``noise_refiner``
+    hook, so only ``embed_cap`` / ``embed_all``'s two groups are ever recorded —
+    and ``joint`` is the resolved pad layout of the current forward (``None``
+    until the joint stream is identified).
     """
 
-    __slots__ = ("config", "dm", "ctx", "hidden", "ropes", "schedules", "block")
+    __slots__ = ("config", "dm", "profile", "ctx", "hidden", "ropes", "schedules",
+                 "block", "recorder", "joint")
 
-    def __init__(self, config: AreaConfig, dm):
+    def __init__(self, config: AreaConfig, dm, profile: Optional[_ArchProfile] = None):
         self.config = config
         self.dm = dm
+        self.profile = profile
         self.ctx: Optional[AreaContext] = None
         self.hidden: Optional[torch.Tensor] = None
         self.ropes: dict = {}
         self.schedules: dict = {}
         self.block = 0
+        self.recorder: Optional[ZImageRopeRecorder] = None
+        self.joint = None
 
 
-#: The runtime of the forward currently running, read by the attention seam.  Set
-#: and cleared around every forward (SPA discipline) — ``None`` between forwards,
-#: which is what makes an unpatched/inactive model a pure no-op.
+#: The runtime of the FLUX forward currently running, read by the FLUX attention
+#: seam.  Set and cleared around every forward (SPA discipline) — ``None`` between
+#: forwards, which is what makes an unpatched/inactive model a pure no-op.
 _AREA_RUNTIME: Optional[_AreaRuntime] = None
+
+#: The same for Z-Image: the two globals are set exclusively (the unet wrapper
+#: assigns exactly one per forward), so neither backbone's seam can fire on the
+#: other's forward and the two never share a runtime.
+_ZRUNTIME: Optional[_AreaRuntime] = None
 
 # Seam install bookkeeping: the patched module, the original symbol, the
 # ``img_in`` hook handle and the number of patchers consuming them.  A second
 # AReA apply re-uses the wrapper instead of wrapping our own wrapper, and the
 # symbol is restored only when the last consumer unpatches.
 _SEAM = {"module": None, "attr": None, "orig": None, "hook": None, "consumers": 0}
+
+# The Z-Image twin of ``_SEAM`` — a *different* module and symbol, so a different
+# ref-count: FLUX and Z-Image installs never share one.  ``hook`` holds EVERY
+# handle this install registered on the first consumer's diffusion model (the
+# rope recorder and the ``noise_refiner`` layout hook), which is why it is a
+# tuple here and a single handle on the FLUX side, and ``recorder`` is the
+# capture :func:`src.area_zimage.capture_tables` built for it — shared by every
+# consumer of this install, since the hook that feeds it is registered once on
+# the first consumer's model (the same reason the symbol is ref-counted).
+_ZSEAM = {"module": None, "attr": None, "orig": None, "hook": None, "recorder": None,
+          "consumers": 0}
 
 
 # ---------------------------------------------------------------------------
@@ -245,20 +340,50 @@ def _area_locate(sigmas, current) -> tuple[Optional[int], Optional[int]]:
         return None, None
 
 
-def _area_schedule(rt: _AreaRuntime, h: int, w: int, total: int, txt_len: int) -> AreaSchedule:
+def _area_schedule(rt: _AreaRuntime, h: int, w: int, total: int, phase1: int,
+                   txt_len: int) -> AreaSchedule:
     """The schedule of one canvas, cached per ``(h, w, total, phase1, txt_len)``.
 
     The reference caches on exactly this key (``backbones/base.py:64-66``): the
     windows of a step depend on the canvas and on how many text tokens the
-    prompt carries, both constant across a generation.
+    prompt carries, both constant across a generation.  ``phase1`` is the
+    *resolved* Phase I count (``_phase1_count``), not the raw knob, so sigma mode
+    — whose count comes from the schedule itself — is cached correctly.
     """
     cfg = rt.config
-    key = (h, w, total, cfg.phase1_steps, txt_len)
+    phase1 = max(0, int(phase1))
+    key = (h, w, total, phase1, txt_len)
     schedule = rt.schedules.get(key)
     if schedule is None:
-        schedule = build_schedule(h, w, total, cfg.phase1_steps, cfg.native, txt_len=txt_len)
+        schedule = build_schedule(h, w, total, phase1, cfg.native, txt_len=txt_len)
         rt.schedules[key] = schedule
     return schedule
+
+
+def _phase1_count(rt: _AreaRuntime, opts: dict) -> int:
+    """How many leading steps of this run are Phase I — the node's switch.
+
+    ``"steps"`` is the reference's fixed count (``config.phase1_steps``);
+    ``"sigma"`` counts the leading steps whose noise level is still at or above
+    ``phase1_sigma`` (:func:`~src.area_zimage.sigma_prefix_count`, ``theory.md:
+    240-246``), which follows the schedule rather than a fixed count (Q4).  The
+    trailing terminal zero of ``sample_sigmas`` is dropped exactly as
+    :func:`_area_locate` drops it, so the count and the step index read the same
+    table.
+    """
+    cfg = rt.config
+    if cfg.phase1_mode != "sigma":
+        return max(0, int(cfg.phase1_steps))
+    table = opts.get("sample_sigmas")
+    if not torch.is_tensor(table) or table.numel() < 2:
+        _warn_once(
+            "sigma-mode-no-table",
+            "AReA: phase1_mode is 'sigma' but this sampler did not publish a "
+            "usable sigma table, so the Phase I -> II switch cannot be located. "
+            "This forward runs all Phase II (a deterministic choice).",
+        )
+        return 0
+    return sigma_prefix_count(table.detach().float().flatten().cpu()[:-1], cfg.phase1_sigma)
 
 
 def _area_rope_ids(txt_len: int, rows: torch.Tensor, cols: torch.Tensor,
@@ -291,17 +416,7 @@ def _area_coarse_ropes(rt: _AreaRuntime, h: int, w: int, f: int, txt_len: int,
             "AReA: this model has no diffusion_model.pe_embedder, so the Phase I "
             "coarse rope tables cannot be built. Use an unmodified FLUX loader."
         )
-    if hasattr(embedder, "set_timestep"):
-        # Takeover warning (the I-Max pattern, nodes/imax.py:287-294): a
-        # DyPE-family embedder carries dynamic, timestep-dependent scaling.
-        _warn_once(
-            "dynamic-embedder",
-            "AReA: the installed positional embedder is a dynamic scaling "
-            "wrapper (%s) — AReA's coarse-grid rope positions now ride on it, so "
-            "its per-step scaling also moves the pooled keys. Chain only one of "
-            "DyPE / I-Max / SEGA positional scaling.",
-            type(embedder).__name__,
-        )
+    _warn_dynamic_embedder(embedder)
     key = ("coarse", h, w, f, txt_len, id(embedder), str(device))
     cached = rt.ropes.get(key)
     if cached is not None:
@@ -316,7 +431,8 @@ def _area_coarse_ropes(rt: _AreaRuntime, h: int, w: int, f: int, txt_len: int,
     return rope_q, rope_kv
 
 
-def _area_fine_layout(rt: _AreaRuntime, ctx: AreaContext, k_img: torch.Tensor) -> Optional[FineLayout]:
+def _area_fine_layout(rt: _AreaRuntime, ctx: AreaContext, k_img: torch.Tensor,
+                      hook_name: str = "diffusion_model.img_in") -> Optional[FineLayout]:
     """Build (once per step) the Phase II layout — the reference's ``_after_embedding``."""
     layout = ctx.data.get("layout")
     if layout is not None:
@@ -326,12 +442,13 @@ def _area_fine_layout(rt: _AreaRuntime, ctx: AreaContext, k_img: torch.Tensor) -
     hidden = rt.hidden
     if hidden is None:
         # Fallback: the detail map is derived from the post-norm projected image
-        # keys instead of the img_in output (see the module docstring).
+        # keys instead of the hooked hook's output (see the module docstring).
         _warn_once(
             "no-img-in",
-            "AReA: diffusion_model.img_in could not be hooked, so the Phase II "
-            "detail map is derived from the projected image keys of the first "
-            "fine call. Results differ slightly from a hooked model.",
+            "AReA: %s could not be hooked, so the Phase II detail map is derived "
+            "from the projected image keys of the first fine call. Results differ "
+            "slightly from a hooked model.",
+            hook_name,
         )
         # [b, heads, n, d] -> [b, n, heads*d], the img_in output's layout
         hidden = k_img.transpose(1, 2).reshape(*k_img.shape[:1], k_img.shape[2], -1)
@@ -450,17 +567,360 @@ def _make_area_wrapper(orig):
     return attention
 
 
-def _area_img_in_hook(module, args, output):
-    """Capture the ``img_in`` output of the running forward (the reference's
-    ``x_embedder`` hook, ``backbones/flux.py:150-163``)."""
-    rt = _AREA_RUNTIME
-    if rt is None or rt.ctx is None or rt.ctx.phase != "fine":
+# ---------------------------------------------------------------------------
+# The Z-Image seam
+# ---------------------------------------------------------------------------
+
+
+def _zimage_take(x):
+    """Consume a seam argument once — the engine duck-types its own, comfy's
+    ``AttentionTensorContainer`` is single-owner (``ldm/modules/attention.py:193-209``)."""
+    return x.take() if hasattr(x, "take") else x
+
+
+def _zimage_delegate(orig, q, k, v, heads, mask, attn_precision, skip_reshape,
+                     skip_output_reshape, kw, cls=None):
+    """Call the pristine attention with FRESH containers.
+
+    Mirrors :func:`_area_delegate`: a taken container must never be re-wrapped
+    (a second ``take`` raises), which is the v2.19.1 crash class.  Everything the
+    seam was handed is forwarded untouched — ``transformer_options`` and
+    ``preferred_attention`` ride ``kw`` — so a delegating call is bit-identical
+    to the unpatched model.
+    """
+    if cls is not None:
+        q, k, v = cls(q), cls(k), cls(v)
+    return orig(q, k, v, heads, mask=mask, attn_precision=attn_precision,
+                skip_reshape=skip_reshape, skip_output_reshape=skip_output_reshape, **kw)
+
+
+def _zimage_check_foreign(symbol, when: str) -> None:
+    """Refuse to install over another pack's hook on the same bound symbol.
+
+    SPA's Z-Image target is this very symbol (``src/spa.py:590-591`` returns
+    ``("comfy.ldm.lumina.model", "optimized_attention_masked", True)``) and it
+    marks its wrapper ``_spa_wrapper`` (``src/spa.py:1362-1363``).  Unlike FLUX —
+    where SPA binds ``comfy.ldm.flux.math.optimized_attention``, a *different*
+    symbol, so AReA simply takes precedence on the steps it runs — there is ONE
+    symbol here, so the two cannot coexist.  AReA never wraps another pack's hook
+    silently: the install raises and the user reorders (plan §0, "Silent no-op
+    avoided by ... foreign-binding collision ValueError").
+    """
+    if getattr(symbol, "_spa_wrapper", False):
+        raise ValueError(
+            f"AReA: {ZIMAGE_SEAM_MODULE}.{ZIMAGE_SEAM_SYMBOL} is already "
+            "wrapped by SPA (src/spa.py:590-591 patches this same bound symbol "
+            "for Z-Image, while for FLUX SPA binds comfy.ldm.flux.math."
+            "optimized_attention instead — a different symbol). AReA never "
+            "wraps another pack's hook silently: restore SPA before applying "
+            "AReA, or run the two on separate models. On a shared symbol "
+            "whichever pack installed last would own every step."
+        )
+
+
+def _zimage_pristine(bound):
+    """The pristine symbol behind ``bound`` — an AReA wrapper carries its own.
+
+    A re-apply after a patcher clone, or an install whose ref-count bookkeeping
+    was reset underneath it, can find our own wrapper still bound with no recorded
+    original.  The wrapper stows the symbol it wrapped (``_area_orig``), so the
+    pristine is recoverable instead of wrapping our own wrapper.
+    """
+    if not getattr(bound, "_area_wrapper", False):
+        return bound
+    orig = getattr(bound, "_area_orig", None)
+    if orig is None:
+        raise ValueError(
+            f"AReA: {ZIMAGE_SEAM_MODULE}.{ZIMAGE_SEAM_SYMBOL} is an AReA "
+            "wrapper with no recorded pristine symbol, so the Z-Image attention "
+            "seam cannot be installed safely. Restart ComfyUI to clear it."
+        )
+    return orig
+
+
+def _make_zimage_wrapper(orig):
+    """Wrap the Z-Image ``optimized_attention_masked`` seam so AReA replaces it.
+
+    The signature mirrors the real call bit-for-bit
+    (``comfy/ldm/lumina/model.py:182``) and comfy's own
+    ``(q, k, v, heads, mask=None, attn_precision=None, skip_reshape=False,
+    skip_output_reshape=False, **kwargs)``
+    (``comfy/ldm/modules/attention.py``): ``heads`` and ``mask`` arrive
+    positionally — a wrapper that mis-slots them fails silently, which is what
+    ``tests/conftest.py:113-129`` and ``tests/test_orig_call_convention.py`` pin.
+    The containers are consumed exactly once (``ldm/modules/attention.py:207``),
+    and the output is comfy's sequence-first ``[b, n, heads*d]`` (``model.py:184``).
+    """
+    def optimized_attention_masked(q, k, v, heads, mask=None, attn_precision=None,
+                                   skip_reshape=False, skip_output_reshape=False, **kw):
+        rt = _ZRUNTIME
+        ctx = None if rt is None else rt.ctx
+        layout = _zimage_layout_for(rt, q)
+        if ctx is None or ctx.phase is None or layout is None:
+            # No forward of ours, a plain-attention step, or a refiner pass: delegate.
+            return _zimage_delegate(orig, q, k, v, heads, mask, attn_precision,
+                                    skip_reshape, skip_output_reshape, kw)
+        cls = type(q) if hasattr(q, "take") else None
+        q_t, k_t, v_t = _zimage_take(q), _zimage_take(k), _zimage_take(v)
+        out = _zimage_attention(rt, ctx, layout, q_t, k_t, v_t, heads, kw)
+        if out is None:
+            return _zimage_delegate(orig, q_t, k_t, v_t, heads, mask, attn_precision,
+                                    skip_reshape, skip_output_reshape, kw, cls)
+        return out
+
+    optimized_attention_masked._area_wrapper = True
+    optimized_attention_masked._area_orig = orig
+    return optimized_attention_masked
+
+
+def _zimage_stream_len(q) -> Optional[int]:
+    """The sequence length of a seam argument, without consuming its container."""
+    tensor = q.peek() if hasattr(q, "peek") else q
+    if torch.is_tensor(tensor) and tensor.ndim == 4:
+        return int(tensor.shape[2])
+    return None
+
+
+def _zimage_layout_for(rt: Optional[_AreaRuntime], q):
+    """The joint layout of THIS call, or ``None`` when it is not the joint stream.
+
+    A plain Z-Image forward hits this symbol three ways: ``context_refiner``
+    carries the caption block alone (``comfy/ldm/lumina/model.py:784-786``),
+    ``noise_refiner`` the image block alone (``:815-822``), and the joint layer
+    loop the concatenated stream (``:880-881``).  The joint stream is identified
+    by its length — the padded caption block plus the padded image, which is
+    strictly longer than either half — and by the recorder holding the model's
+    own two rope groups in call order (the plan's group-identity rule, Q2).  Only
+    that stream is eligible; everything else delegates untouched.
+    """
+    if rt is None or rt.ctx is None or rt.ctx.phase is None or rt.profile is None:
+        return None
+    ctx = rt.ctx
+    if ctx.h * ctx.w < 1 or ctx.txt_len < 1:
+        return None
+    n = _zimage_stream_len(q)
+    if n is None:
+        return None
+    if rt.joint is not None:
+        return rt.joint if rt.joint.seq_len == n else None
+    recorder = rt.recorder
+    if recorder is None:
+        return None
+    try:
+        cap_len, _img_len, _full, _groups = recorder.reads(ZIMAGE_GROUP_ORDER)
+    except ValueError:
+        # A refiner pass, or a rope call the arming window kept out: the model
+        # has not made both joint groups yet, so this is not the joint stream.
+        return None
+    if n != cap_len + rt.profile.padded_seq_len(ctx.h * ctx.w):
+        return None
+    try:
+        layout = zimage_layout(ctx.txt_len, cap_len, ctx.h, ctx.w, n,
+                               rt.profile.seq_pad_multiple)
+    except ValueError as exc:
+        # A stream that does not fit the pad policy (a Ming-Image-style prompt
+        # mask, a non-Z-Image backend): refuse the pooling rather than guess, and
+        # say so once.
+        _warn_once("zimage-layout", "AReA: %s", exc)
+        return None
+    rt.joint = layout
+    return layout
+
+
+def _zimage_coarse_ropes(rt: _AreaRuntime, layout, f: int, device, kw: dict):
+    """The two Phase I rope tables, cached per (canvas, factor, rope options).
+
+    ``coarse_ropes_zimage`` rebuilds them through the model's OWN
+    ``rope_embedder`` with lumina's ids, so a chained positional-scaling embedder
+    composes and the model's own rope options (``scale_x/y``, ``shift_x/y`` —
+    ``pos_ids_x``, ``comfy/ldm/lumina/model.py:421-437``) are honoured instead of
+    assumed away.
+    """
+    embedder = getattr(rt.dm, "rope_embedder", None)
+    _warn_dynamic_embedder(embedder)
+    opts = kw.get("transformer_options")
+    rope_options = opts.get("rope_options") if isinstance(opts, dict) else None
+    key = ("zcoarse", layout, f, tuple(sorted((rope_options or {}).items())))
+    cached = rt.ropes.get(key)
+    if cached is not None:
+        return cached
+    try:
+        ropes = coarse_ropes_zimage(embedder, layout, f, device, rope_options)
+    except ValueError as exc:
+        _warn_once("zimage-ropes", "AReA: %s This forward runs plain attention.", exc)
+        return None
+    rt.ropes[key] = ropes
+    return ropes
+
+
+def _zimage_attention(rt: _AreaRuntime, ctx: AreaContext, layout, q, k, v, heads, kw):
+    """The AReA computation of one Z-Image attention call, or ``None`` to delegate.
+
+    The seam's q/k arrive ROTATED — ``JointAttention`` applies rope itself before
+    the call (``comfy/ldm/lumina/model.py:159-182``) — so both phases start in the
+    un-rotated frame:
+
+    * **Phase I** pools *unrotated* keys (pooling rotated keys would mix keys
+      rotated by different angles inside one block, ``src/area_attn.py:180-184``)
+      and rides the coarse tables, whose q side covers the whole padded stream in
+      stream order and whose kv side the engine's key order.  The caption block
+      and the image pad ride through unchanged (``pass_through``, plan Q6).
+    * **Phase II** attends at the model's own full-resolution positions, which IS
+      the table the recorder captured — so the rotated pair passes through
+      untouched (a second rotation would be a float round trip of the same table)
+      and only the bridge's keys are un-rotated (``bridge.py:10-24``).  The
+      answers go back in stream order with zeros in the pad spans Phase II
+      discards (``stitch_fine_zeros``).
+    """
+    table = rt.recorder.full_table()
+    if table.shape[2] != layout.seq_len:
+        _warn_once(
+            "zimage-table",
+            "AReA: the recorded Z-Image rope table covers %d tokens but the "
+            "stream is %d, so the seam's rotation cannot be undone. This call "
+            "runs plain attention.",
+            table.shape[2], layout.seq_len,
+        )
+        return None
+    block = rt.block
+    rt.block += 1
+    if ctx.phase == "coarse":
+        k_unrot = unrotate1(k, table)
+        ropes = _zimage_coarse_ropes(rt, layout, ctx.size, q.device, kw)
+        if ropes is None:
+            return None
+        rope_q, rope_kv = ropes
+        k_pooled, v_pooled = pool_keys_values(
+            layout.engine_stream(k_unrot), layout.engine_stream(v),
+            layout.pass_through_len, ctx.h, ctx.w, ctx.size, rt.config.pooling,
+            seed=rt.config.seed, step=ctx.step, block=block,
+        )
+        out = F.scaled_dot_product_attention(
+            apply_rope1(unrotate1(q, table), rope_q),
+            apply_rope1(k_pooled, rope_kv), v_pooled,
+        )
+    else:
+        first, last = layout.img_start, layout.img_end
+        fine = _area_fine_layout(rt, ctx, unrotate1(k, table)[:, :, first:last],
+                                 hook_name="diffusion_model.noise_refiner")
+        if fine is None:
+            return None
+        out_txt, out_img = windowed_attention(
+            q[:, :, :ctx.txt_len], k[:, :, :ctx.txt_len], v[:, :, :ctx.txt_len],
+            q[:, :, first:last], k[:, :, first:last], v[:, :, first:last],
+            unrotate1(k, table)[:, :, first:last], fine,
+        )
+        out = stitch_fine_zeros(out_txt, out_img, layout)
+    # comfy's own flatten: heads then head-dim, sequence back on axis 1
+    # (ldm/modules/attention.py:913-917).
+    return out.permute(0, 2, 1, 3).reshape(q.shape[0], q.shape[2], heads * q.shape[3])
+
+
+def _zimage_refiner_hook(module, args, output):
+    """Close the rope window, and capture the Phase II detail-map input.
+
+    Firing here — after ``embed_all``'s two rope groups and after both refiner
+    passes, immediately before the joint layer loop
+    (``comfy/ldm/lumina/model.py:815-822,880-881``) — is the plan's arming window.
+    The output is also the Phase II layout input: the image block alone,
+    post-modulation and pre-concat (Q3), sliced to the real ``h*w`` so no pad
+    token reaches the detail map (``src/area_attn.py:361``).
+    """
+    rt = _ZRUNTIME
+    if rt is None or rt.ctx is None:
         return
-    rt.hidden = output
+    if rt.recorder is not None:
+        # Close the rope capture's arming window: the joint stream's two groups
+        # are in, so anything the model ropes later is none of AReA's business.
+        rt.recorder.armed = False
+    if rt.ctx.phase == "fine" and torch.is_tensor(output):
+        rt.hidden = output[:, : rt.ctx.h * rt.ctx.w]
 
 
-def _area_install_seam(m, dm) -> None:
-    """Patch ``comfy.ldm.flux.layers.attention`` and hook ``img_in`` (ref-counted)."""
+def _zimage_install_seam(m, dm):
+    """Patch ``comfy.ldm.lumina.model.optimized_attention_masked`` (ref-counted).
+
+    Returns the rope capture :func:`src.area_zimage.capture_tables` built for
+    this install (or the live one on a later consumer), so the new runtime feeds
+    the same recorder the registered hook writes to — the FLUX path returns
+    ``None``.
+
+    The symbol is process-global and shared by every patcher, so the install is a
+    module-global rebind plus a ref-count — the proven in-pack pattern
+    (``src/area.py``'s FLUX seam and ``src/spa.py:1341-1372``): comfy's
+    ``add_object_patch`` is a per-patch record re-applied around model use
+    (``comfy/model_patcher.py:739``), which would double-wrap a shared symbol on
+    every clone/re-apply.  A second AReA apply re-uses the wrapper instead of
+    wrapping our own wrapper, and the symbol is restored on the last release.
+    """
+    import importlib
+
+    if _ZSEAM["orig"] is None:
+        try:
+            mod = importlib.import_module(ZIMAGE_SEAM_MODULE)
+        except Exception as exc:  # probe: backend module not importable here
+            raise ValueError(
+                f"AReA: cannot import {ZIMAGE_SEAM_MODULE} to patch the "
+                f"Z-Image attention seam ({exc}). AReA supports FLUX and Z-Image "
+                "(Lumina2); load an unmodified Z-Image checkpoint on a current "
+                "ComfyUI."
+            ) from exc
+        bound = getattr(mod, ZIMAGE_SEAM_SYMBOL, None)
+        if bound is None:
+            raise ValueError(
+                f"AReA: {ZIMAGE_SEAM_MODULE}.{ZIMAGE_SEAM_SYMBOL} is "
+                "missing in this ComfyUI version, so the Z-Image attention seam "
+                "cannot be installed. Update ComfyUI (or load an unmodified "
+                "Z-Image model)."
+            )
+        _zimage_check_foreign(bound, "install")
+        orig = _zimage_pristine(bound)
+        setattr(mod, ZIMAGE_SEAM_SYMBOL, _make_zimage_wrapper(orig))
+        _ZSEAM.update(module=mod, attr=ZIMAGE_SEAM_SYMBOL, orig=orig)
+        handles = []
+        recorder = None
+        rope = getattr(dm, "rope_embedder", None)
+        if rope is not None and hasattr(rope, "register_forward_hook"):
+            hook, recorder = capture_tables(rope)
+            handles.append(hook.handle)
+        else:
+            _warn_once(
+                "no-zimage-rope",
+                "AReA: this Z-Image model has no diffusion_model.rope_embedder "
+                "to hook, so the seam's rope table cannot be captured. Every "
+                "forward runs plain attention.",
+            )
+        _ZSEAM["recorder"] = recorder
+        refiner = getattr(dm, "noise_refiner", None)
+        if refiner is not None and hasattr(refiner, "register_forward_hook"):
+            handles.append(refiner.register_forward_hook(_zimage_refiner_hook))
+        else:
+            _warn_once(
+                "no-zimage-refiner",
+                "AReA: this Z-Image model has no diffusion_model.noise_refiner "
+                "to hook, so the Phase II detail map falls back to the projected "
+                "image keys of the first fine call.",
+            )
+        _ZSEAM["hook"] = tuple(handles)
+    _ZSEAM["consumers"] += 1
+    m._area_seam_consumer = True
+    m._area_seam = "zimage"
+    # The capture is process-wide for this install (its hook is registered once,
+    # on the first consumer's embedder), so a later consumer re-uses it rather
+    # than building a second recorder the registered hook never feeds.
+    return _ZSEAM["recorder"]
+
+
+def _area_install_seam(m, dm, profile):
+    """Patch the backbone's bound attention seam and hook the model (ref-counted).
+
+    FLUX and Z-Image are different symbols in different modules, so each takes its
+    own install path and its own ref-count — the two never share one.  Returns
+    the Z-Image rope capture (``None`` on the FLUX side), which the caller hands
+    to the runtime it builds.
+    """
+    if profile is ZIMAGE_PROFILE:
+        return _zimage_install_seam(m, dm)
     import importlib
 
     if _SEAM["orig"] is None:
@@ -469,7 +929,7 @@ def _area_install_seam(m, dm) -> None:
         except Exception as exc:  # probe: backend module not importable here
             raise ValueError(
                 f"AReA: cannot import {FLUX_ATTENTION_MODULE} to patch the FLUX "
-                f"attention seam ({exc}). AReA supports FLUX only; use an "
+                f"attention seam ({exc}). AReA supports FLUX and Z-Image; use an "
                 "unmodified FLUX/Qwen loader (no fused attention kernels)."
             ) from exc
         orig = getattr(mod, FLUX_ATTENTION_SYMBOL, None)
@@ -483,7 +943,7 @@ def _area_install_seam(m, dm) -> None:
         _SEAM.update(module=mod, attr=FLUX_ATTENTION_SYMBOL, orig=orig)
         img_in = getattr(dm, "img_in", None)
         if img_in is not None and hasattr(img_in, "register_forward_hook"):
-            _SEAM["hook"] = img_in.register_forward_hook(_area_img_in_hook)
+            _SEAM["hook"] = (img_in.register_forward_hook(_area_img_in_hook),)
         else:
             _warn_once(
                 "no-img-in",
@@ -493,6 +953,17 @@ def _area_install_seam(m, dm) -> None:
             )
     _SEAM["consumers"] += 1
     m._area_seam_consumer = True
+    m._area_seam = "flux"
+    return None
+
+
+def _area_img_in_hook(module, args, output):
+    """Capture the ``img_in`` output of the running forward (the reference's
+    ``x_embedder`` hook, ``backbones/flux.py:150-163``)."""
+    rt = _AREA_RUNTIME
+    if rt is None or rt.ctx is None or rt.ctx.phase != "fine":
+        return
+    rt.hidden = output
 
 
 def _area_resolve_forward(rt: _AreaRuntime, params: dict) -> AreaContext:
@@ -501,6 +972,15 @@ def _area_resolve_forward(rt: _AreaRuntime, params: dict) -> AreaContext:
     rt.ctx = ctx
     rt.block = 0
     rt.hidden = None
+    if rt.profile is ZIMAGE_PROFILE:
+        # Per-forward Z-Image state (the SPA discipline): the rope groups are
+        # emptied, the joint layout is unresolved, and the recording window opens
+        # — ``embed_cap`` / ``embed_all`` are about to call ``rope_embedder``.
+        if rt.recorder is None:
+            rt.recorder = _ZSEAM["recorder"] or ZImageRopeRecorder()
+        rt.recorder.reset()
+        rt.recorder.armed = True
+        rt.joint = None
     x = params.get("input")
     conds = params.get("c") or {}
     if not torch.is_tensor(x) or x.ndim != 4:
@@ -514,9 +994,12 @@ def _area_resolve_forward(rt: _AreaRuntime, params: dict) -> AreaContext:
     step, total = _area_locate(opts.get("sample_sigmas"), opts.get("sigmas"))
     if step is None or max(h, w) <= rt.config.native:
         return ctx  # at/below the native extent AReA is a provable no-op
-    phase, size = _area_schedule(rt, h, w, total, ctx.txt_len).at(step)
+    phase, size = _area_schedule(rt, h, w, total, _phase1_count(rt, opts), ctx.txt_len).at(step)
     ctx.phase, ctx.size, ctx.step, ctx.h, ctx.w = phase, size, step, h, w
-    if phase == "coarse":
+    if phase == "coarse" and rt.profile is not ZIMAGE_PROFILE:
+        # FLUX resolves its coarse tables here; the Z-Image ones need the model's
+        # own rope groups, which only exist once the forward has run its embed,
+        # so the seam resolves them lazily (``_zimage_coarse_ropes``).
         try:
             ctx.data["rope_q"], ctx.data["rope_kv"] = _area_coarse_ropes(
                 rt, h, w, size, ctx.txt_len, x.device
@@ -545,14 +1028,19 @@ def _make_area_unet_wrapper(rt: _AreaRuntime, previous_wrapper):
         # the enclosing function does not reach a nested scope, so the assignment
         # would otherwise bind a local of ``wrapper`` and the seam would never
         # see the runtime (the whole patch would silently delegate).
-        global _AREA_RUNTIME
+        global _AREA_RUNTIME, _ZRUNTIME
 
-        _AREA_RUNTIME = rt
+        # One runtime per forward, and only the backbone this patcher resolved:
+        # the FLUX and Z-Image seams read different globals, so neither can fire
+        # on the other's forward.
+        _AREA_RUNTIME = None if rt.profile is ZIMAGE_PROFILE else rt
+        _ZRUNTIME = rt if rt.profile is ZIMAGE_PROFILE else None
         try:
             _area_resolve_forward(rt, params)
             return _call_through(model_function, params)
         finally:
             _AREA_RUNTIME = None
+            _ZRUNTIME = None
 
     return wrapper
 
@@ -568,15 +1056,24 @@ def apply_area_to_model(
     halo: int = 8,
     bridge_ratio: float = 0.5,
     seed: int = 0,
+    phase1_mode: str = "steps",
+    phase1_sigma: float = ZIMAGE_SIGMA_STAR,
 ):
-    """Patch a ComfyUI FLUX model with AReA (arXiv 2610.17227).
+    """Patch a ComfyUI FLUX or Z-Image model with AReA (arXiv 2610.17227).
 
-    FLUX only, v1: every other architecture raises an actionable
+    The backbone is resolved once into an :class:`~src.area_arch._ArchProfile`
+    (``src/area_arch.py``) and exactly one attention seam is installed for it —
+    FLUX's bound ``attention`` or Z-Image's bound
+    ``optimized_attention_masked``.  Every other architecture raises an actionable
     :class:`ValueError` (house rule, ``src/hap.py:876-895``), and Nunchaku (fused
     kernels bypass the seam) warns and returns the clone UNCHANGED
     (``src/hap.py:897-903``).  At or below the native 64-patch extent (1024 px)
     nothing is patched — attention would be replaced by itself.
 
+    ``phase1_mode`` / ``phase1_sigma`` are the Phase I -> II switch (Q4):
+    ``"steps"`` (the default) is the reference's fixed ``phase1_steps``, and
+    ``"sigma"`` counts the leading steps whose noise level is still at or above
+    ``phase1_sigma`` (``theory.md:240-246``) so the switch follows the schedule.
     ``phase1_steps`` is clamped to ``[0, total]`` and ``0`` means "all Phase II"
     (the reference's ``config.phase1_steps``, ported without its
     ``phase1_steps=0`` assert).  ``pooling`` is one of :data:`POOLING`
@@ -607,20 +1104,26 @@ def apply_area_to_model(
         _warn_once(
             "nunchaku",
             "AReA: unsupported on Nunchaku (quantized/fused attention kernels "
-            "bypass the FLUX attention seam); returning the model UNCHANGED. "
-            "Use a non-quantized FLUX loader.",
+            "bypass the attention seam); returning the model UNCHANGED. "
+            "Use a non-quantized FLUX / Z-Image (Lumina2) loader.",
         )
         m._area_config = None
         return m
-    if detected_type != "flux":
+    if detected_type not in ("flux", "zimage"):
         raise ValueError(
-            f"AReA supports FLUX only in v1, but the resolved model type is "
+            f"AReA supports FLUX and Z-Image (Lumina2 / NextDiT) — it covered "
+            f"FLUX only in v1 — but the resolved model type is "
             f"{detected_type!r}. Load an unmodified (non-quantized) FLUX model, "
             "or use SPA / DyPE / SEGA for this architecture."
         )
+    # The arch profile validates the pin against the model's own backbone and
+    # refuses the Lumina2 siblings AReA cannot patch (pixel space, Ming-Image).
+    profile = resolve_area_arch(dm, model_type)
 
     m._area_config = AreaConfig(
         phase1_steps=max(0, int(phase1_steps)),
+        phase1_mode=phase1_mode if phase1_mode in ("steps", "sigma") else "steps",
+        phase1_sigma=float(phase1_sigma),
         pooling=pooling if pooling in POOLING else "subsample",
         halo=max(0, int(halo)),
         bridge_ratio=float(bridge_ratio),
@@ -654,11 +1157,11 @@ def apply_area_to_model(
 
     # GEOMETRY PRE-CHECK (schedule.py:39-48): the pooling ramp needs a common
     # divisor >= 2 of the patch grid to tile it exactly, and a grid with none
-    # would otherwise fail three steps into a sampling run.  Fail here, at
+    # would otherwise fail three steps into the sampling run.  Fail here, at
     # apply time, with the reference's actionable message.
     initial_factor(h, w, NATIVE_PATCHES)
 
-    _area_install_seam(m, dm)
+    _area_install_seam(m, dm, profile)
 
     previous_wrapper = None
     try:
@@ -666,39 +1169,67 @@ def apply_area_to_model(
     except AttributeError:  # probe: mock patchers without model_options
         previous_wrapper = getattr(m, "_unet_wrapper", None)
     m.set_model_unet_function_wrapper(
-        _make_area_unet_wrapper(_AreaRuntime(m._area_config, dm), previous_wrapper)
+        _make_area_unet_wrapper(_AreaRuntime(m._area_config, dm, profile), previous_wrapper)
     )
     logger.info(
-        "AReA: installed on a %dx%d patch grid (%dx%d px), phase1_steps=%d, pooling=%s, "
-        "halo=%d, bridge_ratio=%s, seed=%d",
-        w, h, width, height, m._area_config.phase1_steps, m._area_config.pooling,
-        m._area_config.halo, m._area_config.bridge_ratio, m._area_config.seed,
+        "AReA: installed on a %dx%d patch grid (%dx%d px) on the %s seam, "
+        "phase1_steps=%d (mode %s), pooling=%s, halo=%d, bridge_ratio=%s, seed=%d",
+        w, h, width, height, "Z-Image" if profile is ZIMAGE_PROFILE else "FLUX",
+        m._area_config.phase1_steps, m._area_config.phase1_mode,
+        m._area_config.pooling, m._area_config.halo, m._area_config.bridge_ratio,
+        m._area_config.seed,
     )
     return m
+
+
+def _release_seam(seam) -> None:
+    """Drop one consumer of a shared seam; restore the symbol on the last one.
+
+    Every handle the install registered is removed, and the bound symbol goes
+    back to the pristine function it was rebound from — `None` only when nothing
+    was ever installed (an install that raised before binding).
+    """
+    seam["consumers"] = max(0, seam["consumers"] - 1)
+    if seam["consumers"] > 0:
+        return
+    for handle in seam["hook"] or ():
+        try:
+            handle.remove()
+        except Exception:  # probe: handle already gone with its module
+            pass
+    if seam["orig"] is not None:
+        mod, attr, orig = seam["module"], seam["attr"], seam["orig"]
+        bound = getattr(mod, attr, None)
+        if bound is not orig and not getattr(bound, "_area_wrapper", False):
+            # neither our own wrapper nor the pristine symbol: something else
+            # rebound it while we were installed.
+            _warn_once(
+                "seam-rebound",
+                "AReA: %s.%s was rebound by something else since AReA installed "
+                "its hook; restoring the pristine symbol anyway.",
+                getattr(mod, "__name__", mod), attr,
+            )
+        if bound is not orig:
+            setattr(mod, attr, orig)
+    reset = {"module": None, "attr": None, "orig": None, "hook": None}
+    if "recorder" in seam:
+        # the Z-Image seam's rope capture; the FLUX twin has none to clear.
+        reset["recorder"] = None
+    seam.update(**reset)
 
 
 def restore_area_attention_hook(m) -> None:
     """Undo an AReA patch recorded on ``m`` (idempotent, consumer-aware).
 
-    The seam symbol and the ``img_in`` hook are shared by every patcher, so they
+    The seam symbol and the forward hooks are shared by every patcher, so they
     are restored only when the last consumer leaves — mirroring
-    ``src/spa.py:1485``.
+    ``src/spa.py:1485``.  FLUX and Z-Image have separate ref-counts, so the
+    patcher's own seam (``m._area_seam``) is the one released.
     """
     if not getattr(m, "_area_seam_consumer", False):
         m._area_config = None
         return
     m._area_seam_consumer = False
-    _SEAM["consumers"] = max(0, _SEAM["consumers"] - 1)
-    if _SEAM["consumers"] == 0:
-        handle, _SEAM["hook"] = _SEAM["hook"], None
-        if handle is not None:
-            try:
-                handle.remove()
-            except Exception:  # probe: handle already gone with its module
-                pass
-        if _SEAM["orig"] is not None:
-            mod, attr, orig = _SEAM["module"], _SEAM["attr"], _SEAM["orig"]
-            if getattr(mod, attr, None) is not orig:
-                setattr(mod, attr, orig)
-            _SEAM.update(module=None, attr=None, orig=None)
+    _release_seam(_ZSEAM if getattr(m, "_area_seam", None) == "zimage" else _SEAM)
+    m._area_seam = None
     m._area_config = None
