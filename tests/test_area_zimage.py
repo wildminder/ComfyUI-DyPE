@@ -28,6 +28,7 @@ import pytest
 import torch
 from nodes.area import AReA
 
+import src.area as area
 from src.area import PHASE1_STEPS
 from src.area_arch import (
     FLUX_PROFILE,
@@ -39,7 +40,6 @@ from src.area_attn import apply_rope1, pool_keys_values
 from src.area_zimage import (
     ZIMAGE_AXES,
     ZIMAGE_SIGMA_STAR,
-    ZImageJointLayout,
     ZImageRopeRecorder,
     coarse_ropes_zimage,
     sigma_prefix_count,
@@ -586,3 +586,113 @@ class TestPadPolicy:
         # a mismatched output pair is refused rather than mis-placed
         with pytest.raises(ValueError, match="do not match the Z-Image layout"):
             stitch_fine_zeros(out_text[:, :, :-1], out_image, layout)
+
+
+# ---------------------------------------------------------------------------
+# Phase-regime advisory (docs/2026-10-17-area-zimage-ripple-diagnosis.md)
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.unit
+class TestPhaseRegimeAdvisory:
+    """``_warn_regime``: warn once when Phase I floods a short distilled schedule.
+
+    The node default ``phase1_steps=8`` is the reference's FLUX constant *of 28*
+    (``src/area.py:144``).  Measured on Z-Image Turbo's 8-step schedule it makes
+    every step Phase I — pooled K/V everywhere, no fine windowed steps to restore
+    local detail, periodic ripple/mosaic + swirls (the I-Max Turbo failure class,
+    ``.dev/docs/2026-10-08-imax-zimage-guidance-bug.md``).  Advisory only: a
+    28-step FLUX schedule never trips it, and a large phase-1 share is the user's
+    choice, kept by the explicit knob (same discipline as I-Max's advisory).
+    """
+
+    def _warns(self):
+        return "area-regime" in area._warned
+
+    def test_short_schedule_all_coarse_warns_once(self):
+        area._warned.clear()
+        try:
+            area._warn_regime(8, 8, "coarse")
+            assert self._warns()
+            # warn-once: a second forward (same key set) adds nothing
+            area._warn_regime(8, 8, "coarse")
+            assert len(area._warned) == 1
+        finally:
+            area._warned.clear()
+
+    def test_short_schedule_phase1_2_does_not_warn(self):
+        area._warned.clear()
+        try:
+            area._warn_regime(8, 2, "coarse")
+            assert not self._warns()
+        finally:
+            area._warned.clear()
+
+    def test_long_schedule_default_does_not_warn(self):
+        area._warned.clear()
+        try:
+            # FLUX parity: the paper's 8-of-28 share on a long schedule is fine
+            area._warn_regime(28, 8, "coarse")
+            assert not self._warns()
+        finally:
+            area._warned.clear()
+
+    def test_plain_or_fine_phase_does_not_warn(self):
+        area._warned.clear()
+        try:
+            area._warn_regime(8, 8, "fine")
+            area._warn_regime(8, 8, None)
+            assert not self._warns()
+        finally:
+            area._warned.clear()
+
+    def test_warning_names_the_fix(self, caplog):
+        area._warned.clear()
+        try:
+            with caplog.at_level("WARNING", logger="ComfyUI-DyPE"):
+                area._warn_regime(8, 8, "coarse")
+            message = caplog.text
+            assert "8 of 8" in message and "short schedule" in message
+            assert "phase1_steps" in message and "sigma" in message
+        finally:
+            area._warned.clear()
+
+    def test_sigma_mode_short_schedule_below_threshold(self):
+        # sigma mode auto-selects a fine majority on the same 8-step table, so
+        # the advisory stays silent on the schedule-safe switch (theory.md:240-246)
+        area._warned.clear()
+        try:
+            sigmas = torch.tensor([1.0, 0.9474, 0.8824, 0.8, 0.6923, 0.5455, 0.3333])
+            count = sigma_prefix_count(sigmas, ZIMAGE_SIGMA_STAR)
+            assert count == 2
+            area._warn_regime(8, count, "coarse")
+            assert not self._warns()
+        finally:
+            area._warned.clear()
+
+    def test_resolve_forward_warns_on_short_schedule(self):
+        # Integration: the advisory fires from the real per-forward resolver, not
+        # only when called directly (pins the ``_area_resolve_forward`` wiring).
+        area._warned.clear()
+        rt = area._AreaRuntime(area.AreaConfig(phase1_steps=8), NextDiT(),
+                               ZIMAGE_PROFILE)
+        params = {
+            "input": torch.zeros(1, 16, 256, 256),       # 128x128 patch grid
+            "timestep": torch.tensor([1.0]),
+            "c": {
+                "c_crossattn": torch.zeros(1, 64, 64),
+                "transformer_options": {
+                    "sample_sigmas": torch.tensor(
+                        [1.0, 0.9474, 0.8824, 0.8, 0.6923, 0.5455, 0.3333, 0.0]),
+                    "sigmas": torch.tensor([1.0]),
+                },
+            },
+        }
+        try:
+            ctx = area._area_resolve_forward(rt, params)
+            assert ctx.phase == "coarse"
+            assert self._warns()
+        finally:
+            area._warned.clear()
+            area._AREA_RUNTIME = None
+            area._ZRUNTIME = None

@@ -966,6 +966,36 @@ def _area_img_in_hook(module, args, output):
     rt.hidden = output
 
 
+def _warn_regime(total: int, phase1: int, phase: Optional[str]) -> None:
+    """Warn once when Phase I would flood a short (distilled) schedule.
+
+    The node default (``phase1_steps=8``) is the reference's FLUX constant *of 28*.
+    On a short distilled schedule — Z-Image Turbo's 8-step samplers — it makes
+    EVERY step Phase I: pooled K/V everywhere, no fine windowed steps to restore
+    local detail, and the distilled model hallucinates around the loss (measured
+    2026-10-17: 8/8 coarse at 2048 px, periodic ripple/mosaic + swirls; see
+    ``docs/2026-10-17-area-zimage-ripple-diagnosis.md``).  Advisory only, no
+    behavior change: a 28-step FLUX schedule never trips it (``total > 12``
+    returns early), and a user who wants the flood keeps it by setting
+    ``phase1_steps`` explicitly — the same discipline as I-Max's z-image
+    schedule advisory (``src/imax.py:311-349``).
+    """
+    if phase != "coarse" or total <= 0 or total > 12:
+        return
+    if phase1 * 3 <= total:  # up to a third of the steps coarse: the paper's share
+        return
+    _warn_once(
+        "area-regime",
+        "AReA: %d of %d denoising steps run Phase I (coarse pooled attention) on "
+        "a short schedule — a distilled Turbo sampler cannot re-detail after "
+        "pooled keys, which shows as periodic ripple/mosaic artifacts. Set "
+        "phase1_steps to 1-3, or phase1_mode to 'sigma', to give this run a fine "
+        "(windowed) majority. (8 of 28 is the FLUX paper constant, not a Z-Image "
+        "one.)",
+        phase1, total,
+    )
+
+
 def _area_resolve_forward(rt: _AreaRuntime, params: dict) -> AreaContext:
     """Resolve one forward's step, geometry, ropes and phase into a context."""
     ctx = AreaContext()
@@ -994,8 +1024,10 @@ def _area_resolve_forward(rt: _AreaRuntime, params: dict) -> AreaContext:
     step, total = _area_locate(opts.get("sample_sigmas"), opts.get("sigmas"))
     if step is None or max(h, w) <= rt.config.native:
         return ctx  # at/below the native extent AReA is a provable no-op
-    phase, size = _area_schedule(rt, h, w, total, _phase1_count(rt, opts), ctx.txt_len).at(step)
+    phase1 = _phase1_count(rt, opts)
+    phase, size = _area_schedule(rt, h, w, total, phase1, ctx.txt_len).at(step)
     ctx.phase, ctx.size, ctx.step, ctx.h, ctx.w = phase, size, step, h, w
+    _warn_regime(total, phase1, phase)
     if phase == "coarse" and rt.profile is not ZIMAGE_PROFILE:
         # FLUX resolves its coarse tables here; the Z-Image ones need the model's
         # own rope groups, which only exist once the forward has run its embed,

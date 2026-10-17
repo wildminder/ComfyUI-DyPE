@@ -111,7 +111,7 @@ class AReA(io.ComfyNode):
                 io.Int.Input(
                     "phase1_steps",
                     default=PHASE1_STEPS, min=0, max=100, step=1,
-                    tooltip="Number of leading denoising steps that run Phase I (coarse cross-scale attention), clamped to the total step count. 8 = the reference's FLUX constant (of 28). 0 = all Phase II (windowed attention from the first step). Only read when phase1_mode is 'steps'.",
+                    tooltip="Number of leading denoising steps that run Phase I (coarse cross-scale attention), clamped to the total step count. 8 = the reference's FLUX constant (of 28). 0 = all Phase II (windowed attention from the first step). Only read when phase1_mode is 'steps'. Z-Image Turbo runs short (8-step) schedules: use 1-3 there (or sigma mode) — 8 of an 8-step run pools every step, which the distilled sampler cannot re-detail.",
                 ),
                 io.Combo.Input(
                     "phase1_mode",
