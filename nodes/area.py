@@ -146,7 +146,7 @@ class AReA(io.ComfyNode):
                 io.Int.Input(
                     "bridge_floor_steps",
                     default=2, min=0, max=16, step=1,
-                    tooltip="How many leading Phase II steps keep the paper's full bridge (R = round(rho*w)^2) and the full halo instead of the cost-capped ones. On short schedules (12 total steps or fewer) the cost cap starves the bridge exactly on the composition-critical steps, so those steps are exempted here; a 28-step FLUX run is never floored (long schedules ignore this knob). 0 = the cost cap on every step. The exemption costs ~1.25-1.45x full attention per floored step, and warns once naming the multiplier.",
+                    tooltip="How many leading Phase II steps keep the paper's full bridge (R = round(rho*w)^2) and the full halo instead of the cost-capped ones. On short schedules (12 total steps or fewer) the cost cap starves the bridge exactly on the composition-critical steps, so those steps are exempted here; a 28-step FLUX run is never floored (long schedules ignore this knob). 0 = the cost cap on every step. The exemption costs about 1.0-1.4x full attention per floored step (measured 1.25x-1.41x on the 2048px Turbo schedule), and warns once naming the multiplier.",
                 ),
                 io.Int.Input(
                     "window_start",
