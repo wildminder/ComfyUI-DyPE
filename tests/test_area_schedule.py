@@ -41,6 +41,7 @@ import torch
 from src.area_schedule import (
     DEDUPE_COVER,
     F_MIN,
+    SHORT_SCHEDULE_TOTAL,
     AreaSchedule,
     Window,
     _cover,
@@ -51,6 +52,7 @@ from src.area_schedule import (
     even_starts,
     grid_divisors,
     initial_factor,
+    is_short_schedule,
     pooling_ramp,
     ring_size,
     start_window,
@@ -308,6 +310,102 @@ class TestWindowSizesCaveat:
         assert window_step_cost(68, 100, forced, 0) > cap
         assert forced in sched.windows
         assert list(sched.windows) == sorted(sched.windows, reverse=True)
+
+
+@pytest.mark.unit
+class TestShortScheduleGate:
+    """``SHORT_SCHEDULE_TOTAL`` / :func:`is_short_schedule`: the one definition of
+    "short schedule" every short-schedule rule in the engine gates on."""
+
+    def test_boundary_of_the_predicate(self):
+        assert SHORT_SCHEDULE_TOTAL == 12
+        # 0 and negatives are NOT short: they carry no steps to be short on
+        assert is_short_schedule(0) is False
+        assert is_short_schedule(-3) is False
+        for total in range(1, SHORT_SCHEDULE_TOTAL + 1):
+            assert is_short_schedule(total) is True
+        assert is_short_schedule(SHORT_SCHEDULE_TOTAL + 1) is False
+        assert is_short_schedule(28) is False            # the FLUX default
+
+
+@pytest.mark.unit
+class TestWindowStartOverride:
+    """A4: ``window_start`` — Phase II begins at a chosen side, not Eq. 8's.
+
+    "Strictly decreasing" is the roomy-regime guarantee: it holds whenever the
+    override leaves at least ``fine_steps - 1`` rungs of room between itself and
+    ``w_min`` (each rung's admissible lower bound is distinct), and degrades to
+    non-increasing in the cramped regime exactly as the un-overridden ramp does.
+    """
+
+    def _fine(self, **kwargs):
+        """The fine window tuple of a 5-fine-step 128 grid schedule."""
+        return list(build_schedule(128, 128, 8, 3, NATIVE, **kwargs).windows)
+
+    @pytest.mark.parametrize("override", [96, 80])
+    @pytest.mark.parametrize("txt_len", [0, TEXT])
+    def test_override_strictly_decreases_to_w_min(self, override, txt_len):
+        sizes = self._fine(txt_len=txt_len, window_start=override)
+        assert sizes[0] == override                        # the override leads
+        assert all(b < a for a, b in zip(sizes, sizes[1:]))   # strictly decreasing
+        assert sizes[-1] == NATIVE                         # ... and ends at w_min
+        # the override really changed the ramp, it is not a no-op
+        assert sizes != self._fine(txt_len=txt_len)
+
+    def test_override_is_clamped_into_the_grid(self):
+        # above the extent: one full-grid window per fine step
+        assert self._fine(window_start=4096)[0] == 128
+        # below w_min: clamped UP to w_min, never under it
+        assert self._fine(window_start=1)[0] == NATIVE
+
+    def test_override_is_ignored_on_a_long_schedule(self):
+        """A4's knobs are short-schedule geometry; a 28-step run keeps Eq. 8."""
+        plain = build_schedule(128, 128, 28, 3, NATIVE)
+        overridden = build_schedule(128, 128, 28, 3, NATIVE,
+                                    window_start=96, window_hold_steps=2)
+        assert overridden.factors == plain.factors
+        assert overridden.windows == plain.windows
+        assert plain.windows[0] == start_window(128, 128, 64, 0) == 90
+
+
+@pytest.mark.unit
+class TestWindowHoldSteps:
+    """A4: ``hold`` repeats the start rung, clamped so the ramp still runs."""
+
+    def _fine(self, **kwargs):
+        return list(build_schedule(128, 128, 8, 3, NATIVE, **kwargs).windows)
+
+    @pytest.mark.parametrize("hold", [1, 2])
+    def test_hold_repeats_the_start_rung(self, hold):
+        sizes = self._fine(window_hold_steps=hold)
+        assert len(sizes) == 5                              # the total is preserved
+        assert sizes[:hold + 1] == [sizes[0]] * (hold + 1)  # k extra + the rung itself
+        assert sizes[-1] == NATIVE                          # the ramp still lands on w_min
+        # the held head IS the un-held schedule's start rung
+        assert sizes[0] == self._fine()[0]
+
+    def test_hold_is_clamped_to_two_rungs_of_ramp(self):
+        sizes = self._fine(window_hold_steps=99)
+        assert len(sizes) == 5
+        assert sizes[:4] == [sizes[0]] * 4                  # clamped to steps - 2
+        assert sizes[4] == NATIVE
+        # the clamp is the documented one: [0, max(0, steps - 2)]
+        assert window_sizes(128, 128, 5, 90, 64, 0, 99) == [90] * 3 + window_sizes(128, 128, 2, 90, 64, 0)
+        assert window_sizes(128, 128, 5, 90, 64, 0, -4) == window_sizes(128, 128, 5, 90, 64, 0)
+        # a two-rung schedule cannot hold at all (steps - 2 == 0)
+        assert window_sizes(128, 128, 2, 90, 64, 0, 1) == [90, 64]
+
+    @pytest.mark.parametrize("phase1,txt_len", list(itertools.product((0, 1, 3), (0, 64, 288))))
+    def test_zero_knobs_reproduce_the_current_tuples(self, phase1, txt_len):
+        """Byte-identical: explicit zeros and the historical call are one thing."""
+        plain = build_schedule(128, 128, 8, phase1, NATIVE, txt_len=txt_len)
+        zeroed = build_schedule(128, 128, 8, phase1, NATIVE, txt_len=txt_len,
+                                window_start=0, window_hold_steps=0)
+        assert zeroed.factors == plain.factors
+        assert zeroed.windows == plain.windows
+        # ... and so is a NEGATIVE window_start (the "unset" spelling)
+        assert (build_schedule(128, 128, 8, phase1, NATIVE, txt_len=txt_len,
+                               window_start=-1).windows == plain.windows)
 
 
 @pytest.mark.unit

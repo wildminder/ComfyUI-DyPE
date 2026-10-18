@@ -31,6 +31,10 @@ Deviations from the reference, all deliberate and pinned by
   the caller (``src/area.py``) owns that gate, mirroring the reference's
   ``Backbone.schedule`` (``backbones/base.py:59-68``).  A native-size grid still
   builds a well-formed schedule here (one full-grid window per fine step).
+* :func:`build_schedule` takes ``window_start`` / ``window_hold_steps``
+  short-schedule geometry overrides and :func:`window_sizes` a ``hold`` rung —
+  both absent from the reference, both ignored (zeroed) on a long schedule, so
+  the FLUX default stays byte-identical.
 """
 from __future__ import annotations
 
@@ -43,6 +47,12 @@ import torch
 
 F_MIN = 2          # Eq. 4: Phase I never pools past 2x2 blocks
 DEDUPE_COVER = 0.8  # Appendix C: split windows covering each other by this much merge
+
+#: A run is a SHORT (distilled) schedule when its total step count sits at or below
+#: this.  The paper calibrated on 28 steps; Turbo-class samplers run 8, where the
+#: same constants mean something else (the regime advisory and the Phase II bridge
+#: floor both key on this one definition, so the two gates can never disagree).
+SHORT_SCHEDULE_TOTAL = 12
 
 
 # ---------------------------------------------------------------------------
@@ -216,6 +226,17 @@ def start_window(h: int, w: int, lo: int, txt_len: int = 0) -> int:
     return lo
 
 
+def is_short_schedule(total: int) -> bool:
+    """Whether ``total`` denoising steps is a short (distilled) schedule.
+
+    The paper's calibration is a 28-step FLUX run; Z-Image Turbo's 8-step table is
+    a different regime, and every "short schedule" rule in the engine (the Phase I
+    regime advisory, the Phase II bridge floor and the short-schedule geometry
+    overrides) gates on this one predicate so they cannot disagree.
+    """
+    return 0 < int(total) <= SHORT_SCHEDULE_TOTAL
+
+
 def _geometric_sizes(steps: int, start: int, floor: int) -> list[int]:
     if steps == 1:
         return [start]
@@ -227,11 +248,24 @@ def _geometric_sizes(steps: int, start: int, floor: int) -> list[int]:
     return sizes
 
 
-def window_sizes(h: int, w: int, steps: int, start: int, floor: int, txt_len: int = 0) -> list[int]:
+def window_sizes(h: int, w: int, steps: int, start: int, floor: int, txt_len: int = 0,
+                 hold: int = 0) -> list[int]:
     """Eqs. 10 and 11: geometric shrink from w_start to w_min, each rung snapped down so it
-    never costs more than the first one and sizes strictly decrease."""
+    never costs more than the first one and sizes strictly decrease.
+
+    ``hold`` repeats the START rung ``hold`` extra times before the ramp shrinks
+    (clamped so the shortened ramp still spans at least two rungs, and never
+    negative).  On a short schedule the leading fine steps are the
+    composition-critical ones, so a start-heavy ramp hands them the budget the
+    20-step geometric ramp would have spread over the whole phase
+    (``docs/2026-10-18-area-zimage-adaptation-research.md`` §4-A4).  ``hold=0``
+    reproduces the reference's ramp exactly.
+    """
     if steps <= 0:
         return []
+    hold = max(0, min(int(hold), max(0, steps - 2)))
+    if hold:
+        return [start] * hold + window_sizes(h, w, steps - hold, start, floor, txt_len)
     ideal = _geometric_sizes(steps, start, floor)
     if start - floor < steps - 1:
         return ideal
@@ -286,7 +320,7 @@ class AreaSchedule:
 
 def build_schedule(
     h: int, w: int, steps: int, phase1_steps: int, native: int, w_min: int | None = None,
-    txt_len: int = 0,
+    txt_len: int = 0, window_start: int = 0, window_hold_steps: int = 0,
 ) -> AreaSchedule:
     """Schedule for an ``h x w`` patch grid over ``steps`` denoising steps.
 
@@ -294,6 +328,13 @@ def build_schedule(
     same way, and 0 means "all Phase II"), ``w_min`` defaults to the native
     extent, and the Phase I/II handoff is the pooled grid the last ramp rung
     leaves behind (``extent // f_last``) — Phase II never starts below it.
+
+    ``window_start`` / ``window_hold_steps`` are the short-schedule Phase II
+    geometry overrides (§4-A4 of the adaptation research): a start side to begin
+    the ramp at instead of Eq. 8's cost-optimal one (``0`` = Eq. 8, clamped into
+    ``[w_min, extent]``) and extra steps to hold that first side.  Both are gated
+    on :func:`is_short_schedule` — on a long schedule the Eq. 8 start is the
+    calibrated choice and the two knobs are ignored (zeroed) rather than applied.
     """
     phase1_steps = max(0, min(int(phase1_steps), int(steps)))
     extent = max(h, w)
@@ -304,5 +345,12 @@ def build_schedule(
     if phase2_steps:
         handoff = extent // (factors[-1] if factors else 1)
         lo = max(w_min, min(handoff, extent))
-        windows = window_sizes(h, w, phase2_steps, start_window(h, w, lo, txt_len), w_min, txt_len)
+        if not is_short_schedule(steps):
+            # The overrides are a property of SHORT schedules only: a long ramp
+            # already starts where the geometry paper calibrated it, so the two
+            # knobs are ignored there (never applied, never clamped away).
+            window_start, window_hold_steps = 0, 0
+        start = (start_window(h, w, lo, txt_len) if int(window_start) <= 0
+                 else min(max(int(window_start), w_min), extent))
+        windows = window_sizes(h, w, phase2_steps, start, w_min, txt_len, window_hold_steps)
     return AreaSchedule((h, w), tuple(factors), tuple(windows))
