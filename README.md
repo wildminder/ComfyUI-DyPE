@@ -397,7 +397,7 @@ Window sizes and the bridge/Halo budget are chosen to keep a windowed step at or
 
 **Z-Image:** same node, `model_type: auto` detects it. Turbo schedules are short (8 steps) — pick `phase1_steps` 1-3 or `phase1_mode: sigma`; the node warns when pooling would flood the run.
 
-**Bootstrap (paper Appendix F, any arch):** when you want the structure of a full-resolution run without the pooled footprint, skip Phase I: sample the coarse steps at the native 1024 px, upscale the **latent** ×2 (no VAE round trip), re-noise to `phase1_sigma` (0.89), then sample the target resolution with `AReA` in `phase1_mode: bootstrap` — windowed attention only, entering at the handover level (the node warns if the sampler enters elsewhere).
+**Bootstrap (paper Appendix F) — experimental, not yet GPU-validated:** `phase1_mode: bootstrap` itself is ready (it runs Phase II only, and the entry-sigma check warns when a sampler enters off-level), but the two-sampler *construction* — native 1024 pass, latent ×2 upscale, re-noise to `phase1_sigma`, then the target pass — currently produces corrupted output on Z-Image Turbo's 8-step schedule (the pre-pass is under-denoised at the handover level and five windowed steps cannot finish it). Do not use the recipe until it validates; the validated Z-Image knobs remain `phase1_steps` 1-3 or `sigma` mode.
 
 <details>
 <summary><b>Inputs & Parameters</b></summary>
