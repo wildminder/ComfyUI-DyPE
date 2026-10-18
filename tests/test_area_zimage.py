@@ -737,3 +737,38 @@ class TestBootstrapMode:
         for mode, kw in (("steps", {}), ("sigma", {"phase1_sigma": 0.5})):
             area._phase1_count(self._runtime(phase1_mode=mode, **kw), {})
         assert "area-bootstrap-steps" not in area._warned
+
+
+@pytest.mark.unit
+class TestBootstrapEntrySigma:
+    """B2: bootstrap Phase II must enter at the re-noise level (Appendix F)."""
+
+    def _run(self, monkeypatch, first_sigma, mode="bootstrap", sigma=0.89):
+        import torch as _t
+        rt = area._AreaRuntime(
+            area.AreaConfig(phase1_steps=8, phase1_mode=mode, phase1_sigma=sigma),
+            NextDiT(), ZIMAGE_PROFILE)
+        # a 2048 px canvas: 128x128 grid, past the native 64-token extent
+        table = _t.tensor([first_sigma] + [0.5] * 7)
+        params = {
+            "input": _t.zeros(1, 16, 256, 256),
+            "timestep": _t.tensor([float(first_sigma)]),
+            "c": {"c_crossattn": _t.zeros(1, 64, 77),
+                  "transformer_options": {"sample_sigmas": table,
+                                          "sigmas": table[0]}},
+        }
+        return area._area_resolve_forward(rt, params)
+
+    def test_entry_far_from_sigma_star_warns(self):
+        self._run(None, 0.60)
+        assert "zimage-bootstrap-entry" in area._warned
+
+    def test_entry_at_sigma_star_is_silent(self):
+        area._warned.clear()
+        self._run(None, 0.89)
+        assert "zimage-bootstrap-entry" not in area._warned
+
+    def test_other_modes_never_check_the_entry(self):
+        area._warned.clear()
+        self._run(None, 0.60, mode="steps")
+        assert "zimage-bootstrap-entry" not in area._warned

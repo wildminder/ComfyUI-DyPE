@@ -1088,6 +1088,26 @@ def _area_resolve_forward(rt: _AreaRuntime, params: dict) -> AreaContext:
     phase, size = _area_schedule(rt, h, w, total, phase1, ctx.txt_len).at(step)
     ctx.phase, ctx.size, ctx.step, ctx.h, ctx.w = phase, size, step, h, w
     _warn_regime(total, phase1, phase)
+    if step == 0 and rt.config.phase1_mode == "bootstrap" and phase == "fine":
+        # Appendix F: Phase II must ENTER at the re-noise level the native
+        # pre-pass handed over (sigma_star), so check the sampler's own table
+        # against phase1_sigma and say so once when the graph re-uses a table
+        # that enters somewhere else.
+        table = opts.get("sample_sigmas")
+        if torch.is_tensor(table) and table.numel():
+            first = float(table.detach().float().flatten().cpu()[0])
+            if abs(first - rt.config.phase1_sigma) > 0.05:
+                _warn_once(
+                    "zimage-bootstrap-entry",
+                    "AReA: bootstrap mode runs Phase II from the first step, "
+                    "but this sampler enters at sigma %.2f while phase1_sigma "
+                    "is %.2f — the native-resolution pre-pass must hand the "
+                    "latent over re-noised to sigma_star (plan 2026-10-18-area-"
+                    "zimage-bootstrap, step B2), or this run starts windowed "
+                    "attention on a canvas composed for a different noise "
+                    "level.",
+                    first, rt.config.phase1_sigma,
+                )
     if phase == "coarse" and rt.profile is not ZIMAGE_PROFILE:
         # FLUX resolves its coarse tables here; the Z-Image ones need the model's
         # own rope groups, which only exist once the forward has run its embed,
