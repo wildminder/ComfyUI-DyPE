@@ -58,7 +58,7 @@ Training-free methods that push pre-trained DiT models far beyond their native r
 | **❖ [FreeScale](#user-content-freescale)** | Tuning-free self-cascade upscaling. |
 | **❖ [HiFlow](#user-content-hiflow)** | Trajectory-guided flow upscaling for rectified-flow models (FLUX, Qwen-Image, Krea2, Z-Image, …). |
 | **❖ [I-Max](#user-content-imax)** | Dual-pass resolution extrapolation for FLUX and Z-Image — a native-resolution pass guides the target pass. |
-| **❖ [AReA](#user-content-area)** | Two-phase attention replacement for FLUX — coarse cross-scale attention, then detail-map-guided windows. |
+| **❖ [AReA](#user-content-area)** | Two-phase attention replacement for FLUX / Z-Image — coarse cross-scale attention, then detail-map-guided windows. |
 
 ### Which method when?
 
@@ -74,7 +74,7 @@ Two families: **model patches** alter how your own KSampler run attends (no imag
 | **FreeScale** | FLUX-family DiTs | Scale-fused attention + self-cascade | ✓ | Regenerative hi-res, mostly new content |
 | **HiFlow** | Flow models (FLUX, Qwen-Image, Krea2, Z-Image, …) | Time-matched reference trajectory guidance | ✓ | Structure-faithful flow upscale |
 | **I-Max** | FLUX, Z-Image | Dual-pass Projected-Flow guidance (low-res pass → target pass) | ✗ | Native high-res generation |
-| **AReA** | FLUX | Two-phase attention replacement (pooled cross-scale → DWT-guided windows) | ✗ | Native high-res generation |
+| **AReA** | FLUX, Z-Image | Two-phase attention replacement (pooled cross-scale → DWT-guided windows) | ✗ | Native high-res generation |
 
 > [!TIP]
 > **Quick picker:** starting from noise → DyPE (or SEGA), add SPA if you see repeated/collapsed structures, add HAP for speed. Starting from an existing image → PixelRush to keep it faithful, FreeScale to re-imagine it at high res (lower its `noise_timestep` for more fidelity), HiFlow for FLUX-family flow models — it reuses the whole base-resolution denoising trajectory as guidance, so structure survives while detail is re-synthesized. For FLUX or Z-Image at 2K+ from noise, **I-Max** is the dual-pass alternative — it runs its own low-resolution guidance pass instead of patching the sampler. For FLUX, **AReA** takes the other road: it replaces image self-attention itself, so it layers on top of (not instead of) DyPE/SEGA positioning.
@@ -91,7 +91,7 @@ Two families: **model patches** alter how your own KSampler run attends (no imag
 
 \* **Z-Image only** (new in v2.19.0) — Anima/Cosmos are not supported by I-Max. The Z-Image wiring skips the FLUX-specific extras: text duplication is ignored (Lumina-Next uses cross-attention) and `guidance_low`/`guidance_high` apply to FLUX only. See the [I-Max section](#user-content-imax).
 
-\* **AReA** — FLUX only, and not Nunchaku: its quantized/fused attention kernels bypass the attention seam, so the node warns and returns the model unchanged. See the [AReA section](#user-content-area).
+\* **AReA** — FLUX and Z-Image, and not Nunchaku: its quantized/fused attention kernels bypass the attention seam, so the node warns and returns the model unchanged. See the [AReA section](#user-content-area).
 
 **Qwen-Image 2.1 notes**
 
@@ -386,7 +386,7 @@ Tuning-free resolution extrapolation for **FLUX and Z-Image** ([paper](https://a
 <a id="user-content-area"></a>
 ### ❖ AReA
 
-Training-free two-phase replacement of FLUX image self-attention ([arXiv 2610.17227](https://arxiv.org/abs/2610.17227)). Instead of one dense attention over the whole canvas, the denoising run gets a **time-dependent attention graph** that follows the coarse-to-fine shape of sampling itself:
+Training-free two-phase replacement of FLUX / Z-Image image self-attention ([arXiv 2610.17227](https://arxiv.org/abs/2610.17227)). Instead of one dense attention over the whole canvas, the denoising run gets a **time-dependent attention graph** that follows the coarse-to-fine shape of sampling itself:
 
 * **Phase I (coarse).** The first `phase1_steps` steps pool image keys/values to one token per `f x f` block (`f` ramps `f₀ → 2` over the phase) and run cross-scale attention on the pooled position grid, while the queries stay at full resolution. Keys are pooled **before** the position rotation, so the pooled tokens live in the query's frame.
 * **Phase II (fine).** The remaining steps run windowed attention: the window sizes come from the image's **Haar-DWT detail map** (smooth tiles split into quadrants), each window is widened by a **Halo** ring whose four sides draw their own width in `[0, halo]` — and each row/column its own reach — at every step, and each also attends a **bridge** of `round(rho·w)²` of the canvas's most distinctive unrotated keys spread over an 8×8 cell grid. Overlapping windows merge with centre-weighted (raised-cosine) blending.
@@ -404,7 +404,7 @@ Window sizes and the bridge/Halo budget are chosen to keep a windowed step at or
 
 | Parameter | Default | Description |
 |:---|:---|:---|
-| `model_type` | auto | Architecture detection (`auto` / `flux`). **FLUX only** in v1 — other architectures are refused with an actionable error. |
+| `model_type` | auto | Architecture detection (`auto` / `flux` / `zimage`); a mismatch with the loaded model is refused with an actionable error. |
 | `width` / `height` | 2048 | Target resolution (multiples of 16). These decide the apply-time checks — the native-extent no-op and the geometry pre-check — so keep them in step with your latent; at each forward AReA re-derives the patch grid from the latent itself and validates the token count against its schedule. |
 | `phase1_mode` | steps | `steps` (the leading `phase1_steps` steps pool) / `sigma` (the switch follows the schedule) / `bootstrap` (no Phase I at all — the paper's Appendix F recipe, see below). |
 | `phase1_steps` | 8 | Phase I length when the mode is `steps`; 8 = the FLUX constant of 28. On Z-Image Turbo's short schedules use 1-3 (or `sigma`) — the node warns when pooling would flood the run. |
