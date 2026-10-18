@@ -318,7 +318,9 @@ class TestAReASchema:
         inputs = {i.name: i for i in schema.inputs}
         assert list(inputs) == ["model", "width", "height", "model_type", "enable_area",
                                 "phase1_steps", "phase1_mode", "phase1_sigma",
-                                "pooling", "halo", "bridge_ratio", "seed"]
+                                "pooling", "halo", "bridge_ratio",
+                                "bridge_floor_steps", "window_start",
+                                "window_hold_steps", "seed"]
         assert inputs["model_type"].kwargs["options"] == ["auto", "flux", "zimage"]
         assert inputs["phase1_steps"].kwargs["default"] == PHASE1      # backbones/flux.py:16
         assert inputs["pooling"].kwargs["options"] == ["subsample", "mean", "medoid", "random"]
@@ -331,6 +333,51 @@ class TestAReASchema:
         assert inputs["phase1_mode"].kwargs["options"] == ["steps", "sigma", "bootstrap"]
         assert inputs["phase1_mode"].kwargs["default"] == "steps"
         assert inputs["phase1_sigma"].kwargs["default"] == 0.89
+
+    def test_short_schedule_inputs_match_the_floor_design(self):
+        """The three A1/A4 knobs: names, defaults and widget ranges."""
+        inputs = {i.name: i for i in AReA.define_schema().inputs}
+        assert inputs["bridge_floor_steps"].kwargs["default"] == 2
+        assert (inputs["bridge_floor_steps"].kwargs["min"],
+                inputs["bridge_floor_steps"].kwargs["max"]) == (0, 16)
+        assert inputs["window_start"].kwargs["default"] == 0
+        assert (inputs["window_start"].kwargs["min"],
+                inputs["window_start"].kwargs["max"]) == (0, 1024)
+        assert inputs["window_hold_steps"].kwargs["default"] == 0
+        assert (inputs["window_hold_steps"].kwargs["min"],
+                inputs["window_hold_steps"].kwargs["max"]) == (0, 8)
+        # appended after bridge_ratio, before seed (schema order, not just names)
+        assert list(inputs).index("bridge_floor_steps") == list(inputs).index("bridge_ratio") + 1
+        assert list(inputs).index("window_start") == list(inputs).index("bridge_ratio") + 2
+        assert list(inputs).index("window_hold_steps") == list(inputs).index("bridge_ratio") + 3
+        assert list(inputs).index("seed") == list(inputs).index("bridge_ratio") + 4
+        # each tooltip names its gate (short schedules only) and the exemption
+        for name in ("bridge_floor_steps", "window_start", "window_hold_steps"):
+            assert "short schedule" in inputs[name].kwargs["tooltip"].lower()
+        assert "cost" in inputs["bridge_floor_steps"].kwargs["tooltip"].lower()
+
+    def test_execute_forwards_the_short_schedule_knobs(self, flux_layers):
+        """The three knobs reach the engine, clamped exactly as halo's are."""
+        out = AReA.execute(mock_flux_model(), WIDTH, HEIGHT, "flux", True,
+                           phase1_steps=3, halo=4, bridge_ratio=0.25,
+                           bridge_floor_steps=3, window_start=96,
+                           window_hold_steps=2, seed=5)
+        cfg = out[0]._area_config
+        assert cfg.bridge_floor_steps == 3
+        assert cfg.window_start == 96
+        assert cfg.window_hold_steps == 2
+        assert cfg.halo == 4                           # the neighbours still flow
+        assert cfg.bridge_ratio == 0.25
+        assert cfg.seed == 5
+        restore_area_attention_hook(out[0])
+        # out-of-range widget values are clamped by the engine, not lost
+        wide_model = AReA.execute(mock_flux_model(), WIDTH, HEIGHT, "flux", True,
+                                  bridge_floor_steps=99, window_start=-5,
+                                  window_hold_steps=40)[0]
+        wide = wide_model._area_config
+        assert (wide.bridge_floor_steps, wide.window_start,
+                wide.window_hold_steps) == (16, 0, 8)
+        restore_area_attention_hook(wide_model)
 
     def test_outputs_patched_model(self):
         schema = AReA.define_schema()

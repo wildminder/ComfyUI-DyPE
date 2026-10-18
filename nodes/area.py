@@ -70,7 +70,10 @@ class AReA(io.ComfyNode):
     pair serves either.  ``phase1_mode`` picks how the Phase I -> Phase II
     switch is expressed: the leading ``steps`` (the reference's constant) or
     the leading steps whose noise level is still at or above
-    ``phase1_sigma``.
+    ``phase1_sigma``.  Three knobs tune short (distilled) schedules only and are
+    ignored on a long one: ``bridge_floor_steps`` exempts the leading fine steps
+    from the cost cap (they keep the paper's full bridge and halo),
+    ``window_start`` / ``window_hold_steps`` reshape the window ramp.
     """
 
     @classmethod
@@ -141,6 +144,21 @@ class AReA(io.ComfyNode):
                     tooltip="Rho of the bridge: each Phase II window also attends to R = round(rho * w)^2 of the canvas's most distinctive unrotated keys, spread over an 8x8 cell grid so no region is starved. 0 = no bridge.",
                 ),
                 io.Int.Input(
+                    "bridge_floor_steps",
+                    default=2, min=0, max=16, step=1,
+                    tooltip="How many leading Phase II steps keep the paper's full bridge (R = round(rho*w)^2) and the full halo instead of the cost-capped ones. On short schedules (12 total steps or fewer) the cost cap starves the bridge exactly on the composition-critical steps, so those steps are exempted here; a 28-step FLUX run is never floored (long schedules ignore this knob). 0 = the cost cap on every step. The exemption costs ~1.25-1.45x full attention per floored step, and warns once naming the multiplier.",
+                ),
+                io.Int.Input(
+                    "window_start",
+                    default=0, min=0, max=1024, step=1,
+                    tooltip="Window side (patches) Phase II starts its ramp at, instead of the cost-optimal size — smaller gives the early windows more global context. Short schedules only: a long (28-step) schedule ignores this knob. 0 = the cost-optimal start, which is clamped into [w_min, grid]; the ramp still shrinks to w_min.",
+                ),
+                io.Int.Input(
+                    "window_hold_steps",
+                    default=0, min=0, max=8, step=1,
+                    tooltip="Extra Phase II steps that hold the start window before the ramp shrinks it (a start-heavy ramp for short schedules). Short schedules only: a long (28-step) schedule ignores this knob.",
+                ),
+                io.Int.Input(
                     "seed",
                     default=0, min=0, max=0xFFFFFFFFFFFFFFFF, step=1,
                     tooltip="Seed of every draw (tile placement, Halo widths and reaches, random pooling). Keyed by (seed, step), so the same seed and step always build the same windows and halos — and cond and uncond attend through identical graphs. No global RNG is read.",
@@ -169,7 +187,7 @@ class AReA(io.ComfyNode):
         return validate_resolution(width, height)
 
     @classmethod
-    def execute(cls, model, width: int, height: int, model_type: str, enable_area: bool, phase1_steps: int = PHASE1_STEPS, pooling: str = "subsample", halo: int = 8, bridge_ratio: float = 0.5, seed: int = 0, phase1_mode: str = "steps", phase1_sigma: float = ZIMAGE_SIGMA_STAR) -> io.NodeOutput:
+    def execute(cls, model, width: int, height: int, model_type: str, enable_area: bool, phase1_steps: int = PHASE1_STEPS, pooling: str = "subsample", halo: int = 8, bridge_ratio: float = 0.5, bridge_floor_steps: int = 2, window_start: int = 0, window_hold_steps: int = 0, seed: int = 0, phase1_mode: str = "steps", phase1_sigma: float = ZIMAGE_SIGMA_STAR) -> io.NodeOutput:
         # Fallback for unlinked/None inputs
         width = 2048 if width is None else int(width)
         height = 2048 if height is None else int(height)
@@ -181,6 +199,9 @@ class AReA(io.ComfyNode):
             pooling=str(pooling),
             halo=int(halo),
             bridge_ratio=float(bridge_ratio),
+            bridge_floor_steps=int(bridge_floor_steps),
+            window_start=int(window_start),
+            window_hold_steps=int(window_hold_steps),
             seed=int(seed),
             **_phase1_switch_kwargs(phase1_mode, phase1_sigma),
         )
