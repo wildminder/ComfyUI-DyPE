@@ -831,26 +831,41 @@ def _zimage_refiner_handles(refiner) -> tuple:
     hooks do.  A refiner that is a plain module (not a container) is its own
     target, and a container with no hookable children yields nothing so the
     caller can warn instead of staying silent.
+
+    The FIRST hookable layer is tagged ``_area_refiner_entry``: the Phase II
+    detail map's input is that layer's INPUT — the image embedding that enters
+    refinement, the faithful Z-Image analogue of the reference's
+    ``x_embedder`` (``backbones/flux.py:111-114,150-163``) — so the hook
+    captures from the tagged module and only that one.
     """
     if refiner is None:
         return ()
-    layers = list(refiner.children()) or [refiner]
-    return tuple(
-        layer.register_forward_hook(_zimage_refiner_hook)
-        for layer in layers
+    layers = [
+        layer for layer in (list(refiner.children()) or [refiner])
         if hasattr(layer, "register_forward_hook")
-    )
+    ]
+    if layers:
+        # The same module object is the first layer every forward calls, so the
+        # tag identifies it per forward — no ordering re-discovery inside the
+        # hook, no mutable global counter.
+        layers[0]._area_refiner_entry = True
+    return tuple(layer.register_forward_hook(_zimage_refiner_hook) for layer in layers)
 
 
 def _zimage_refiner_hook(module, args, output):
     """Close the rope window, and capture the Phase II detail-map input.
 
-    Firing here — after ``embed_all``'s two rope groups and after both refiner
-    passes, immediately before the joint layer loop
-    (``comfy/ldm/lumina/model.py:815-822,880-881``) — is the plan's arming window.
-    The output is also the Phase II layout input: the image block alone,
-    post-modulation and pre-concat (Q3), sliced to the real ``h*w`` so no pad
-    token reaches the detail map (``src/area_attn.py:361``).
+    The arming window it closes is the plan's: the tagged (first) layer fires
+    after ``embed_all``'s two rope groups and before the joint layer loop
+    (``comfy/ldm/lumina/model.py:815-822,880-881``), and every later layer
+    closes it again harmlessly.
+    The detail map's input is the image embedding that ENTERS the FIRST refiner
+    layer (``args[0]`` of the module tagged ``_area_refiner_entry``), sliced to
+    the real ``h*w`` so no pad token reaches the detail map
+    (``src/area_attn.py:361``): the faithful Z-Image analogue of the reference's
+    ``x_embedder`` — layer-0 features, before any transformer block
+    (``backbones/flux.py:111-114,150-163``), not any layer's transformed output.
+    Later refiner layers keep closing the arming window but never re-capture.
     """
     rt = _ZRUNTIME
     if rt is None or rt.ctx is None:
@@ -859,8 +874,9 @@ def _zimage_refiner_hook(module, args, output):
         # Close the rope capture's arming window: the joint stream's two groups
         # are in, so anything the model ropes later is none of AReA's business.
         rt.recorder.armed = False
-    if rt.ctx.phase == "fine" and torch.is_tensor(output):
-        rt.hidden = output[:, : rt.ctx.h * rt.ctx.w]
+    if (getattr(module, "_area_refiner_entry", False) and rt.ctx.phase == "fine"
+            and args and torch.is_tensor(args[0])):
+        rt.hidden = args[0][:, : rt.ctx.h * rt.ctx.w]
 
 
 def _zimage_install_seam(m, dm):

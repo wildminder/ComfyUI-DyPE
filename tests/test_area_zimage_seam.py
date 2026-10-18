@@ -170,13 +170,18 @@ class MockNoiseRefiner(torch.nn.Module):
     Each refiner block runs attention over the IMAGE BLOCK ALONE through the very
     symbol AReA patches, so this mock calls the bound symbol once with a short
     image-only stream (cheap, and enough to prove the wrapper delegates it —
-    the refiner stream is never the joint stream).  The output passes through
-    untouched: the hook reads it for the Phase II detail map.
+    the refiner stream is never the joint stream).  The block is TRANSFORMED
+    deterministically — every token shifted by this layer's own ``shift``, a
+    different constant per layer — so input != output and a layer's input is
+    distinguishable from its output: the hook reads the layer's INPUT for the
+    Phase II detail map, and a mock that returned the input unchanged could
+    not tell the two sources apart.
     """
 
-    def __init__(self, seam_getter):
+    def __init__(self, seam_getter, shift=1.0):
         super().__init__()
         self._seam = seam_getter
+        self.shift = shift
         self.calls = 0
 
     def forward(self, x):
@@ -187,7 +192,7 @@ class MockNoiseRefiner(torch.nn.Module):
                      HEADS, None, skip_reshape=True, transformer_options={},
                      preferred_attention=None)
         self.calls += 1
-        return x
+        return x + self.shift
 
 
 class NextDiT(torch.nn.Module):
@@ -210,11 +215,14 @@ class NextDiT(torch.nn.Module):
         # An nn.ModuleList, like the real one (``model.py:497-514``), and for the
         # same reason the mock forward LOOPS over it: a forward hook on the
         # container never fires when the model iterates its layers
-        # (``model.py:816``).  A plain module here would hide that bug.
+        # (``model.py:816``).  A plain module here would hide that bug.  Each
+        # layer shifts its input by its own constant, so the input and the
+        # output of the pass are distinguishable in the tests.
         self.noise_refiner = torch.nn.ModuleList([
             MockNoiseRefiner(
-                lambda: sys.modules["comfy.ldm.lumina.model"].optimized_attention_masked)
-            for _ in range(REFINER_LAYERS)
+                lambda: sys.modules["comfy.ldm.lumina.model"].optimized_attention_masked,
+                shift=1.0 + idx)
+            for idx in range(REFINER_LAYERS)
         ])
 
 
@@ -304,8 +312,11 @@ class SimulatedZImage:
         full = torch.cat((cap_table, img_table), dim=2)      # model.py:731/:805
         # 3. noise_refiner over the image block alone, layer by layer — the real
         # forward LOOPS the ModuleList (``model.py:816``) rather than calling it,
-        # so only the layers' own hooks fire.  The last layer's output is the
-        # detail map's input, and the block is kept for the tests to compare.
+        # so only the layers' own hooks fire.  The FIRST layer's INPUT is the
+        # detail map's input (the reference's ``x_embedder`` analogue); the
+        # pre-refiner block is kept for the tests to compare, and each layer
+        # shifts its input so no later layer's input or output can be mistaken
+        # for it.
         self.img_block = torch.randn(self.b, IMG_TOKENS + IMG_PAD, HIDDEN)
         x = self.img_block
         for layer in dm.noise_refiner:
@@ -653,10 +664,15 @@ class TestPerForwardHooks:
             assert sim.refiner_calls == REFINER_LAYERS
             # the detail map got exactly h*w image tokens — no caption, no pad
             assert captured["shape"] == (1, IMG_TOKENS, HIDDEN)
-            # it was the refiner's OWN last-layer output, not the projected-keys
-            # fallback (which would have warned "no-img-in" and re-derived the
-            # map from the rotated keys)
+            # it was the FIRST refiner layer's INPUT — the image embedding that
+            # enters refinement (the reference's ``x_embedder`` analogue) — not
+            # the projected-keys fallback (which would have warned "no-img-in"
+            # and re-derived the map from the rotated keys) and not any later
+            # layer's transformed stream (every layer shifts by ``layer.shift``)
             assert torch.equal(captured["hidden"], sim.img_block[:, :IMG_TOKENS])
+            last_out = sim.img_block + sum(
+                layer.shift for layer in sim.dm.noise_refiner)
+            assert not torch.equal(captured["hidden"], last_out[:, :IMG_TOKENS])
             assert "no-img-in" not in area._warned
             # ... and the recorder holds the model's own two groups in call order
             rt = area._ZRUNTIME
@@ -697,9 +713,9 @@ class TestRefinerHookRegistration:
         for layer in dm.noise_refiner:                       # all removed
             assert layer._forward_hooks == {}
 
-    def test_detail_map_comes_from_the_hooked_refiner_output(self, lumina_model,
-                                                             monkeypatch):
-        """End to end: the iterating pass feeds the map, no fallback warning."""
+    def test_detail_map_comes_from_the_first_refiner_input(self, lumina_model,
+                                                           monkeypatch):
+        """End to end: the iterating pass feeds the map the FIRST layer's input."""
         seen = {}
         real_detail = area.detail_map
 
@@ -714,7 +730,47 @@ class TestRefinerHookRegistration:
             sim, out = _run_forward(patched, step=STEPS - 1)
         finally:
             restore_area_attention_hook(patched)
+        # the PRE-refiner input of the first layer (``img_block`` before the
+        # loop), never a transformed layer output — each layer shifts its input
         assert torch.equal(seen["hidden"], sim.img_block[:, :IMG_TOKENS])
+        assert "no-img-in" not in area._warned
+
+    def test_second_refiner_layer_never_overwrites_the_detail_map_input(
+            self, lumina_model, monkeypatch):
+        """Guard: every layer's hook fires, yet the map keeps the FIRST input.
+
+        Each layer's hook closes the arming window on every call (unchanged),
+        but only the module tagged ``_area_refiner_entry`` at install captures
+        the detail map's input — the transformed inputs and outputs of the later
+        layers must never reach it.
+        """
+        seen = []
+        real_detail = area.detail_map
+
+        def spy(hidden_states, h, w):
+            seen.append(hidden_states.detach().clone())
+            return real_detail(hidden_states, h, w)
+
+        monkeypatch.setattr(area, "detail_map", spy)
+        patched = apply_area_to_model(mock_zimage_model(), "zimage", WIDTH, HEIGHT,
+                                      phase1_steps=4, seed=5)
+        try:
+            sim, out = _run_forward(patched, step=STEPS - 1)     # a fine step
+        finally:
+            restore_area_attention_hook(patched)
+        # every refiner layer's hook fired ...
+        assert sim.refiner_calls == REFINER_LAYERS
+        # ... yet ONE capture served the whole forward: the FIRST layer's input
+        assert len(seen) == 1
+        assert seen[0].shape == (1, IMG_TOKENS, HIDDEN)
+        assert torch.equal(seen[0], sim.img_block[:, :IMG_TOKENS])
+        # not the second layer's input (the first layer's shifted output) ...
+        second_in = sim.img_block + sim.dm.noise_refiner[0].shift
+        assert not torch.equal(seen[0], second_in[:, :IMG_TOKENS])
+        # ... and not the last layer's shifted output either
+        last_out = sim.img_block + sum(
+            layer.shift for layer in sim.dm.noise_refiner)
+        assert not torch.equal(seen[0], last_out[:, :IMG_TOKENS])
         assert "no-img-in" not in area._warned
 
     def test_coarse_builders_ropes_are_never_recorded(self, lumina_model, monkeypatch):
