@@ -19,6 +19,7 @@ Markers: @pytest.mark.unit
 from __future__ import annotations
 
 import logging
+import re
 import sys
 import types
 
@@ -878,3 +879,64 @@ class TestBridgeFloor:
                                     window_hold_steps=1)
         assert small._area_config.window_start == 1024    # widget max
         restore_area_attention_hook(small)
+
+
+# ---------------------------------------------------------------------------
+# The floor's one-time warning (A1, ``_warn_once``)
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.unit
+class TestBridgeFloorWarning:
+    """``area-bridge-floor``: emitted once, naming the multiplier the floor pays."""
+
+    def _warned(self) -> bool:
+        return "area-bridge-floor" in area._warned
+
+    def _forward(self, floor, step=CORPUS_PHASE1, txt_len=64, steps=CORPUS_STEPS):
+        m = apply_area_to_model(mock_flux_model(), "flux", CORPUS_WIDTH, CORPUS_HEIGHT,
+                                phase1_steps=CORPUS_PHASE1, seed=7,
+                                bridge_floor_steps=floor)
+        try:
+            _run_forward(m, step, blocks=1, side=CORPUS_WIDTH, steps=steps,
+                         txt_len=txt_len)
+        finally:
+            restore_area_attention_hook(m)
+
+    def test_warns_once_naming_the_multiplier(self, flux_layers, caplog):
+        area._warned.clear()
+        try:
+            with caplog.at_level("WARNING", logger="ComfyUI-DyPE"):
+                for _ in range(3):                     # repeated forwards
+                    self._forward(floor=2)
+            assert self._warned()
+            # one emission: the message is not repeated per step or per forward
+            assert caplog.text.count("full-attention step") == 1
+            # it NAMES the multiplier it pays, and the opt-out
+            multiplier = re.search(r"costs (\d+\.\d+)x", caplog.text)
+            assert multiplier is not None and float(multiplier.group(1)) > 1.0
+            assert "bridge_floor_steps=0" in caplog.text
+            assert "short schedule" in caplog.text
+        finally:
+            area._warned.clear()
+
+    def test_silent_when_the_floor_is_off(self, flux_layers, caplog):
+        area._warned.clear()
+        try:
+            with caplog.at_level("WARNING", logger="ComfyUI-DyPE"):
+                for step in range(CORPUS_PHASE1, CORPUS_STEPS):
+                    self._forward(floor=0, step=step)
+            assert not self._warned()
+        finally:
+            area._warned.clear()
+
+    def test_silent_on_a_long_schedule(self, flux_layers, caplog):
+        """A 28-step run is never floored, so it never warns either."""
+        area._warned.clear()
+        try:
+            with caplog.at_level("WARNING", logger="ComfyUI-DyPE"):
+                for step in (PHASE1, PHASE1 + 1, STEPS - 1):
+                    self._forward(floor=2, step=step, txt_len=TXT_LEN, steps=STEPS)
+            assert not self._warned()
+        finally:
+            area._warned.clear()
