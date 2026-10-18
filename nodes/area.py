@@ -115,9 +115,9 @@ class AReA(io.ComfyNode):
                 ),
                 io.Combo.Input(
                     "phase1_mode",
-                    options=["steps", "sigma"],
+                    options=["steps", "sigma", "bootstrap"],
                     default="steps",
-                    tooltip="How the Phase I -> Phase II switch is expressed. 'steps' = the leading phase1_steps steps run Phase I (the reference's mode). 'sigma' = the leading steps whose noise level is still at or above phase1_sigma run Phase I, so the switch follows the schedule rather than a fixed count (8 of 28 sits at a sigma of roughly 0.88 on a shift-3.0 flow). The paper's sigma is a FLUX value and is advisory for the distilled Z-Image schedule.",
+                    tooltip="How the Phase I -> Phase II switch is expressed. 'steps' = the leading phase1_steps steps run Phase I (the reference's mode). 'sigma' = the leading steps whose noise level is still at or above phase1_sigma run Phase I, so the switch follows the schedule rather than a fixed count (8 of 28 sits at a sigma of roughly 0.88 on a shift-3.0 flow). The paper's sigma is a FLUX value and is advisory for the distilled Z-Image schedule. 'bootstrap' = the paper's Appendix F mode: no Phase I at all, windowed Phase II from the first step; the early steps must have composed the canvas in a separate native-resolution pass whose latent was upscaled and re-noised to phase1_sigma (see the README pattern).",
                 ),
                 io.Float.Input(
                     "phase1_sigma",

@@ -372,6 +372,20 @@ def _phase1_count(rt: _AreaRuntime, opts: dict) -> int:
     table.
     """
     cfg = rt.config
+    if cfg.phase1_mode == "bootstrap":
+        # The paper's Appendix F mode: Phase I is replaced by a separate
+        # native-resolution pass (the canvas is never pooled, so there is no
+        # pooling footprint to ripple), so this run runs Phase II only.
+        if int(cfg.phase1_steps):
+            _warn_once(
+                "area-bootstrap-steps",
+                "AReA: phase1_mode is 'bootstrap' but phase1_steps is %d, which "
+                "bootstrap ignores — Phase I runs no steps (Appendix F replaces "
+                "it with a native-resolution pre-pass, see the plan "
+                ".dev/docs/plans/2026-10-18-area-zimage-bootstrap.md).",
+                int(cfg.phase1_steps),
+            )
+        return 0
     if cfg.phase1_mode != "sigma":
         return max(0, int(cfg.phase1_steps))
     table = opts.get("sample_sigmas")
@@ -1200,7 +1214,7 @@ def apply_area_to_model(
 
     m._area_config = AreaConfig(
         phase1_steps=max(0, int(phase1_steps)),
-        phase1_mode=phase1_mode if phase1_mode in ("steps", "sigma") else "steps",
+        phase1_mode=phase1_mode if phase1_mode in ("steps", "sigma", "bootstrap") else "steps",
         phase1_sigma=float(phase1_sigma),
         pooling=pooling if pooling in POOLING else "subsample",
         halo=max(0, int(halo)),

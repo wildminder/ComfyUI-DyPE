@@ -250,7 +250,7 @@ class TestNodeSchema:
     def test_node_phase1_mode_input_present_with_steps_default(self):
         inputs = {i.name: i for i in AReA.define_schema().inputs}
         mode = inputs["phase1_mode"]
-        assert mode.kwargs["options"] == ["steps", "sigma"]
+        assert mode.kwargs["options"] == ["steps", "sigma", "bootstrap"]
         assert mode.kwargs["default"] == "steps"          # the reference's mode
         # 0.89 = the paper's first-backbone value (theory.md:494), one
         # definition shared with the engine-facing constant
@@ -696,3 +696,44 @@ class TestPhaseRegimeAdvisory:
             area._warned.clear()
             area._AREA_RUNTIME = None
             area._ZRUNTIME = None
+
+
+# ---------------------------------------------------------------------------
+# Bootstrap mode — the paper's Appendix F switch (plan 2026-10-18, step B1)
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.unit
+class TestBootstrapMode:
+    """``phase1_mode="bootstrap"`` runs Phase II only: no pooled Phase I at all."""
+
+    def _runtime(self, phase1_steps=8, **cfg):
+        return area._AreaRuntime(area.AreaConfig(phase1_steps=phase1_steps, **cfg),
+                                 NextDiT(), ZIMAGE_PROFILE)
+
+    def test_bootstrap_returns_zero_coarse_steps(self):
+        rt = self._runtime(phase1_mode="bootstrap")
+        assert area._phase1_count(rt, {}) == 0
+
+    def test_bootstrap_config_keeps_the_mode(self):
+        assert area.AreaConfig(phase1_mode="bootstrap").phase1_mode == "bootstrap"
+
+    def test_nonzero_phase1_steps_warns_once_then_ignores(self):
+        area._warned.clear()
+        rt = self._runtime(phase1_mode="bootstrap")
+        assert area._phase1_count(rt, {}) == 0
+        assert "area-bootstrap-steps" in area._warned
+        area._phase1_count(rt, {})                       # a second forward
+        assert "area-bootstrap-steps" in area._warned    # still once (warn-once set)
+
+    def test_zero_phase1_steps_is_silent(self):
+        area._warned.clear()
+        rt = self._runtime(phase1_steps=0, phase1_mode="bootstrap")
+        assert area._phase1_count(rt, {}) == 0
+        assert "area-bootstrap-steps" not in area._warned
+
+    def test_other_modes_never_warn_bootstrap(self):
+        area._warned.clear()
+        for mode, kw in (("steps", {}), ("sigma", {"phase1_sigma": 0.5})):
+            area._phase1_count(self._runtime(phase1_mode=mode, **kw), {})
+        assert "area-bootstrap-steps" not in area._warned

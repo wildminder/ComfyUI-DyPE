@@ -317,7 +317,7 @@ class TestAReASchema:
         assert inputs["enable_area"].kwargs["default"] is True
         # the z-image switch's defaults reproduce the reference's step-count
         # behaviour, so a graph that never touches them is unchanged
-        assert inputs["phase1_mode"].kwargs["options"] == ["steps", "sigma"]
+        assert inputs["phase1_mode"].kwargs["options"] == ["steps", "sigma", "bootstrap"]
         assert inputs["phase1_mode"].kwargs["default"] == "steps"
         assert inputs["phase1_sigma"].kwargs["default"] == 0.89
 
