@@ -397,7 +397,7 @@ Window sizes and the bridge/Halo budget are chosen to keep a windowed step at or
 
 **Z-Image:** same node, `model_type: auto` detects it. Turbo schedules are short (8 steps) — pick `phase1_steps` 1-3 or `phase1_mode: sigma`; the node warns when pooling would flood the run.
 
-**Bootstrap (paper Appendix F) — experimental, not yet GPU-validated:** `phase1_mode: bootstrap` itself is ready (it runs Phase II only, and the entry-sigma check warns when a sampler enters off-level), but the two-sampler *construction* — native 1024 pass, latent ×2 upscale, re-noise to `phase1_sigma`, then the target pass — currently produces corrupted output on Z-Image Turbo's 8-step schedule (the pre-pass is under-denoised at the handover level and five windowed steps cannot finish it). Do not use the recipe until it validates; the validated Z-Image knobs remain `phase1_steps` 1-3 or `sigma` mode.
+**Bootstrap (paper Appendix F) — experimental, does not work on Z-Image Turbo yet:** `phase1_mode: bootstrap` itself is ready (it runs Phase II only, and the entry-sigma check warns when a sampler enters off-level), but the two-sampler *construction* — native 1024 pass, latent ×2 upscale, re-noise to `phase1_sigma`, then the target pass — has failed two GPU validation rounds on Z-Image Turbo's 8-step schedule (round 1: an under-denoised pre-pass the windowed steps could not finish; round 2, faithful to the paper with a full native pre-pass: the windowed pass inflates latent amplitude ~1.8×, so the decode keeps the composition but corrupts the palette). Do not use the recipe on Turbo until that is solved; the validated Z-Image knobs remain `phase1_steps` 1-3 or `sigma` mode.
 
 <details>
 <summary><b>Inputs & Parameters</b></summary>
