@@ -346,7 +346,11 @@ def build_schedule(
     phase1_steps = max(0, min(int(phase1_steps), int(steps)))
     extent = max(h, w)
     w_min = min(int(w_min or native), extent)
-    delay = max(0, min(int(delay), phase1_steps)) if is_short_schedule(steps) else 0
+    # Leave at least one pooled rung: delay == phase1_steps would make the last
+    # ramp factor 1, and the Phase II handoff reads that factor, so a full
+    # delay would silently start Phase II on the whole grid instead of the
+    # pooled handoff ("no Phase I at all" is phase1_steps=0 / bootstrap).
+    delay = max(0, min(int(delay), phase1_steps - 1)) if is_short_schedule(steps) else 0
     ramp = pooling_ramp(initial_factor(h, w, native), phase1_steps, h, w) if phase1_steps else []
     factors = [1] * delay + ramp[:phase1_steps - delay]
     phase2_steps = steps - phase1_steps

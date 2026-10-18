@@ -222,6 +222,9 @@ class AreaConfig:
     #: A4 — extra steps that hold the start side before the ramp shrinks it;
     #: short only, clamped to ``[0, fine_steps - 2]``.
     window_hold_steps: int = 0
+    #: Delay — leading Phase I steps run at factor 1 (no pooling), so the
+    #: measured sigma~1 ripple pulse never forms; clamped to `[0, phase1]`.
+    delay: int = 2
     seed: int = 0
     native: int = NATIVE_PATCHES
 
@@ -377,12 +380,14 @@ def _area_schedule(rt: _AreaRuntime, h: int, w: int, total: int, phase1: int,
     """
     cfg = rt.config
     phase1 = max(0, int(phase1))
-    key = (h, w, total, phase1, txt_len, cfg.window_start, cfg.window_hold_steps)
+    key = (h, w, total, phase1, txt_len, cfg.window_start, cfg.window_hold_steps,
+           cfg.delay)
     schedule = rt.schedules.get(key)
     if schedule is None:
         schedule = build_schedule(h, w, total, phase1, cfg.native, txt_len=txt_len,
                                   window_start=cfg.window_start,
-                                  window_hold_steps=cfg.window_hold_steps)
+                                  window_hold_steps=cfg.window_hold_steps,
+                                  delay=cfg.delay)
         rt.schedules[key] = schedule
     return schedule
 
@@ -1230,6 +1235,7 @@ def apply_area_to_model(
     bridge_floor_steps: int = 2,
     window_start: int = 0,
     window_hold_steps: int = 0,
+    delay: int = 2,
     seed: int = 0,
     phase1_mode: str = "steps",
     phase1_sigma: float = ZIMAGE_SIGMA_STAR,
@@ -1315,6 +1321,7 @@ def apply_area_to_model(
         bridge_floor_steps=max(0, min(16, int(bridge_floor_steps))),
         window_start=max(0, min(1024, int(window_start))),
         window_hold_steps=max(0, min(8, int(window_hold_steps))),
+        delay=max(0, min(int(phase1_steps), int(delay))),
         seed=int(seed),
     )
 

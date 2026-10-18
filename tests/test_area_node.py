@@ -880,7 +880,7 @@ class TestBridgeFloor:
         area._area_schedule(a, CORPUS_GRID, CORPUS_GRID, CORPUS_STEPS, CORPUS_PHASE1, 64)
         area._area_schedule(b, CORPUS_GRID, CORPUS_GRID, CORPUS_STEPS, CORPUS_PHASE1, 64)
         assert list(a.schedules) == list(b.schedules)
-        assert len(list(a.schedules)[0]) == 7
+        assert len(list(a.schedules)[0]) == 8   # the key gained `delay`
 
     def test_engine_kwargs_are_clamped(self, flux_layers):
         """The engine stores what the node's widgets allow, no matter what arrives."""
