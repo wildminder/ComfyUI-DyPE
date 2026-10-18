@@ -222,9 +222,12 @@ class AreaConfig:
     #: A4 — extra steps that hold the start side before the ramp shrinks it;
     #: short only, clamped to ``[0, fine_steps - 2]``.
     window_hold_steps: int = 0
-    #: Delay — leading Phase I steps run at factor 1 (no pooling), so the
-    #: measured sigma~1 ripple pulse never forms; clamped to `[0, phase1]`.
-    delay: int = 2
+    #: Delay — leading Phase I steps run at factor 1 (no pooling). Measured on
+    #: the GPU to cut final 32px energy 2.3-4.4x, but the user's real-checkpoint
+    #: check found it WORSE visually (more hallucination, worse quality): the
+    #: mid-composition pooled steps after full-attention steps are the harmful
+    #: mix. Default 0 (today's pooling-from-step-0) until that is understood.
+    delay: int = 0
     seed: int = 0
     native: int = NATIVE_PATCHES
 
@@ -1235,7 +1238,7 @@ def apply_area_to_model(
     bridge_floor_steps: int = 2,
     window_start: int = 0,
     window_hold_steps: int = 0,
-    delay: int = 2,
+    delay: int = 0,
     seed: int = 0,
     phase1_mode: str = "steps",
     phase1_sigma: float = ZIMAGE_SIGMA_STAR,
