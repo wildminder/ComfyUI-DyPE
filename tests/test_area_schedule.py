@@ -62,6 +62,7 @@ from src.area_schedule import (
     window_step_cost,
     window_tokens,
 )
+from src.area import AreaConfig
 
 NATIVE = 64          # FLUX: 64 patches (1024 px) per side
 TEXT = 333           # a plausible T5 text-token count
@@ -520,3 +521,34 @@ class TestStepRng:
     def test_large_seed_is_masked(self):
         assert (step_rng(2 ** 40, 0, 0).bit_generator.seed_seq.entropy
                 == step_rng(0, 0, 0).bit_generator.seed_seq.entropy)
+
+
+class TestPhaseIDelay:
+    """The Phase I start delay (``delay``) — engine-level, DEFAULT OFF (§13/§14).
+
+    The knob measured 2.3-4.4x lower final 32px energy but was visually WORSE on
+    the real checkpoint (more hallucination): pooling introduced mid-composition
+    hurts. So its default is 0 in ``AreaConfig`` and it ships opt-in; these tests
+    pin both the schedule semantics and the "never a default regression" rule.
+    """
+
+    def test_default_is_off(self):
+        """The shipped default never shifts the ramp (no silent behavior change)."""
+        assert AreaConfig().delay == 0
+        plain = build_schedule(128, 128, 10, 8, 64, txt_len=64)
+        assert build_schedule(128, 128, 10, 8, 64, txt_len=64).factors == plain.factors
+
+    def test_delay_shifts_the_pooled_ramp(self):
+        """D full-attention steps then the pooled ramp, same coarse count."""
+        s = build_schedule(128, 128, 10, 8, 64, txt_len=64, delay=2)
+        assert s.factors == (1, 1) + (2,) * 6
+
+    def test_one_pooled_rung_survives(self):
+        """A delay may never eat the whole ramp: the handoff reads the last factor."""
+        assert build_schedule(128, 128, 10, 2, 64, txt_len=64, delay=9).factors == (1, 2)
+        assert build_schedule(128, 128, 10, 1, 64, txt_len=64, delay=9).factors == (2,)
+
+    def test_long_schedules_ignore_it(self):
+        """A long schedule is not delayed — FLUX's calibrated ramp is intact."""
+        plain = build_schedule(128, 128, 28, 8, 64, txt_len=64)
+        assert build_schedule(128, 128, 28, 8, 64, txt_len=64, delay=4).factors == plain.factors
