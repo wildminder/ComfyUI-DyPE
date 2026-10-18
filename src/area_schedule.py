@@ -320,7 +320,7 @@ class AreaSchedule:
 
 def build_schedule(
     h: int, w: int, steps: int, phase1_steps: int, native: int, w_min: int | None = None,
-    txt_len: int = 0, window_start: int = 0, window_hold_steps: int = 0,
+    txt_len: int = 0, window_start: int = 0, window_hold_steps: int = 0, delay: int = 0,
 ) -> AreaSchedule:
     """Schedule for an ``h x w`` patch grid over ``steps`` denoising steps.
 
@@ -335,11 +335,20 @@ def build_schedule(
     ``[w_min, extent]``) and extra steps to hold that first side.  Both are gated
     on :func:`is_short_schedule` — on a long schedule the Eq. 8 start is the
     calibrated choice and the two knobs are ignored (zeroed) rather than applied.
+
+    ``delay`` is the Phase I start delay (§12 of the research: the measured 32 px
+    ripple pulse lives in the first coarse steps at sigma ~ 1, and pooling from
+    step ``delay`` instead of 0 removes it).  Steps before it run factor 1 — the
+    engine's own no-pooling representation — so Phase I begins on an established
+    canvas.  Gated like the knobs above, and clamped so the ramp never shrinks
+    below ``phase1_steps`` pooled rungs.
     """
     phase1_steps = max(0, min(int(phase1_steps), int(steps)))
     extent = max(h, w)
     w_min = min(int(w_min or native), extent)
-    factors = pooling_ramp(initial_factor(h, w, native), phase1_steps, h, w) if phase1_steps else []
+    delay = max(0, min(int(delay), phase1_steps)) if is_short_schedule(steps) else 0
+    ramp = pooling_ramp(initial_factor(h, w, native), phase1_steps, h, w) if phase1_steps else []
+    factors = [1] * delay + ramp[:phase1_steps - delay]
     phase2_steps = steps - phase1_steps
     windows: list[int] = []
     if phase2_steps:
