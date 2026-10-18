@@ -44,6 +44,10 @@ Deviations from the reference, all deliberate and pinned by the Phase 2 tests:
   reductions are kept exactly as shipped — :func:`detail_map` means over the batch
   and :func:`token_importance` sums over it — and one layout serves the whole
   batch: both CFG branches attend through identical graphs (theory.md:496).
+* :func:`windowed_step_cost` exposes the pricing of :func:`fit_extra_keys`
+  without applying it, for the engine's bridge-floor exemption (which deliberately
+  runs above the cap on a short schedule's leading fine steps).  ``fit_extra_keys``
+  itself is untouched, so the cost-capped path is byte-identical.
 
 Determinism: nothing here reads the global RNG.  Every stream is a
 ``numpy.random.default_rng`` keyed by ``(seed, step, salt)`` through
@@ -107,6 +111,12 @@ class AreaContext:
     carries the payload the caller resolved for that phase: ``rope_q``/``rope_kv``
     for a coarse step, a :class:`FineLayout` under ``"layout"`` for a fine one.
 
+    ``fine_step`` is the step's ordinal WITHIN Phase II (``0`` on the first fine
+    step, negative on a coarse one) and ``floor_steps`` how many of those leading
+    steps the bridge floor exempts from the cost cap (``0`` off a short schedule,
+    or when the floor is disabled) — the pair the layout builder compares to
+    decide whether this step keeps the paper's full bridge (``src/area.py``).
+
     Phase 3 sets and clears this around every forward (the SPA discipline,
     ``src/spa.py:1385-1476``) so no layout may leak across models or steps.
     """
@@ -117,6 +127,10 @@ class AreaContext:
     h: int = 0
     w: int = 0
     txt_len: int = 0
+    #: ordinal within Phase II — how many fine steps ran before this one
+    fine_step: int = 0
+    #: how many leading fine steps the bridge floor covers (0 = no floor)
+    floor_steps: int = 0
     data: dict = field(default_factory=dict)
 
 
@@ -257,6 +271,25 @@ def fit_extra_keys(windows: list[Window], h: int, w: int, txt_len: int, register
         return int(room // sum(rows)), halo
     depth = next((d for d in range(halo, -1, -1) if local(d) <= full), 0)
     return 0, depth
+
+
+def windowed_step_cost(windows: list[Window], h: int, w: int, txt_len: int, registers: int,
+                       halo: int) -> float:
+    """One Phase II step in units of one full-attention pass, before any trimming.
+
+    The same pricing :func:`fit_extra_keys` applies — each window runs ``T + n``
+    queries (text and its image tokens) against ``T + n`` keys plus its Halo ring
+    and ``R`` bridge tokens, summed over the windows and divided by the full
+    ``(T + h*w)^2`` — with the Halo priced at its FULL width, the most any window
+    can draw.  :func:`fit_extra_keys` keeps that at or below 1.0; the bridge floor
+    (``src/area.py``) is the deliberate exception, and this is the number it
+    reports so the exemption is visible rather than silent.
+    """
+    full = float(txt_len + h * w) ** 2
+    rows = [float(txt_len + win.area) for win in windows]
+    total = sum(q * (q + ring_size(win, halo, h, w) + registers)
+                for q, win in zip(rows, windows))
+    return total / full
 
 
 def tiling_rng(seed: int, step: int) -> np.random.Generator:

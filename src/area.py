@@ -90,6 +90,13 @@ Deviations from the reference, all deliberate and pinned by the Phase 3 tests:
   (not an ``nn.Module``), the Phase II detail map falls back to the
   post-norm projected image keys of the first fine call, with a one-time
   warning.  Everything else is unchanged.
+* **Short-schedule bridge floor (A1) and geometry (A4).** Deliberate, opt-out
+  deviations on short (distilled) schedules only — ``bridge_floor_steps`` leading
+  fine steps keep the paper's full bridge/halo above the cost cap, and
+  ``window_start`` / ``window_hold_steps`` reshape the window ramp
+  (``docs/2026-10-18-area-zimage-adaptation-research.md`` §4-§5).  Both are gated
+  on the shared :func:`~src.area_schedule.is_short_schedule` predicate, so the
+  28-step FLUX path — and every long schedule — is byte-identical.
 """
 from __future__ import annotations
 
@@ -113,6 +120,7 @@ from .area_attn import (
     pool_keys_values,
     tiling_rng,
     windowed_attention,
+    windowed_step_cost,
 )
 from .area_arch import (
     FLUX_PROFILE,
@@ -120,7 +128,7 @@ from .area_arch import (
     _ArchProfile,
     resolve_area_arch,
 )
-from .area_schedule import AreaSchedule, build_schedule, initial_factor
+from .area_schedule import AreaSchedule, build_schedule, initial_factor, is_short_schedule
 from .area_zimage import (
     ZIMAGE_GROUP_ORDER,
     ZIMAGE_SEAM_MODULE,
@@ -203,6 +211,17 @@ class AreaConfig:
     pooling: str = "subsample"
     halo: int = 8
     bridge_ratio: float = 0.5
+    #: A1 — how many leading Phase II steps keep the paper's full bridge and
+    #: halo instead of the cost cap's trimmed ones.  Short schedules only
+    #: (:func:`~src.area_schedule.is_short_schedule`); ``0`` disables the floor,
+    #: which restores the capped behaviour on every step.
+    bridge_floor_steps: int = 2
+    #: A4 — window side Phase II starts its ramp at (``0`` = the Eq. 8
+    #: cost-optimal choice), clamped into ``[w_min, extent]``; short only.
+    window_start: int = 0
+    #: A4 — extra steps that hold the start side before the ramp shrinks it;
+    #: short only, clamped to ``[0, fine_steps - 2]``.
+    window_hold_steps: int = 0
     seed: int = 0
     native: int = NATIVE_PATCHES
 
@@ -349,13 +368,21 @@ def _area_schedule(rt: _AreaRuntime, h: int, w: int, total: int, phase1: int,
     prompt carries, both constant across a generation.  ``phase1`` is the
     *resolved* Phase I count (``_phase1_count``), not the raw knob, so sigma mode
     — whose count comes from the schedule itself — is cached correctly.
+
+    The A4 geometry knobs join the key because they change the windows they
+    produce: two runtimes differing only in ``window_start`` / ``window_hold_steps``
+    must not share one entry.  ``bridge_floor_steps`` is deliberately NOT in the
+    key — the floor is applied per step by the layout builder, so it never
+    changes the schedule (the resolution that produced it is irrelevant to it).
     """
     cfg = rt.config
     phase1 = max(0, int(phase1))
-    key = (h, w, total, phase1, txt_len)
+    key = (h, w, total, phase1, txt_len, cfg.window_start, cfg.window_hold_steps)
     schedule = rt.schedules.get(key)
     if schedule is None:
-        schedule = build_schedule(h, w, total, phase1, cfg.native, txt_len=txt_len)
+        schedule = build_schedule(h, w, total, phase1, cfg.native, txt_len=txt_len,
+                                  window_start=cfg.window_start,
+                                  window_hold_steps=cfg.window_hold_steps)
         rt.schedules[key] = schedule
     return schedule
 
@@ -469,9 +496,31 @@ def _area_fine_layout(rt: _AreaRuntime, ctx: AreaContext, k_img: torch.Tensor,
     energy = detail_map(hidden, h, w)
     w_min = min(cfg.native, max(h, w))
     windows = adaptive_tiling(energy, h, w, ctx.size, w_min, t, rng=tiling_rng(cfg.seed, ctx.step))
-    registers = bridge_registers(ctx.size, cfg.bridge_ratio)
-    # Never cost more than a full-attention step: cut bridge tokens, then the Halo.
-    registers, halo = fit_extra_keys(windows, h, w, t, registers, cfg.halo)
+    if ctx.fine_step < ctx.floor_steps:
+        # A1 — the bridge floor (``docs/2026-10-18-area-zimage-adaptation-research.md``
+        # §4/§5-A1): on a SHORT schedule the cost cap cuts the bridge to zero and
+        # the Halo to a sliver on exactly the steps where composition is still
+        # forming, which the paper's own ablation links to window duplication.  The
+        # leading ``floor_steps`` fine steps therefore keep the paper's full
+        # ``round(rho*w)^2`` bridge and the configured halo, exempt from the cap —
+        # an explicit, warned cost decision, not a silent one.
+        registers, halo = bridge_registers(ctx.size, cfg.bridge_ratio), cfg.halo
+        cost = windowed_step_cost(windows, h, w, t, registers, halo)
+        if cost > 1.0:
+            _warn_once(
+                "area-bridge-floor",
+                "AReA: the first %d fine step(s) of this short schedule keep the "
+                "full bridge (R=%d per window) and halo=%d, which costs %.2fx a "
+                "full-attention step instead of the cost-capped 1.0x — the cap is "
+                "deliberately waived there, because it would cut the bridge to "
+                "zero on the composition-critical steps. Set bridge_floor_steps=0 "
+                "to cap every step instead.",
+                ctx.floor_steps, registers, halo, cost,
+            )
+    else:
+        registers = bridge_registers(ctx.size, cfg.bridge_ratio)
+        # Never cost more than a full-attention step: cut bridge tokens, then the Halo.
+        registers, halo = fit_extra_keys(windows, h, w, t, registers, cfg.halo)
     layout = build_fine_layout(windows, h, w, halo, registers, cfg.seed, ctx.step,
                                k_img.dtype, k_img.device)
     ctx.data["layout"] = layout
@@ -1035,12 +1084,12 @@ def _warn_regime(total: int, phase1: int, phase: Optional[str]) -> None:
     local detail, and the distilled model hallucinates around the loss (measured
     2026-10-17: 8/8 coarse at 2048 px, periodic ripple/mosaic + swirls; see
     ``docs/2026-10-17-area-zimage-ripple-diagnosis.md``).  Advisory only, no
-    behavior change: a 28-step FLUX schedule never trips it (``total > 12``
-    returns early), and a user who wants the flood keeps it by setting
-    ``phase1_steps`` explicitly — the same discipline as I-Max's z-image
-    schedule advisory (``src/imax.py:311-349``).
+    behavior change: a 28-step FLUX schedule never trips it (the shared
+    :func:`~src.area_schedule.is_short_schedule` gate returns early), and a user
+    who wants the flood keeps it by setting ``phase1_steps`` explicitly — the
+    same discipline as I-Max's z-image schedule advisory (``src/imax.py:311-349``).
     """
-    if phase != "coarse" or total <= 0 or total > 12:
+    if phase != "coarse" or not is_short_schedule(total):
         return
     if phase1 * 3 <= total:  # up to a third of the steps coarse: the paper's share
         return
@@ -1085,8 +1134,19 @@ def _area_resolve_forward(rt: _AreaRuntime, params: dict) -> AreaContext:
     if step is None or max(h, w) <= rt.config.native:
         return ctx  # at/below the native extent AReA is a provable no-op
     phase1 = _phase1_count(rt, opts)
-    phase, size = _area_schedule(rt, h, w, total, phase1, ctx.txt_len).at(step)
+    cfg = rt.config
+    schedule = _area_schedule(rt, h, w, total, phase1, ctx.txt_len)
+    phase, size = schedule.at(step)
     ctx.phase, ctx.size, ctx.step, ctx.h, ctx.w = phase, size, step, h, w
+    # The Phase II ordinal (how many fine steps ran before this one) and how many
+    # of its leading steps the bridge floor exempts from the cost cap.  The floor
+    # is keyed on the RESOLVED schedule's geometry, so steps / sigma / bootstrap
+    # all behave identically: a resolution that spends more steps coarse simply
+    # reaches fewer of the floored fine steps, and a floored step is floored
+    # whichever mode resolved the schedule.
+    ctx.fine_step = step - len(schedule.factors)
+    ctx.floor_steps = (cfg.bridge_floor_steps
+                       if phase == "fine" and is_short_schedule(total) else 0)
     _warn_regime(total, phase1, phase)
     if step == 0 and rt.config.phase1_mode == "bootstrap" and phase == "fine":
         # Appendix F: Phase II must ENTER at the re-noise level the native
@@ -1167,6 +1227,9 @@ def apply_area_to_model(
     pooling: str = "subsample",
     halo: int = 8,
     bridge_ratio: float = 0.5,
+    bridge_floor_steps: int = 2,
+    window_start: int = 0,
+    window_hold_steps: int = 0,
     seed: int = 0,
     phase1_mode: str = "steps",
     phase1_sigma: float = ZIMAGE_SIGMA_STAR,
@@ -1192,6 +1255,14 @@ def apply_area_to_model(
     (``subsample`` / ``mean`` / ``medoid`` / ``random``), ``halo`` the widest
     Halo ring, ``bridge_ratio`` rho of ``R = round(rho * w)^2`` bridge tokens per
     window, and ``seed`` the key of every draw (windows, halos, random pooling).
+
+    ``bridge_floor_steps`` (A1) is the short-schedule bridge floor: the first
+    that many fine steps keep the paper's full bridge and halo instead of the
+    cost cap's trimmed ones, on a short schedule only (a 28-step FLUX run is
+    never floored), with a one-time warning naming the cost multiplier it pays.
+    ``window_start`` / ``window_hold_steps`` (A4) re-shape the Phase II window
+    ramp on short schedules only — a start side instead of Eq. 8's, and extra
+    steps holding it — and are ignored on a long one.
 
     Determinism: no global RNG is read — every stream is keyed by
     ``(seed, step)`` in :mod:`src.area_schedule` / :mod:`src.area_attn`.
@@ -1239,6 +1310,11 @@ def apply_area_to_model(
         pooling=pooling if pooling in POOLING else "subsample",
         halo=max(0, int(halo)),
         bridge_ratio=float(bridge_ratio),
+        # A1/A4: clamped to the node's widget ranges (the node clamps the same
+        # way, so a graph and a script agree on what is stored).
+        bridge_floor_steps=max(0, min(16, int(bridge_floor_steps))),
+        window_start=max(0, min(1024, int(window_start))),
+        window_hold_steps=max(0, min(8, int(window_hold_steps))),
         seed=int(seed),
     )
 

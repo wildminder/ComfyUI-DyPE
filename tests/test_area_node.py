@@ -29,8 +29,8 @@ from nodes.area import AReA
 
 import src.area as area
 from src.area import apply_area_to_model, restore_area_attention_hook
-from src.area_attn import apply_rope1
-from src.area_schedule import initial_factor, pooling_ramp
+from src.area_attn import apply_rope1, bridge_registers, fit_extra_keys, windowed_step_cost
+from src.area_schedule import build_schedule, initial_factor, pooling_ramp
 
 try:
     from comfy.model_patcher import ModelPatcher
@@ -46,6 +46,14 @@ HEADS, HEAD_DIM = 2, 128
 HIDDEN = HEADS * HEAD_DIM          # 256 — pe_embedder's dim (axes_dim sums to 128)
 STEPS = 28                          # the reference's FLUX total
 PHASE1 = 8
+# A 2048 px canvas: the 128x128 patch grid the Z-Image adaptation research
+# (``docs/2026-10-18-area-zimage-adaptation-research.md``) measured the bridge
+# starvation on — 2x the native extent, the corpus geometry of the bridge floor.
+CORPUS_WIDTH, CORPUS_HEIGHT = 2048, 2048
+CORPUS_GRID = 128
+CORPUS_STEPS = 8                    # Z-Image Turbo's short schedule
+CORPUS_PHASE1 = 3                    # sigma mode also lands here at shift 3.0
+
 # A 2560 px canvas: 160x160 patches, the first grid whose Phase I ramp is
 # multi-rung (f0 = 4 -> 2 mid-phase).  The 80x80 ramp is constant at 2, so a
 # rung change is only observable through the seam on the big canvas.
@@ -152,16 +160,16 @@ def _grid(side: int) -> int:
     return side // 16
 
 
-def _joint(b=1, seed=0, side=WIDTH):
+def _joint(b=1, seed=0, side=WIDTH, txt_len=TXT_LEN):
     """Unrotated joint q/k/v ``[b, heads, T + h*w, d]`` plus the seam's ``pe``."""
     g = torch.Generator().manual_seed(seed)
-    n = TXT_LEN + _grid(side) ** 2
+    n = txt_len + _grid(side) ** 2
     shape = (b, HEADS, n, HEAD_DIM)
     q = torch.randn(shape, generator=g)
     k = torch.randn(shape, generator=g)
     v = torch.randn(shape, generator=g)
     pos = torch.arange(_grid(side) ** 2)
-    pe = MockPeEmbedder()(_ids(TXT_LEN, pos // _grid(side), pos % _grid(side)))
+    pe = MockPeEmbedder()(_ids(txt_len, pos // _grid(side), pos % _grid(side)))
     return q, k, v, pe
 
 
@@ -194,10 +202,11 @@ class SimulatedFlux:
     ``ldm/flux/model.py:169``; the attention calls replicate ``layers.py:244``.
     """
 
-    def __init__(self, dm, blocks: int = 2, side: int = WIDTH):
+    def __init__(self, dm, blocks: int = 2, side: int = WIDTH, txt_len: int = TXT_LEN):
         self.dm = dm
         self.blocks = blocks
         self.side = side
+        self.txt_len = txt_len
         self.seam = sys.modules["comfy.ldm.flux.layers"].attention
         self.calls: list = []
         self.layouts: list = []
@@ -215,7 +224,8 @@ class SimulatedFlux:
         img_in = getattr(self.dm, "img_in", None)
         if callable(img_in):
             self.img_out = img_in(torch.randn(x.shape[0], _grid(self.side) ** 2, 2 * 2 * 16))
-        q, k, v, pe = _joint(b=x.shape[0], seed=self.seed, side=self.side)
+        q, k, v, pe = _joint(b=x.shape[0], seed=self.seed, side=self.side,
+                             txt_len=self.txt_len)
         out = None
         for _ in range(self.blocks):
             out = self(q, k, v, pe, opts)
@@ -224,14 +234,15 @@ class SimulatedFlux:
     seed = 0
 
 
-def _run_forward(m, step, blocks=2, b=1, seed=0, sigmas=True, side=WIDTH):
+def _run_forward(m, step, blocks=2, b=1, seed=0, sigmas=True, side=WIDTH,
+                 steps=STEPS, txt_len=TXT_LEN):
     """Drive one sampled forward through the installed unet wrapper."""
     dm = m.model.diffusion_model
-    sim = SimulatedFlux(dm, blocks, side)
+    sim = SimulatedFlux(dm, blocks, side, txt_len)
     sim.seed = seed
-    opts = _opts(step) if sigmas else {"sigmas": torch.tensor([1.0])}
+    opts = _opts(step, steps) if sigmas else {"sigmas": torch.tensor([1.0])}
     latent = _latent(b=b, side=side)
-    cross = torch.randn(b, TXT_LEN, 77)
+    cross = torch.randn(b, txt_len, 77)
     params = {"input": latent, "timestep": torch.tensor([float(opts["sigmas"])]),
               "c": {"c_crossattn": cross, "transformer_options": opts}}
     out = _unet_wrapper(m)(sim.model_function, params)
@@ -630,3 +641,193 @@ class TestSeamConformance:
                                         transformer_options=opts, preferred_attention=None)
         assert torch.equal(sim.calls[0], expected)
         assert sim.calls[0].shape == (1, TXT_LEN + GRID_H * GRID_W + 1, HEADS * HEAD_DIM)
+
+
+# ---------------------------------------------------------------------------
+# The short-schedule bridge floor (A1, ``src/area.py::_area_fine_layout``)
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.unit
+class TestBridgeFloor:
+    """``bridge_floor_steps``: the leading fine steps of a SHORT schedule keep the
+    paper's full bridge and halo, exempt from the cost cap.
+
+    Measured (``docs/2026-10-18-area-zimage-adaptation-research.md`` §4): on a
+    128² grid the cost cap cuts the bridge to **zero** and the Halo to a sliver
+    on exactly the composition-critical steps, which the paper's own ablation
+    links to window duplication.  The floor restores the paper's configuration
+    there, at a cost multiplier that must stay observable.
+
+    Geometry: 2048² px = a 128x128 patch grid, 8 steps, 3 coarse — the corpus
+    geometry — so fine steps 0..4 run windows 90/83/76/70/64 (txt 64) or
+    89/82/75/69/64 (txt 288).
+    """
+
+    @pytest.fixture(autouse=True)
+    def _seam(self, flux_layers):
+        """Every forward here needs the mock ``comfy.ldm.flux.layers`` seam."""
+        yield flux_layers
+
+    def _capture(self, monkeypatch):
+        """Spy on ``build_fine_layout``: the (registers, halo) pair actually used."""
+        seen = {}
+        real_build = area.build_fine_layout
+
+        def spy(windows, h, w, halo, registers, seed, step, dtype, device):
+            layout = real_build(windows, h, w, halo, registers, seed, step, dtype, device)
+            seen["registers"], seen["halo"] = registers, halo
+            seen["windows"] = list(windows)
+            seen["h"], seen["w"] = h, w
+            return layout
+
+        monkeypatch.setattr(area, "build_fine_layout", spy)
+        return seen
+
+    def _forward(self, monkeypatch, step, txt_len, floor, phase1=CORPUS_PHASE1,
+                 steps=CORPUS_STEPS, **cfg):
+        """One sampled forward at ``step`` on the corpus canvas; the spy's capture."""
+        seen = self._capture(monkeypatch)
+        m = apply_area_to_model(mock_flux_model(), "flux", CORPUS_WIDTH, CORPUS_HEIGHT,
+                                phase1_steps=phase1, seed=7,
+                                bridge_floor_steps=floor, **cfg)
+        try:
+            sim, out = _run_forward(m, step, blocks=1, side=CORPUS_WIDTH, steps=steps,
+                                    txt_len=txt_len)
+        finally:
+            restore_area_attention_hook(m)
+        assert out.shape == (1, txt_len + CORPUS_GRID ** 2, HEADS * HEAD_DIM)
+        return seen
+
+    def _windows(self, txt_len, phase1=CORPUS_PHASE1, steps=CORPUS_STEPS):
+        """The fine window sides of this corpus schedule (the reference ramp)."""
+        return list(build_schedule(CORPUS_GRID, CORPUS_GRID, steps, phase1,
+                                   area.NATIVE_PATCHES, txt_len=txt_len).windows)
+
+    @pytest.mark.parametrize("txt_len", [64, 288])
+    @pytest.mark.parametrize("phase1", [0, 1, CORPUS_PHASE1])
+    @pytest.mark.parametrize("fine_step", [0, 1])
+    def test_floored_steps_keep_the_paper_bridge_and_halo(self, monkeypatch, txt_len,
+                                                          phase1, fine_step):
+        """P0: fine steps 0 and 1 run the FULL bridge and the configured halo."""
+        sizes = self._windows(txt_len, phase1)
+        seen = self._forward(monkeypatch, phase1 + fine_step, txt_len, floor=2,
+                             phase1=phase1)
+        # the schedule's own side decides R — asserted, never hard-coded
+        assert seen["registers"] == bridge_registers(sizes[fine_step], 0.5)
+        assert seen["registers"] > 0
+        # the halo is never narrowed on a floored step, not even the room<0 case
+        # where the cap trims it to a sliver (§4: halo 0-1 at txt 64/288)
+        capped = fit_extra_keys(seen["windows"], seen["h"], seen["w"], txt_len,
+                                bridge_registers(sizes[fine_step], 0.5), 8)
+        assert seen["halo"] == 8 >= capped[1]
+        assert seen["registers"] >= capped[0]
+        assert (seen["registers"], seen["halo"]) != capped
+
+    @pytest.mark.parametrize("txt_len", [64, 288])
+    @pytest.mark.parametrize("fine_step", [2, 3, 4])
+    def test_steps_past_the_floor_are_trimmed_exactly_as_today(
+            self, monkeypatch, txt_len, fine_step):
+        """P0: from fine step 2 on, the pair equals a floor-off run, byte for byte."""
+        floored = self._forward(monkeypatch, CORPUS_PHASE1 + fine_step, txt_len, floor=2)
+        plain = self._forward(monkeypatch, CORPUS_PHASE1 + fine_step, txt_len, floor=0)
+        assert floored["windows"] == plain["windows"]
+        assert (floored["registers"], floored["halo"]) == (plain["registers"], plain["halo"])
+
+    @pytest.mark.parametrize("txt_len", [64, 288])
+    @pytest.mark.parametrize("fine_step", [0, 1, 2, 3, 4])
+    def test_floor_zero_is_todays_layout_everywhere(self, monkeypatch, txt_len,
+                                                    fine_step):
+        """``bridge_floor_steps=0`` reproduces the capped path on EVERY fine step."""
+        seen = self._forward(monkeypatch, CORPUS_PHASE1 + fine_step, txt_len, floor=0)
+        size = self._windows(txt_len)[fine_step]
+        registers, halo = fit_extra_keys(seen["windows"], seen["h"], seen["w"], txt_len,
+                                         bridge_registers(size, 0.5), 8)
+        assert (seen["registers"], seen["halo"]) == (registers, halo)
+        assert windowed_step_cost(seen["windows"], seen["h"], seen["w"], txt_len,
+                                  registers, halo) <= 1.0 + 1e-9
+
+    @pytest.mark.parametrize("floor", [0, 2])
+    def test_a_28_step_schedule_is_never_floored(self, monkeypatch, floor):
+        """P0: the FLUX default (28 steps) is not a short schedule — no floor."""
+        floored = self._forward(monkeypatch, PHASE1, TXT_LEN, floor=floor, steps=STEPS)
+        plain = self._forward(monkeypatch, PHASE1, TXT_LEN, floor=0, steps=STEPS)
+        assert (floored["registers"], floored["halo"]) == (plain["registers"], plain["halo"])
+
+    def test_bridge_ratio_zero_keeps_an_uncut_halo(self, monkeypatch):
+        """With the bridge off there is nothing to floor but the halo's trimming."""
+        seen = self._forward(monkeypatch, CORPUS_PHASE1, 64, floor=2, bridge_ratio=0.0)
+        assert seen["registers"] == 0
+        assert seen["halo"] == 8
+
+    def test_the_cost_exemption_is_observable(self, monkeypatch):
+        """P0: a floored step runs ABOVE full-attention cost (the waived cap)."""
+        for txt_len in (64, 288):
+            seen = self._forward(monkeypatch, CORPUS_PHASE1, txt_len, floor=2)
+            cost = windowed_step_cost(seen["windows"], seen["h"], seen["w"], txt_len,
+                                      seen["registers"], seen["halo"])
+            assert cost > 1.0
+            # one full-grid window is the cheapest exemption (~1.25x); the split
+            # ones pay the paper's bridge on top of the halo (~1.37-1.44x)
+            assert 1.0 < cost < 2.0
+
+    def test_floor_steps_are_deterministic_and_built_once(self, monkeypatch):
+        """Repeatable draws, and one layout per step for the whole CFG batch."""
+        captured = []
+
+        def run(batch):
+            seen = self._capture(monkeypatch)
+            m = apply_area_to_model(mock_flux_model(), "flux", CORPUS_WIDTH, CORPUS_HEIGHT,
+                                    phase1_steps=CORPUS_PHASE1, seed=7,
+                                    bridge_floor_steps=2)
+            try:
+                _run_forward(m, CORPUS_PHASE1, b=batch, side=CORPUS_WIDTH,
+                             steps=CORPUS_STEPS, txt_len=64, blocks=1)
+            finally:
+                restore_area_attention_hook(m)
+            captured.append((seen["registers"], seen["halo"], len(seen["windows"])))
+
+        run(2)                                   # cond + uncond share one forward
+        run(2)                                   # a second forward of the same step
+        run(1)                                   # the unbatched forward agrees
+        assert len({c[:2] for c in captured}) == 1        # identical draws
+        assert len({c[2] for c in captured}) == 1         # one layout per forward
+
+    def test_cache_key_includes_the_geometry_knobs(self):
+        """Two runtimes differing only in window_start must not share a schedule."""
+        plain_rt = area._AreaRuntime(area.AreaConfig(phase1_steps=CORPUS_PHASE1), None)
+        held_rt = area._AreaRuntime(area.AreaConfig(phase1_steps=CORPUS_PHASE1,
+                                                   window_start=96), None)
+        plain = area._area_schedule(plain_rt, CORPUS_GRID, CORPUS_GRID, CORPUS_STEPS,
+                                    CORPUS_PHASE1, 64)
+        held = area._area_schedule(held_rt, CORPUS_GRID, CORPUS_GRID, CORPUS_STEPS,
+                                   CORPUS_PHASE1, 64)
+        assert plain.windows[0] == self._windows(64)[0]
+        assert held.windows[0] == 96                       # the override led
+        assert plain.windows != held.windows
+        # each runtime cached its OWN entry — the staleness the key prevents
+        assert list(plain_rt.schedules.values()) == [plain]
+        assert list(held_rt.schedules.values()) == [held]
+        # ... and the floor knob is NOT part of the key (it never changes windows)
+        a = area._AreaRuntime(area.AreaConfig(bridge_floor_steps=0), None)
+        b = area._AreaRuntime(area.AreaConfig(bridge_floor_steps=9), None)
+        area._area_schedule(a, CORPUS_GRID, CORPUS_GRID, CORPUS_STEPS, CORPUS_PHASE1, 64)
+        area._area_schedule(b, CORPUS_GRID, CORPUS_GRID, CORPUS_STEPS, CORPUS_PHASE1, 64)
+        assert list(a.schedules) == list(b.schedules)
+        assert len(list(a.schedules)[0]) == 7
+
+    def test_engine_kwargs_are_clamped(self, flux_layers):
+        """The engine stores what the node's widgets allow, no matter what arrives."""
+        m = apply_area_to_model(mock_flux_model(), "flux", WIDTH, HEIGHT,
+                                bridge_floor_steps=99, window_start=-7,
+                                window_hold_steps=40)
+        cfg = m._area_config
+        assert cfg.bridge_floor_steps == 16               # widget max
+        assert cfg.window_start == 0                      # widget min
+        assert cfg.window_hold_steps == 8                 # widget max
+        restore_area_attention_hook(m)
+        small = apply_area_to_model(mock_flux_model(), "flux", WIDTH, HEIGHT,
+                                    bridge_floor_steps=2, window_start=4096,
+                                    window_hold_steps=1)
+        assert small._area_config.window_start == 1024    # widget max
+        restore_area_attention_hook(small)
