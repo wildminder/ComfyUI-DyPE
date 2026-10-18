@@ -696,6 +696,11 @@ class TestSeamConformance:
 # ---------------------------------------------------------------------------
 
 
+#: The pristine ``build_fine_layout``, captured once so a spy never wraps another
+#: spy (a second capture inside one test would chain the wrappers).
+_BUILD_FINE_LAYOUT = area.build_fine_layout
+
+
 @pytest.mark.unit
 class TestBridgeFloor:
     """``bridge_floor_steps``: the leading fine steps of a SHORT schedule keep the
@@ -720,10 +725,10 @@ class TestBridgeFloor:
     def _capture(self, monkeypatch):
         """Spy on ``build_fine_layout``: the (registers, halo) pair actually used."""
         seen = {}
-        real_build = area.build_fine_layout
 
         def spy(windows, h, w, halo, registers, seed, step, dtype, device):
-            layout = real_build(windows, h, w, halo, registers, seed, step, dtype, device)
+            layout = _BUILD_FINE_LAYOUT(windows, h, w, halo, registers, seed,
+                                        step, dtype, device)
             seen["registers"], seen["halo"] = registers, halo
             seen["windows"] = list(windows)
             seen["h"], seen["w"] = h, w
@@ -824,7 +829,15 @@ class TestBridgeFloor:
         captured = []
 
         def run(batch):
-            seen = self._capture(monkeypatch)
+            built = []
+
+            def spy(windows, h, w, halo, registers, seed, step, dtype, device):
+                layout = _BUILD_FINE_LAYOUT(windows, h, w, halo, registers,
+                                            seed, step, dtype, device)
+                built.append((registers, halo, len(windows)))
+                return layout
+
+            monkeypatch.setattr(area, "build_fine_layout", spy)
             m = apply_area_to_model(mock_flux_model(), "flux", CORPUS_WIDTH, CORPUS_HEIGHT,
                                     phase1_steps=CORPUS_PHASE1, seed=7,
                                     bridge_floor_steps=2)
@@ -833,13 +846,18 @@ class TestBridgeFloor:
                              steps=CORPUS_STEPS, txt_len=64, blocks=1)
             finally:
                 restore_area_attention_hook(m)
-            captured.append((seen["registers"], seen["halo"], len(seen["windows"])))
+            captured.append(built)
 
         run(2)                                   # cond + uncond share one forward
         run(2)                                   # a second forward of the same step
         run(1)                                   # the unbatched forward agrees
-        assert len({c[:2] for c in captured}) == 1        # identical draws
-        assert len({c[2] for c in captured}) == 1         # one layout per forward
+        # ONE layout build per forward — the batched (CFG) forward is not rebuilt
+        assert [len(b) for b in captured] == [1, 1, 1]
+        # the floored layout is the same every time (identical draws)
+        assert len({tuple(b) for b in captured}) == 1
+        registers, halo, _windows_seen = captured[0][0]
+        assert registers == bridge_registers(self._windows(64)[0], 0.5)
+        assert halo == 8
 
     def test_cache_key_includes_the_geometry_knobs(self):
         """Two runtimes differing only in window_start must not share a schedule."""
