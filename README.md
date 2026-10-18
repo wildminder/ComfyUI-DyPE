@@ -395,6 +395,10 @@ Window sizes and the bridge/Halo budget are chosen to keep a windowed step at or
 
 **Usage:** Load an unmodified FLUX model → add `AReA` (under `WMNodes/image`) → set `width`/`height` to match your empty latent (multiples of 16) → connect to KSampler. Keep going past 1024 px on the longer side for AReA to engage.
 
+**Z-Image:** same node, `model_type: auto` detects it. Turbo schedules are short (8 steps) — pick `phase1_steps` 1-3 or `phase1_mode: sigma`; the node warns when pooling would flood the run.
+
+**Bootstrap (paper Appendix F, any arch):** when you want the structure of a full-resolution run without the pooled footprint, skip Phase I: sample the coarse steps at the native 1024 px, upscale the **latent** ×2 (no VAE round trip), re-noise to `phase1_sigma` (0.89), then sample the target resolution with `AReA` in `phase1_mode: bootstrap` — windowed attention only, entering at the handover level (the node warns if the sampler enters elsewhere).
+
 <details>
 <summary><b>Inputs & Parameters</b></summary>
 
@@ -402,6 +406,10 @@ Window sizes and the bridge/Halo budget are chosen to keep a windowed step at or
 |:---|:---|:---|
 | `model_type` | auto | Architecture detection (`auto` / `flux`). **FLUX only** in v1 — other architectures are refused with an actionable error. |
 | `width` / `height` | 2048 | Target resolution (multiples of 16). These decide the apply-time checks — the native-extent no-op and the geometry pre-check — so keep them in step with your latent; at each forward AReA re-derives the patch grid from the latent itself and validates the token count against its schedule. |
+| `phase1_mode` | steps | `steps` (the leading `phase1_steps` steps pool) / `sigma` (the switch follows the schedule) / `bootstrap` (no Phase I at all — the paper's Appendix F recipe, see below). |
+| `phase1_steps` | 8 | Phase I length when the mode is `steps`; 8 = the FLUX constant of 28. On Z-Image Turbo's short schedules use 1-3 (or `sigma`) — the node warns when pooling would flood the run. |
+| `phase1_sigma` | 0.89 | Phase I/II boundary when the mode is `sigma`, and the handover level `bootstrap` expects. |
+| `halo` / `bridge_ratio` / `seed` / `pooling` | 8 / 0.5 / 0 / subsample | Phase II's ring width (patches, drawn fresh per side at every step), global-bridge size `round(rho·w)²`, the keyed RNG seed, and which token of each `f x f` block the pooled key/value comes from. |
 | `enable_area` | True | Disable to pass the model through unchanged. |
 | `phase1_steps` | 8 | Leading denoising steps that run Phase I, clamped to the total step count. `8` is the reference's FLUX constant (of 28); `0` = all Phase II (windowed attention from the first step). |
 | `pooling` | subsample | Which token of each `f x f` block the pooled key/value comes from: `subsample` (block centre), `mean` (block average), `medoid` (the token closest to the block-mean key), `random` (drawn per seed, step and block). |
