@@ -51,7 +51,7 @@ import torch.nn.functional as F
 
 import src.area as area
 from src.area import apply_area_to_model, restore_area_attention_hook
-from src.area_attn import apply_rope1
+from src.area_attn import apply_rope1, bridge_registers, windowed_step_cost
 from src.area_zimage import sigma_prefix_count
 
 try:
@@ -333,17 +333,31 @@ class SimulatedZImage:
         return out
 
 
-def _run_forward(m, step, blocks=1, b=1, seed=0, sigmas=True):
-    """Drive one sampled forward through the installed unet wrapper."""
+def _run_forward(m, step, blocks=1, b=1, seed=0, sigmas=True, steps=STEPS):
+    """Drive one sampled forward through the installed unet wrapper.
+
+    ``steps`` selects the schedule length (the default is the reference's FLUX
+    28; the Turbo table is 8), so a short-schedule test can drive the very
+    shift-3.0 table the adaptation research measured on.
+    """
     dm = m.model.diffusion_model
     sim = SimulatedZImage(dm, blocks, b, seed)
-    opts = {"sample_sigmas": _flow_sigmas(STEPS, 3.0), "sigmas": _flow_sigmas(STEPS, 3.0)[step]}
+    opts = {"sample_sigmas": _flow_sigmas(steps, 3.0), "sigmas": _flow_sigmas(steps, 3.0)[step]}
     if not sigmas:
         opts = {"sigmas": torch.tensor([1.0])}
     cross = torch.randn(b, TXT_LEN, 77)
     params = {"input": _latent(b), "timestep": torch.tensor([float(opts["sigmas"])]),
               "c": {"c_crossattn": cross, "transformer_options": opts}}
     return sim, _unet_wrapper(m)(sim.model_function, params)
+
+
+def _turbo_sigmas() -> torch.Tensor:
+    """Turbo's 8-step shift-3.0 table in denoising order, terminal zero included.
+
+    The same table ``docs/2026-10-18-area-zimage-adaptation-research.md`` §2
+    lists, and the one ``_area_locate`` reads (it drops the terminal zero).
+    """
+    return torch.cat([_flow_sigmas(8, 3.0), torch.zeros(1)])
 
 
 def _unet_wrapper(m):
@@ -886,3 +900,106 @@ class TestFluxSeparation:
             restore_area_attention_hook(patched)
         assert flux_layers.attention is base_flux_attention
         assert area._SEAM["consumers"] == 0
+
+# ---------------------------------------------------------------------------
+# The short-schedule bridge floor (A1) through the shared call site
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.unit
+class TestBridgeFloorSeam:
+    """The Z-Image seam consumes the floor through the SAME call site FLUX does.
+
+    Both seams funnel their fine steps into ``src.area._area_fine_layout``
+    (FLUX: ``_area_attention``'s fine branch; Z-Image:
+    ``_zimage_attention``'s fine branch), so one spy on ``build_fine_layout``
+    pins the decision for both backbones.  Geometry: Turbo's 8-step shift-3.0
+    table with ``phase1_steps=3`` — 3 coarse, then 5 fine — on the 65x65 grid.
+    """
+
+    def _run(self, monkeypatch, step, floor, steps=8, phase1=3, halo=8,
+             bridge_ratio=0.5):
+        """One sampled forward; the (registers, halo) the layout builder got."""
+        seen = {}
+        real_build = area.build_fine_layout
+
+        def spy(windows, h, w, halo, registers, seed, st, dtype, device):
+            layout = real_build(windows, h, w, halo, registers, seed, st, dtype, device)
+            seen.update(registers=registers, halo=halo, windows=list(windows), h=h, w=w)
+            return layout
+
+        monkeypatch.setattr(area, "build_fine_layout", spy)
+        cfg = dict(phase1_steps=phase1, seed=4, halo=halo,
+                   bridge_ratio=bridge_ratio, bridge_floor_steps=floor)
+        if steps != 8:
+            # the 28-step reference table for this mocked schedule
+            cfg["phase1_mode"] = "steps"
+        patched = apply_area_to_model(mock_zimage_model(), "zimage", WIDTH, HEIGHT, **cfg)
+        try:
+            sim, out = _run_forward(patched, step, blocks=1, steps=steps)
+        finally:
+            restore_area_attention_hook(patched)
+        assert out.shape == (1, SEQ_LEN, HEADS * HEAD_DIM)
+        return seen
+
+    def _cost(self, seen):
+        return windowed_step_cost(seen["windows"], seen["h"], seen["w"], TXT_LEN,
+                                  seen["registers"], seen["halo"])
+
+    def test_floored_steps_keep_the_bridge_and_halo(self, lumina_model, monkeypatch):
+        """The first two fine steps run the paper's bridge and the full halo."""
+        # the 65x65 grid hands over a 64x64 start window on every fine step, so
+        # R = round(0.5 * 64)^2 — asserted through the shared helper, not literals
+        expected = bridge_registers(64, 0.5)
+        for step in (3, 4):                                # fine steps 0 and 1
+            seen = self._run(monkeypatch, step, floor=2)
+            assert seen["registers"] == expected
+            assert seen["halo"] == 8                       # cfg.halo, uncut
+            # the cost cap is deliberately waived: this is observable
+            assert self._cost(seen) > 1.0
+
+    def test_steps_past_the_floor_are_trimmed_as_today(self, lumina_model, monkeypatch):
+        for step in (5, 6, 7):                             # fine steps 2..4
+            floored = self._run(monkeypatch, step, floor=2)
+            plain = self._run(monkeypatch, step, floor=0)
+            assert (floored["registers"], floored["halo"]) == \
+                   (plain["registers"], plain["halo"])
+
+    def test_coarse_steps_run_phase_i(self, lumina_model, monkeypatch):
+        """A floored step is a fine step: coarse steps are untouched by the floor."""
+        pooled = []
+        real_pool = area.pool_keys_values
+
+        def pool(*a, **kw):
+            pooled.append(1)
+            return real_pool(*a, **kw)
+
+        monkeypatch.setattr(area, "pool_keys_values", pool)
+        patched = apply_area_to_model(mock_zimage_model(), "zimage", WIDTH, HEIGHT,
+                                      phase1_steps=3, seed=4, bridge_floor_steps=2)
+        try:
+            _run_forward(patched, 2, blocks=1, steps=8)     # the last coarse step
+        finally:
+            restore_area_attention_hook(patched)
+        assert len(pooled) == 1                            # Phase I ran, no layout
+
+    def test_a_long_schedule_is_never_floored(self, lumina_model, monkeypatch):
+        floored = self._run(monkeypatch, STEPS - 1, floor=2, steps=STEPS)
+        plain = self._run(monkeypatch, STEPS - 1, floor=0, steps=STEPS)
+        assert (floored["registers"], floored["halo"]) == (plain["registers"], plain["halo"])
+
+    def test_the_warning_names_the_cost_multiplier(self, lumina_model, monkeypatch,
+                                                   caplog):
+        area._warned.clear()
+        try:
+            with caplog.at_level("WARNING", logger="ComfyUI-DyPE"):
+                seen = self._run(monkeypatch, 3, floor=2)
+            message = caplog.text
+            assert "area-bridge-floor" in area._warned
+            assert "1." in message and "x a" in message        # the multiplier
+            assert f"{seen['registers']}" in message           # and the R it keeps
+            # warn-once: the next floored step adds nothing
+            self._run(monkeypatch, 4, floor=2)
+            assert caplog.text.count("1.0x") == 1
+        finally:
+            area._warned.clear()

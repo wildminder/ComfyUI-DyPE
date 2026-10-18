@@ -395,7 +395,7 @@ Window sizes and the bridge/Halo budget are chosen to keep a windowed step at or
 
 **Usage:** Load an unmodified FLUX model → add `AReA` (under `WMNodes/image`) → set `width`/`height` to match your empty latent (multiples of 16) → connect to KSampler. Keep going past 1024 px on the longer side for AReA to engage.
 
-**Z-Image:** same node, `model_type: auto` detects it. Turbo schedules are short (8 steps) — pick `phase1_steps` 1-3 or `phase1_mode: sigma`; the node warns when pooling would flood the run.
+**Z-Image:** same node, `model_type: auto` detects it. Turbo schedules are short (8 steps) — pick `phase1_steps` 1-3 or `phase1_mode: sigma`; the node warns when pooling would flood the run. A short schedule also turns on the bridge floor (`bridge_floor_steps`, default 2 — the first fine steps keep the paper's full bridge and halo instead of the cost cap) and the window-ramp knobs (`window_start` / `window_hold_steps`); all three are inert on a long (28-step) schedule.
 
 **Bootstrap (paper Appendix F) — experimental, does not work on Z-Image Turbo yet:** `phase1_mode: bootstrap` itself is ready (it runs Phase II only, and the entry-sigma check warns when a sampler enters off-level), but the two-sampler *construction* — native 1024 pass, latent ×2 upscale, re-noise to `phase1_sigma`, then the target pass — has failed two GPU validation rounds on Z-Image Turbo's 8-step schedule (round 1: an under-denoised pre-pass the windowed steps could not finish; round 2, faithful to the paper with a full native pre-pass: the windowed pass inflates latent amplitude ~1.8×, so the decode keeps the composition but corrupts the palette). Do not use the recipe on Turbo until that is solved; the validated Z-Image knobs remain `phase1_steps` 1-3 or `sigma` mode.
 
@@ -415,6 +415,9 @@ Window sizes and the bridge/Halo budget are chosen to keep a windowed step at or
 | `pooling` | subsample | Which token of each `f x f` block the pooled key/value comes from: `subsample` (block centre), `mean` (block average), `medoid` (the token closest to the block-mean key), `random` (drawn per seed, step and block). |
 | `halo` | 8 | Widest Halo ring a Phase II window may draw, in patches (`0`–`64`). Each side draws its own fresh width every step; AReA narrows it only when a windowed step would otherwise cost more than full attention. |
 | `bridge_ratio` | 0.5 | Rho of the bridge: each window also attends `round(rho·w)²` of the canvas's most distinctive keys, spread over an 8×8 cell grid so no region is starved. `0` = no bridge. |
+| `bridge_floor_steps` | 2 | Short schedules only (≤ 12 total steps): how many leading Phase II steps keep the paper's full bridge and halo instead of the cost-capped ones — the cap starves the bridge exactly on the composition-critical steps. `0` = the cap on every step; long schedules ignore this knob. |
+| `window_start` | 0 | Short schedules only: the window side (patches) Phase II starts its ramp at, instead of the cost-optimal size (`0` = cost-optimal). Clamped into `[w_min, grid]`; the ramp still ends at `w_min`. |
+| `window_hold_steps` | 0 | Short schedules only: extra Phase II steps that hold the start window before the ramp shrinks it. |
 | `seed` | 0 | Seed of every draw (tile placement, Halo widths and reaches, random pooling). |
 
 > [!TIP]

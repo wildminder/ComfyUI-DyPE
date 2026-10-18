@@ -772,3 +772,124 @@ class TestBootstrapEntrySigma:
         area._warned.clear()
         self._run(None, 0.60, mode="steps")
         assert "zimage-bootstrap-entry" not in area._warned
+
+
+# ---------------------------------------------------------------------------
+# The short-schedule bridge floor (A1) — how the Z-Image resolutions take it
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.unit
+class TestShortScheduleBridgeFloor:
+    """``bridge_floor_steps`` is resolved on the SCHEDULE, not on the mode.
+
+    The floor is keyed on the fine ordinal of the resolved schedule, so the
+    step-count switch, the sigma switch and bootstrap all reach it identically:
+    a resolution that spends more steps coarse simply runs fewer floored fine
+    steps.  Z-Image Turbo's 8-step shift-3.0 table
+    (``docs/2026-10-18-area-zimage-adaptation-research.md`` §2) is the geometry
+    the floor exists for — 3 of 8 steps coarse, 5 fine.
+    """
+
+    def _turbo_table(self) -> torch.Tensor:
+        """Turbo's 8-step table in denoising order, terminal zero included."""
+        return torch.cat([_flow_sigmas(8, 3.0), torch.zeros(1)])
+
+    def _resolve(self, rt, table, txt_len, step):
+        """One forward's resolved context, through the real resolver."""
+        params = {
+            "input": torch.zeros(1, 16, 256, 256),       # a 128x128 patch grid
+            "timestep": torch.tensor([1.0]),
+            "c": {
+                "c_crossattn": torch.zeros(1, txt_len, 77),
+                "transformer_options": {"sample_sigmas": table,
+                                        "sigmas": table[step]},
+            },
+        }
+        try:
+            return area._area_resolve_forward(rt, params)
+        finally:
+            area._AREA_RUNTIME = None
+            area._ZRUNTIME = None
+
+    def _runtime(self, **cfg):
+        """A Z-Image runtime; ``bridge_floor_steps`` defaults to the shipped 2."""
+        return area._AreaRuntime(
+            area.AreaConfig(**{"bridge_floor_steps": 2, **cfg}),
+            NextDiT(), ZIMAGE_PROFILE)
+
+    def test_sigma_mode_gets_the_floor_identically(self):
+        """The sigma switch on Turbo's table: 3 coarse, the first 2 fine floored."""
+        table = self._turbo_table()
+        # σ* = 0.89 on this table is the doc's count — the FLUX constant restated
+        assert sigma_prefix_count(table[:-1], ZIMAGE_SIGMA_STAR) == 3
+        rt = self._runtime(phase1_mode="sigma", phase1_sigma=ZIMAGE_SIGMA_STAR)
+        seen = [self._resolve(rt, table, 64, step) for step in range(8)]
+        fine = [ctx for ctx in seen if ctx.phase == "fine"]
+        coarse = [ctx for ctx in seen if ctx.phase == "coarse"]
+        assert len(coarse) == 3 and len(fine) == 5
+        # fine_step is the ordinal WITHIN Phase II; a coarse step is negative
+        assert [ctx.fine_step for ctx in fine] == [0, 1, 2, 3, 4]
+        assert all(ctx.fine_step < 0 for ctx in coarse)
+        # every fine step of a short schedule carries the floor budget ...
+        assert [ctx.floor_steps for ctx in fine] == [2] * 5
+        assert all(ctx.floor_steps == 0 for ctx in coarse)
+        # ... and the first TWO of them are actually floored
+        assert [ctx.fine_step < ctx.floor_steps for ctx in fine] == [True, True,
+                                                                    False, False,
+                                                                    False]
+
+    def test_steps_mode_lands_on_the_same_floor(self):
+        """The step-count switch with phase1_steps=3 resolves the same thing."""
+        table = self._turbo_table()
+        sigma_rt = self._runtime(phase1_mode="sigma", phase1_sigma=ZIMAGE_SIGMA_STAR)
+        steps_rt = self._runtime(phase1_steps=3)
+        sigma = self._resolve(sigma_rt, table, 64, 3)
+        steps = self._resolve(steps_rt, table, 64, 3)
+        assert (steps.phase, steps.size, steps.fine_step, steps.floor_steps) == \
+               (sigma.phase, sigma.size, sigma.fine_step, sigma.floor_steps)
+        assert (steps.phase, steps.fine_step, steps.floor_steps) == ("fine", 0, 2)
+
+    def test_bootstrap_floors_its_first_steps(self):
+        """Appendix F runs Phase II only, so ITS first steps are floored too."""
+        table = self._turbo_table()
+        rt = self._runtime(phase1_mode="bootstrap")
+        seen = [self._resolve(rt, table, 288, step) for step in range(3)]
+        assert all(ctx.phase == "fine" for ctx in seen)     # no Phase I at all
+        assert [ctx.fine_step for ctx in seen] == [0, 1, 2]
+        assert [ctx.floor_steps for ctx in seen] == [2] * 3
+        assert [ctx.fine_step < ctx.floor_steps for ctx in seen] == [True, True, False]
+
+    def test_a_long_schedule_is_not_floored(self):
+        """A 28-step schedule is not short: no floor anywhere (FLUX parity)."""
+        table = torch.cat([_flow_sigmas(28, 3.0), torch.zeros(1)])
+        assert not area.is_short_schedule(table.numel() - 1)
+        rt = self._runtime(phase1_steps=8)
+        for step in range(8, 28):
+            ctx = self._resolve(rt, table, 64, step)
+            assert ctx.phase == "fine"
+            assert ctx.floor_steps == 0
+
+    def test_the_floor_knob_off_silences_every_resolution(self):
+        """``bridge_floor_steps=0`` restores today's behaviour on every mode."""
+        table = self._turbo_table()
+        for mode, cfg in (("sigma", {"phase1_sigma": ZIMAGE_SIGMA_STAR}),
+                          ("steps", {"phase1_steps": 3}), ("bootstrap", {})):
+            rt = self._runtime(phase1_mode=mode, bridge_floor_steps=0, **cfg)
+            seen = [self._resolve(rt, table, 64, step) for step in range(8)]
+            assert all(ctx.floor_steps == 0 for ctx in seen), mode
+
+    def test_the_gate_is_the_shared_constant(self):
+        """Both short-schedule gates consume one definition, by construction."""
+        from src.area_schedule import SHORT_SCHEDULE_TOTAL, is_short_schedule
+
+        assert area.is_short_schedule is is_short_schedule
+        assert SHORT_SCHEDULE_TOTAL == 12
+        # the floor and the regime advisory read the same boundary, so they
+        # cannot disagree about what a short schedule is
+        for total in (1, 2, 8, 12, 13, 28):
+            table = torch.cat([_flow_sigmas(total, 3.0), torch.zeros(1)])
+            assert table.numel() - 1 == total      # the sampler's own step count
+            rt = self._runtime(phase1_steps=0, bridge_floor_steps=2)
+            ctx = self._resolve(rt, table, 64, 0)
+            assert bool(ctx.floor_steps) is is_short_schedule(total), total
