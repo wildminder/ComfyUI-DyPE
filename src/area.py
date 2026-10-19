@@ -845,9 +845,14 @@ def _zimage_attention(rt: _AreaRuntime, ctx: AreaContext, layout, q, k, v, heads
     * **Phase II** attends at the model's own full-resolution positions, which IS
       the table the recorder captured — so the rotated pair passes through
       untouched (a second rotation would be a float round trip of the same table)
-      and only the bridge's keys are un-rotated (``bridge.py:10-24``).  The
-      answers go back in stream order with zeros in the pad spans Phase II
-      discards (``stitch_fine_zeros``).
+      and only the bridge's keys are un-rotated (``bridge.py:10-24``).  The text
+      block is the whole PADDED caption block — ``[0, cap_len)``, the prompt's
+      tokens plus the model's own learned caption pad
+      (``cap_pad_token``, ``comfy/ldm/lumina/model.py:620-623``) — the same span
+      Phase I passes through, so both phases see the same caption and the pad
+      tokens keep their attention outputs.  The answers go back in stream order
+      with zeros only in the image pad span Phase II discards
+      (``stitch_fine_zeros``).
     """
     table = rt.recorder.full_table()
     if table.shape[2] != layout.seq_len:
@@ -883,7 +888,7 @@ def _zimage_attention(rt: _AreaRuntime, ctx: AreaContext, layout, q, k, v, heads
         if fine is None:
             return None
         out_txt, out_img = windowed_attention(
-            q[:, :, :ctx.txt_len], k[:, :, :ctx.txt_len], v[:, :, :ctx.txt_len],
+            q[:, :, :layout.cap_len], k[:, :, :layout.cap_len], v[:, :, :layout.cap_len],
             q[:, :, first:last], k[:, :, first:last], v[:, :, first:last],
             unrotate1(k, table)[:, :, first:last], fine,
         )

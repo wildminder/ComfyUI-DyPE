@@ -562,30 +562,45 @@ class TestPadPolicy:
                            k[0, 0, CAP_LEN + expected_centre, 0])
 
     def test_phase2_pad_positions_filled_after_stitch(self):
-        """Phase II: the answers go back in stream order and the pad slots read zero."""
+        """Phase II: the text answer spans the whole padded caption block.
+
+        The engine now answers for ``cap_len`` text tokens — the prompt's tokens
+        PLUS the model's own learned caption pad (``cap_pad_token``,
+        ``comfy/ldm/lumina/model.py:620-623``) — so only the IMAGE pad span
+        stays zero (it is discarded at unpatchify).
+        """
         layout = zimage_layout(TXT_LEN, CAP_LEN, H, W, SEQ_LEN)
         assert (layout.cap_pad, layout.img_pad) == (CAP_LEN - TXT_LEN, IMG_PAD)
         heads, dim = 2, 4
         torch.manual_seed(2)
-        out_text = torch.randn(1, heads, TXT_LEN, dim)
+        out_text = torch.randn(1, heads, CAP_LEN, dim)
         out_image = torch.randn(1, heads, IMG_TOKENS, dim)
 
         out = stitch_fine_zeros(out_text, out_image, layout)
 
         assert out.shape == (1, heads, SEQ_LEN, dim)
-        assert torch.equal(out[:, :, :TXT_LEN], out_text)
+        # the text answer covers the prompt tokens AND the learned caption pad
+        assert torch.equal(out[:, :, :CAP_LEN], out_text)
         assert torch.equal(out[:, :, CAP_LEN:CAP_LEN + IMG_TOKENS], out_image)
-        # both discarded pad spans are exactly zero, and nothing else is
-        assert torch.equal(out[:, :, TXT_LEN:CAP_LEN], torch.zeros_like(out[:, :, TXT_LEN:CAP_LEN]))
+        # the caption pad span carries the model's own attention answer, not zeros
+        assert out[:, :, TXT_LEN:CAP_LEN].abs().sum() > 0
+        assert torch.equal(out[:, :, TXT_LEN:CAP_LEN], out_text[:, :, TXT_LEN:CAP_LEN])
+        # ONLY the image pad span is exactly zero, and nothing else is
         assert torch.equal(out[:, :, CAP_LEN + IMG_TOKENS:],
                            torch.zeros_like(out[:, :, CAP_LEN + IMG_TOKENS:]))
-        # the zero slots are exactly the pad spans — caption pad plus image pad
         assert layout.cap_pad == CAP_LEN - TXT_LEN
         assert layout.img_pad == IMG_PAD
-        assert int((out[0, 0, :, 0] == 0).sum()) == layout.cap_pad + layout.img_pad
+        assert int((out[0, 0, :, 0] == 0).sum()) == layout.img_pad
         # a mismatched output pair is refused rather than mis-placed
         with pytest.raises(ValueError, match="do not match the Z-Image layout"):
             stitch_fine_zeros(out_text[:, :, :-1], out_image, layout)
+        # the degenerate geometry — a prompt already 32-aligned, so cap_pad is
+        # empty — is unchanged: the text block is the prompt, the pad is zero
+        even = zimage_layout(CAP_LEN, CAP_LEN, H, W, SEQ_LEN)
+        even_text = torch.randn(1, heads, CAP_LEN, dim)
+        even_out = stitch_fine_zeros(even_text, out_image, even)
+        assert torch.equal(even_out[:, :, :CAP_LEN], even_text)
+        assert int((even_out[0, 0, :, 0] == 0).sum()) == IMG_PAD
 
 
 # ---------------------------------------------------------------------------

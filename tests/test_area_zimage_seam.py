@@ -32,8 +32,10 @@ What this file pins:
   call order and the ``noise_refiner`` hook feeds the detail map the real image
   tokens only, never the pad — registered on every refiner LAYER, because lumina
   iterates the ModuleList (``model.py:816``) instead of calling it;
-* the computation: comfy-shaped output, RNG keyed by ``(seed, step)``, and ONE
-  layout shared by cond and uncond of a batched forward;
+* the computation: comfy-shaped output, RNG keyed by ``(seed, step)``, ONE
+  layout shared by cond and uncond of a batched forward, and the Phase II text
+  block spanning the whole padded caption block (``cap_len``, the prompt tokens
+  plus the model's learned caption pad) with only the image pad zeroed;
 * the FLUX seam is untouched by a Z-Image install, and vice versa.
 
 Markers: @pytest.mark.unit
@@ -879,6 +881,56 @@ class TestZImageComputation:
         assert out.shape == (2, SEQ_LEN, HEADS * HEAD_DIM)
         # both branches attend through the same windows but answer for their own q
         assert not torch.allclose(out[0], out[1])
+
+    def test_phase2_attends_the_whole_caption_block(self, lumina_model, monkeypatch):
+        """Phase II hands the engine the FULL padded caption block (``cap_len``).
+
+        The prompt here is 20 tokens inside a 32-token caption block, so the
+        caption pad span is non-empty: the seam must pass ``cap_len`` text
+        queries/keys/values to ``windowed_attention`` — the prompt tokens plus the
+        model's own learned pad (``cap_pad_token``,
+        ``comfy/ldm/lumina/model.py:620-623``), the same span Phase I passes
+        through — and stitch their answer back, leaving ONLY the image pad span
+        zero (``stitch_fine_zeros``).
+        """
+        seen: dict = {}
+        real_window = area.windowed_attention
+        real_stitch = area.stitch_fine_zeros
+
+        def window(*args, **kw):
+            seen["txt_len"], seen["kv_len"], seen["val_len"] = (int(args[0].shape[2]),
+                                                                int(args[1].shape[2]),
+                                                                int(args[2].shape[2]))
+            return real_window(*args, **kw)
+
+        def stitch(out_text, out_image, layout):
+            seen["text_out"] = int(out_text.shape[2])
+            stitched = real_stitch(out_text, out_image, layout)
+            seen["stitched"] = stitched.clone()
+            return stitched
+
+        monkeypatch.setattr(area, "windowed_attention", window)
+        monkeypatch.setattr(area, "stitch_fine_zeros", stitch)
+        patched = apply_area_to_model(mock_zimage_model(), "zimage", WIDTH, HEIGHT,
+                                      phase1_steps=PHASE1, seed=9)
+        try:
+            sim, out = _run_forward(patched, step=STEPS - 1)      # a fine step
+        finally:
+            restore_area_attention_hook(patched)
+
+        # the engine's text block is the whole padded caption block, not the
+        # prompt alone: TXT_LEN=20 prompt tokens + CAP_LEN - TXT_LEN learned pad
+        assert (seen["txt_len"], seen["kv_len"], seen["val_len"]) == (CAP_LEN,) * 3
+        assert seen["text_out"] == CAP_LEN
+        # the caption pad span now carries the model's own attention answer
+        stitched = seen["stitched"]
+        assert stitched[:, :, TXT_LEN:CAP_LEN].abs().sum() > 0
+        # ONLY the image pad span stays zero — and still zero through the
+        # seam's own flatten of the stitched answer
+        assert torch.equal(stitched[:, :, CAP_LEN + IMG_TOKENS:],
+                           torch.zeros_like(stitched[:, :, CAP_LEN + IMG_TOKENS:]))
+        assert torch.equal(out[:, CAP_LEN + IMG_TOKENS:, :],
+                           torch.zeros_like(out[:, CAP_LEN + IMG_TOKENS:, :]))
 
 
 # ---------------------------------------------------------------------------

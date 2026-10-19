@@ -37,8 +37,10 @@ caption length, not at the prompt's.  :class:`ZImageJointLayout` is that
 geometry, validated against the pad multiple so a Ming-Image-style prompt mask
 or a foreign stream is refused instead of pooling the wrong tokens.  The engine
 is handed exactly ``h*w`` image tokens (plan Q6); the pad key/value tokens pass
-through Phase I unchanged, and Phase II stitches zeros into the discarded pad
-slots.
+through Phase I unchanged, and Phase II stitches its answer over the whole
+padded caption block (the prompt tokens plus the model's learned caption pad,
+``cap_pad_token``, ``comfy/ldm/lumina/model.py:620-623``) while only the image
+pad slots stay zero (they are discarded at unpatchify).
 
 No comfy import and no module rebinding here: this module owns tensors only, the
 seam install is t4 (``src/area.py``), and the arch profile is t2
@@ -404,8 +406,9 @@ class ZImageJointLayout:
     slicing methods below are the policy itself: the engine is handed exactly
     ``h*w`` image tokens (:meth:`image`, plan Q6) plus the never-pooled
     non-image tokens (:meth:`pass_through`), so the pad key/value tokens ride
-    through Phase I unchanged and :func:`stitch_fine_zeros` writes zeros into
-    the pad slots Phase II discards.
+    through Phase I unchanged and :func:`stitch_fine_zeros` writes the Phase II
+    answer over the whole padded caption block, leaving only the image pad slots
+    zero.
     """
 
     txt_len: int
@@ -648,25 +651,27 @@ def coarse_ropes_zimage(
 def stitch_fine_zeros(
     out_text: torch.Tensor, out_image: torch.Tensor, layout: ZImageJointLayout
 ) -> torch.Tensor:
-    """A Phase II output in stream order, zeros in the discarded pad slots.
+    """A Phase II output in stream order, zeros only in the discarded pad.
 
-    :func:`src.area_attn.windowed_attention` answers for the real text and image
-    tokens only — the pad slots are neither text nor windows — so the seam has
-    to put the answers back where the stream expects them: the prompt's tokens at
-    ``[0, txt_len)``, the image tokens at ``[cap_len, cap_len + h*w)``, and zeros
-    in the two pad spans (plan Q6; the pad tokens are the model's own learned
-    padding, ``comfy/ldm/lumina/model.py:620-623`` and ``:725-727``).
+    :func:`src.area_attn.windowed_attention` answers for the text and image
+    tokens only — the image pad slots are neither text nor windows — so the seam
+    has to put the answers back where the stream expects them: the text answer
+    spans the whole PADDED caption block ``[0, cap_len)`` (the prompt's tokens
+    plus the model's own learned caption pad, ``cap_pad_token``,
+    ``comfy/ldm/lumina/model.py:620-623``), the image tokens at
+    ``[cap_len, cap_len + h*w)``, and ONLY the image pad span stays zero (it is
+    discarded at unpatchify; ``model.py:725-727``).
     """
-    if out_text.shape[2] != layout.txt_len or out_image.shape[2] != layout.h * layout.w:
+    if out_text.shape[2] != layout.cap_len or out_image.shape[2] != layout.h * layout.w:
         raise ValueError(
             f"AReA: the Phase II outputs ({out_text.shape[2]} text, "
             f"{out_image.shape[2]} image tokens) do not match the Z-Image "
-            f"layout (txt_len={layout.txt_len}, h*w={layout.h * layout.w}), so "
+            f"layout (cap_len={layout.cap_len}, h*w={layout.h * layout.w}), so "
             "they cannot be stitched back into the padded stream. This call "
             "runs plain attention."
         )
     b, heads, _, dim = out_image.shape
     out = out_image.new_zeros(b, heads, layout.seq_len, dim)
-    out[:, :, : layout.txt_len] = out_text
+    out[:, :, : layout.cap_len] = out_text
     out[:, :, layout.img_start : layout.img_end] = out_image
     return out
