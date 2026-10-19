@@ -405,7 +405,7 @@ Window sizes and the bridge/Halo budget are chosen to keep a windowed step at or
 | Parameter | Default | Description |
 |:---|:---|:---|
 | `model_type` | auto | Architecture detection (`auto` / `flux` / `zimage`); a mismatch with the loaded model is refused with an actionable error. |
-| `width` / `height` | 2048 | Target resolution (multiples of 16). These decide the apply-time checks — the native-extent no-op and the geometry pre-check — so keep them in step with your latent; at each forward AReA re-derives the patch grid from the latent itself and validates the token count against its schedule. |
+| `width` / `height` | 2048 | Target resolution (multiples of 16). These decide the apply-time checks — the native-extent no-op and the geometry pre-check — so keep them in step with your latent; at each forward AReA re-derives the patch grid from the latent itself and validates the token count against its schedule. A grid whose dimensions share no factor (512×2000 and friends) is **adjusted, not refused** — the edge block pools partially, the node warns once, and the output resolution is unchanged. |
 | `phase1_mode` | auto | `auto` (per backbone: `sigma` on Z-Image, the reference's `steps` on FLUX) / `steps` (the leading `phase1_steps` steps pool) / `sigma` (the switch follows the schedule) / `bootstrap` (no Phase I at all — the paper's Appendix F recipe, see below). |
 | `phase1_steps` | 8 | Phase I length when the mode is `steps`; 8 = the FLUX constant of 28. On Z-Image Turbo's short schedules use 1-3 (or `sigma`) — the node warns when pooling would flood the run. |
 | `phase1_sigma` | 0.89 | Phase I/II boundary when the mode is `sigma`, and the handover level `bootstrap` expects. |
@@ -424,7 +424,7 @@ Window sizes and the bridge/Halo budget are chosen to keep a windowed step at or
 > **Determinism:** every draw is keyed by `(seed, step)` — no global RNG is read — and cond and uncond share one batched forward, so both CFG branches attend through **identical** windows, halos and bridges. Same seed, same layout.
 
 > [!IMPORTANT]
-> **Model support:** FLUX only. **Nunchaku is not supported** — its quantized/fused attention kernels bypass the attention seam, so the node warns and returns the model unchanged. AReA replaces attention itself, so on the steps it runs it takes precedence over an installed SPA/HAP hook (plain-attention steps and the native extent still delegate to it), and a chained DyPE/SEGA positional embedder composes — AReA's coarse positions ride on whichever embedder is installed, with a one-time warning when that embedder is dynamic.
+> **Model support:** FLUX and Z-Image (Lumina2 / NextDiT). **Nunchaku is not supported** — its quantized/fused attention kernels bypass the attention seam, so the node warns and returns the model unchanged. AReA replaces attention itself, so on the steps it runs it takes precedence over an installed SPA/HAP hook (plain-attention steps and the native extent still delegate to it), and a chained DyPE/SEGA positional embedder composes — AReA's coarse positions ride on whichever embedder is installed, with a one-time warning when that embedder is dynamic.
 
 <p align="right"><a href="#readme-top" title="back to top">⟔ ▲ ⟓</a></p>
 
