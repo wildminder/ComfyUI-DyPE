@@ -186,20 +186,48 @@ def _pool(x_img: torch.Tensor, h: int, w: int, f: int, pooling: str,
     return pooled.reshape(b, heads, nh * nw, dim)
 
 
+def _norm_preserved_keys(k_img: torch.Tensor, h: int, w: int, f: int) -> torch.Tensor:
+    """The ``mean`` pooling's keys: the block-mean DIRECTION at the mean MEMBER NORMS.
+
+    ``subsample`` pooling discards ``f^2 - 1`` of every block's tokens, so the
+    survivors' values form a Dirac comb on the ``f``-stride grid and drive the
+    latent toward a piecewise-constant mosaic (Flaw 3).  Averaging the block
+    removes the comb but also shrinks the key norm by roughly ``sqrt(f^2)``,
+    flattening the attention temperature.  This keeps the centroid direction —
+    every token of the block still contributes equally — and rescales it to the
+    mean of the block's member norms, so the softmax scale stays the un-pooled
+    one.  ``f == 1`` returns the keys untouched, bit for bit.
+    """
+    b, heads, _, dim = k_img.shape
+    nh, nw = h // f, w // f
+    if f == 1:
+        return k_img
+    grid = k_img.reshape(b, heads, nh, f, nw, f, dim).float()
+    centroid = grid.mean(dim=(3, 5))
+    norms = grid.norm(dim=-1).mean(dim=(3, 5))
+    pooled = centroid / (centroid.norm(dim=-1, keepdim=True) + 1e-8) * norms[..., None]
+    return pooled.reshape(b, heads, nh * nw, dim).to(k_img.dtype)
+
+
 def pool_keys_values(key: torch.Tensor, value: torch.Tensor, txt_len: int, h: int, w: int, f: int,
                      pooling: str, seed: int = 0, step: int = 0, block: int = 0
                      ) -> tuple[torch.Tensor, torch.Tensor]:
     """Keep one token per ``f x f`` block of the image keys and values (text is never pooled).
 
-    ``subsample`` keeps the block centre, ``mean`` averages the block, ``medoid``
-    keeps the token whose key is closest to the block-mean key, and ``random``
-    keeps a token drawn per ``(seed, step, block)``.  Keys must be unrotated —
-    pooling after RoPE would rotate the survivors away from the query's frame —
-    and K and V always come from the same token.
+    ``subsample`` keeps the block centre, ``mean`` averages the VALUES and keeps
+    the norm-preserving CENTROID keys (:func:`_norm_preserved_keys` — the block-mean
+    direction at the mean member norm, so neither a Dirac comb nor a flattened
+    temperature; M2 in ``.dev/area-debug/area-fix.txt``), ``medoid`` keeps the
+    token whose key is closest to the block-mean key, and ``random`` keeps a token
+    drawn per ``(seed, step, block)``.  Keys must be unrotated — pooling after
+    RoPE would rotate the survivors away from the query's frame — and K and V
+    always come from the same token for the selecting poolings.
     """
     k_img, v_img = key[:, :, txt_len:], value[:, :, txt_len:]
     sel = _block_selection(k_img, h, w, f, pooling, seed, step, block)
-    k = torch.cat([key[:, :, :txt_len], _pool(k_img, h, w, f, pooling, sel)], dim=2)
+    k_pooled = (_norm_preserved_keys(k_img, h, w, f) if pooling == "mean"
+                else _pool(k_img, h, w, f, pooling, sel))
+    k = torch.cat([key[:, :, :txt_len], k_pooled], dim=2)
     v = torch.cat([value[:, :, :txt_len], _pool(v_img, h, w, f, pooling, sel)], dim=2)
     return k, v
 

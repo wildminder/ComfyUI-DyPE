@@ -5,9 +5,10 @@ Plan 2026-10-15, Phase 2 (``docs/2026-10-15-area-aReA-node.md``): the port of th
 What these tests pin:
 
 * **Pooling** — all four modes shrink the image keys and values to ``(h/f)(w/f)`` while the
-  text tokens pass through untouched, ``subsample`` is the block centre, ``mean`` the block
-  average, ``medoid`` the token closest to the block-mean key and ``random`` a draw keyed
-  by ``(seed, step, block)``.  K and V always come from the same token.
+  text tokens pass through untouched, ``subsample`` is the block centre, ``mean`` the plain
+  block average for VALUES with the norm-preserving centroid key for KEYS (the block-mean
+  direction at the mean member norm), ``medoid`` the token closest to the block-mean key and
+  ``random`` a draw keyed by ``(seed, step, block)``.  K and V always come from the same token.
 * **RoPE** — :func:`apply_rope1` is comfy's ``_apply_rope1`` (``ldm/flux/math.py:36-49``)
   in local form: the hand-computed rotation, the input dtype, the head-shared table and
   comfy's clip when the table is longer than the tensor.
@@ -96,12 +97,65 @@ class TestPoolKeysValues:
         assert torch.equal(pooled, grid[:, :, off::f, off::f][:, :, : h // f, : w // f]
                            .reshape(B, HEADS, -1, DIM))
 
-    def test_mean_averages_the_block(self):
+    def test_mean_pools_keys_norm_preserved_and_values_plain(self):
+        """M2: ``mean`` keys are the block-mean DIRECTION at the mean MEMBER NORM.
+
+        The centroid direction keeps every token of the block contributing (no
+        Dirac comb, ``.dev/area-debug/area-fix.txt`` Flaw 3) while the restored
+        member norm keeps the attention temperature at the un-pooled one; the
+        VALUES stay the plain block mean.
+        """
         h, w, f = 12, 16, 4
-        _, k, v = _seam(h=h, w=w)
-        blocks = _blocks(k[:, :, TEXT:], h, w, f)
-        assert torch.allclose(_pool(k[:, :, TEXT:], h, w, f, "mean", None),
-                              blocks.mean(dim=4).reshape(B, HEADS, -1, DIM), atol=1e-6)
+        _, k, v = _seam(h=h, w=w, seed=5)
+        pk, pv = pool_keys_values(k, v, TEXT, h, w, f, "mean")
+        blocks_k = _blocks(k[:, :, TEXT:], h, w, f)
+        blocks_v = _blocks(v[:, :, TEXT:], h, w, f)
+
+        # values: the plain block average, exactly as before (text never pooled)
+        assert torch.allclose(pv[:, :, TEXT:],
+                              blocks_v.mean(dim=4).reshape(B, HEADS, -1, DIM), atol=1e-6)
+
+        # keys: the centroid direction ...
+        centroid = blocks_k.mean(dim=4)                       # [b, heads, nh, nw, d]
+        expected = (centroid / (centroid.norm(dim=-1, keepdim=True) + 1e-8)
+                    * blocks_k.norm(dim=-1).mean(dim=4, keepdim=True))
+        assert torch.allclose(pk[:, :, TEXT:],
+                              expected.reshape(B, HEADS, -1, DIM), atol=1e-5)
+        # ... which is NOT the plain block mean: the norm really is restored
+        assert not torch.allclose(pk[:, :, TEXT:],
+                                  centroid.reshape(B, HEADS, -1, DIM), atol=1e-3)
+        # the direction is the block mean's own ...
+        flat = centroid.reshape(B, HEADS, -1, DIM)
+        assert torch.allclose(pk[:, :, TEXT:] / pk[:, :, TEXT:].norm(dim=-1, keepdim=True),
+                              flat / flat.norm(dim=-1, keepdim=True), atol=1e-5)
+        # ... and the norm is the mean of the block's member norms
+        assert torch.allclose(pk[:, :, TEXT:].norm(dim=-1),
+                              blocks_k.norm(dim=-1).mean(dim=4).reshape(B, HEADS, -1),
+                              atol=1e-5)
+        # the text half is untouched either way
+        assert torch.equal(pk[:, :, :TEXT], k[:, :, :TEXT])
+        assert torch.equal(pv[:, :, :TEXT], v[:, :, :TEXT])
+
+    def test_mean_at_factor_one_is_bitwise_identity(self):
+        """``f == 1`` pools nothing: ``mean`` returns the keys bit for bit."""
+        h, w, f = 8, 8, 1
+        _, k, v = _seam(h=h, w=w, seed=5)
+        pk, pv = pool_keys_values(k, v, TEXT, h, w, f, "mean")
+        assert torch.equal(pk, k)
+        assert torch.equal(pv, v)
+
+    def test_the_selecting_poolings_are_unchanged(self):
+        """subsample / medoid / random keep the shared-selection behaviour: K and V
+        still come from the same token, pooled with :func:`_pool`."""
+        h, w, f = 8, 8, 2
+        for pooling in ("subsample", "medoid", "random"):
+            _, k, v = _seam(h=h, w=w, seed=3)
+            sel = _block_selection(k[:, :, TEXT:], h, w, f, pooling, 5, 2, 1)
+            pk, pv = pool_keys_values(k, v, TEXT, h, w, f, pooling, 5, 2, 1)
+            assert torch.equal(pk[:, :, TEXT:],
+                               _pool(k[:, :, TEXT:], h, w, f, pooling, sel))
+            assert torch.equal(pv[:, :, TEXT:],
+                               _pool(v[:, :, TEXT:], h, w, f, pooling, sel))
 
     def test_medoid_keeps_the_token_closest_to_the_block_mean_key(self):
         """Rebuilt independently: for every block the argmin over the squared distance to the
