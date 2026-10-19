@@ -265,8 +265,10 @@ class WindowGroup:
     tokens: torch.Tensor                 # [G, n]
     halo: Optional[torch.Tensor]         # [G, n_halo]
     weights: torch.Tensor                # [G * n] merge weights
-    #: indices into :attr:`FineLayout.windows`, one per member
-    window_ids: torch.Tensor = None      # [G]
+    #: indices into :attr:`FineLayout.windows`, one per member.  ``None`` when a
+    #: hand-built group does not declare the mapping — the mapping is then
+    #: recovered from the group's own token rows (see ``_group_window_ids``).
+    window_ids: Optional[torch.Tensor] = None      # [G]
 
 
 @dataclass
@@ -395,6 +397,30 @@ def saturate_bridge_positions(reg_indices: torch.Tensor, win: Window, h: int, w:
     return sat_r, sat_c
 
 
+def _group_window_ids(group: WindowGroup, layout: FineLayout) -> list[int]:
+    """The layout windows a group's members belong to.
+
+    ``group.window_ids`` is the declared mapping — the builder fills it in.
+    A hand-built group may leave it unset (``None``); the mapping is then
+    recovered by matching the group's token rows against the layout's windows
+    (the same windows, found the long way round), so such a group runs instead
+    of raising.  A member that matches nothing keeps its own index.
+    """
+    if group.window_ids is not None:
+        return [int(i) for i in group.window_ids.reshape(-1).tolist()]
+    found: list[int] = []
+    for member, row in enumerate(group.tokens):
+        match = None
+        for i, win in enumerate(layout.windows):
+            if win.area != int(row.numel()):
+                continue
+            if torch.equal(window_tokens(win, layout.w, row.device), row):
+                match = i
+                break
+        found.append(member if match is None else match)
+    return found
+
+
 def windowed_attention(q_txt: torch.Tensor, k_txt: torch.Tensor, v_txt: torch.Tensor,
                        q_img: torch.Tensor, k_img: torch.Tensor, v_img: torch.Tensor,
                        k_img_unrotated: torch.Tensor, layout: FineLayout,
@@ -440,7 +466,7 @@ def windowed_attention(q_txt: torch.Tensor, k_txt: torch.Tensor, v_txt: torch.Te
                 # registers' own either way, and a caller without an embedder (FLUX) keeps
                 # the paper's true-position keys untouched.
                 sat_rows, sat_cols = [], []
-                for j, win_index in enumerate(group.window_ids.tolist()):
+                for j, win_index in enumerate(_group_window_ids(group, layout)):
                     sat_r, sat_c = saturate_bridge_positions(
                         reg[j], layout.windows[win_index], layout.h, layout.w, q_img.device)
                     sat_rows.append(sat_r)
