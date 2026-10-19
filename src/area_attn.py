@@ -131,6 +131,10 @@ class AreaContext:
     fine_step: int = 0
     #: how many leading fine steps the bridge floor covers (0 = no floor)
     floor_steps: int = 0
+    #: the schedule's total step count, so the layout builder can tell a short
+    #: (distilled) schedule from a long one without peeking into caches
+    #: (``0`` when a context is built by hand)
+    total: int = 0
     data: dict = field(default_factory=dict)
 
 
@@ -261,6 +265,8 @@ class WindowGroup:
     tokens: torch.Tensor                 # [G, n]
     halo: Optional[torch.Tensor]         # [G, n_halo]
     weights: torch.Tensor                # [G * n] merge weights
+    #: indices into :attr:`FineLayout.windows`, one per member
+    window_ids: torch.Tensor = None      # [G]
 
 
 @dataclass
@@ -354,15 +360,45 @@ def build_fine_layout(windows: list[Window], h: int, w: int, halo: int, register
             tokens=torch.stack([tokens[i] for i in members]),
             halo=torch.stack([rings[i] for i in members]) if ring_len else None,
             weights=torch.cat([weights[i] for i in members]),
+            window_ids=torch.tensor(members, dtype=torch.long, device=device),
         )
         for (_, ring_len), members in by_key.items()
     ]
     return FineLayout(h, w, windows, groups, coverage, registers)
 
 
+# The rope horizon of Z-Image's trained extent: rope theta=256 makes the base rotary
+# frequency 1.0 rad per token, so a bridge hop of the canvas' own diameter (100+ tokens
+# at 2048 px) wraps the rotation ~16 times and turns the query-key dot product into
+# pseudorandom noise — distant features leak into empty regions and hallucinate there
+# (area-fix2 mechanism 2).  56 tokens stays inside the trained 64-token extent.
+D_MAX_HORIZON = 56.0
+
+
+def saturate_bridge_positions(reg_indices: torch.Tensor, win: Window, h: int, w: int,
+                              device) -> tuple[torch.Tensor, torch.Tensor]:
+    """The saturated ``(rows, cols)`` of one window's bridge tokens (area-fix2 mechanism 2).
+
+    The register's true offset from the window centre is compressed through a smooth
+    ``D_MAX * tanh(delta / D_MAX)``: the direction survives — and the axis ratio too,
+    while the offset stays inside the horizon — but no query ever meets a bridge key
+    through more rope phase than the model was trained on.
+    """
+    win_r_center = (win.r0 + win.r1) * 0.5
+    win_c_center = (win.c0 + win.c1) * 0.5
+    reg_r = (reg_indices // w).to(torch.float32)
+    reg_c = (reg_indices % w).to(torch.float32)
+    delta_r = reg_r - win_r_center
+    delta_c = reg_c - win_c_center
+    sat_r = win_r_center + D_MAX_HORIZON * torch.tanh(delta_r / D_MAX_HORIZON)
+    sat_c = win_c_center + D_MAX_HORIZON * torch.tanh(delta_c / D_MAX_HORIZON)
+    return sat_r, sat_c
+
+
 def windowed_attention(q_txt: torch.Tensor, k_txt: torch.Tensor, v_txt: torch.Tensor,
                        q_img: torch.Tensor, k_img: torch.Tensor, v_img: torch.Tensor,
-                       k_img_unrotated: torch.Tensor, layout: FineLayout
+                       k_img_unrotated: torch.Tensor, layout: FineLayout,
+                       rope_embedder=None, cap_len: int = 32
                        ) -> tuple[torch.Tensor, torch.Tensor]:
     """Attention inside each window, its keys extended by the Halo ring and the bridge tokens.
 
@@ -371,6 +407,13 @@ def windowed_attention(q_txt: torch.Tensor, k_txt: torch.Tensor, v_txt: torch.Te
     Window outputs merge with the centre weights, and the text output is the mean
     over windows: every window re-runs the same text queries and keys, so averaging
     is the refusal to let window count leak into the text stream.
+
+    ``rope_embedder`` (with ``cap_len``) turns on the bridge ROPE HORIZON
+    SATURATION (area-fix2 mechanism 2): the bridge keys are taken from the UNROTATED
+    keys and re-roped at the saturated positions instead of riding the true-position
+    rotation, so no query meets a distant key through more rope phase than the model
+    was trained on.  Without an embedder (the FLUX call) the bridge keeps the paper's
+    true-position keys, which is why this is a keyword-only opt-in.
     """
     b, heads, n_img, dim = q_img.shape
     t = q_txt.shape[2]
@@ -389,9 +432,37 @@ def windowed_attention(q_txt: torch.Tensor, k_txt: torch.Tensor, v_txt: torch.Te
 
         extra_k, extra_v = [], []
         if score is not None:
-            reg = select_registers(score, group.tokens, layout.registers, layout.h, layout.w).reshape(-1)
-            extra_k.append(k_img[:, :, reg].reshape(b, heads, g, -1, dim))
-            extra_v.append(v_img[:, :, reg].reshape(b, heads, g, -1, dim))
+            reg = select_registers(score, group.tokens, layout.registers, layout.h, layout.w)
+            if rope_embedder is not None:
+                # Horizon saturation (area-fix2 mechanism 2): the bridge KEYS are re-roped
+                # from their saturated positions, so no query meets a distant key through
+                # more rope phase than the model's trained extent.  The VALUES are the
+                # registers' own either way, and a caller without an embedder (FLUX) keeps
+                # the paper's true-position keys untouched.
+                sat_rows, sat_cols = [], []
+                for j, win_index in enumerate(group.window_ids.tolist()):
+                    sat_r, sat_c = saturate_bridge_positions(
+                        reg[j], layout.windows[win_index], layout.h, layout.w, q_img.device)
+                    sat_rows.append(sat_r)
+                    sat_cols.append(sat_c)
+                ids = torch.zeros(g, layout.registers, 3, device=q_img.device,
+                                  dtype=torch.float32)
+                ids[:, :, 0] = float(cap_len + 1)
+                ids[:, :, 1] = torch.stack(sat_rows)
+                ids[:, :, 2] = torch.stack(sat_cols)
+                from .area_zimage import _head_shared
+                rope = _head_shared(rope_embedder(ids))
+                reg_flat = reg.reshape(-1)
+                unrot = (k_img_unrotated[:, :, reg_flat]
+                         .reshape(b, heads, g, -1, dim)
+                         .permute(2, 0, 1, 3, 4).reshape(g, b * heads, -1, dim))
+                extra_v.append(v_img[:, :, reg_flat].reshape(b, heads, g, -1, dim))
+                extra_k.append(
+                    apply_rope1(unrot, rope).reshape(g, b, heads, -1, dim).permute(1, 2, 0, 3, 4))
+            else:
+                reg_flat = reg.reshape(-1)
+                extra_k.append(k_img[:, :, reg_flat].reshape(b, heads, g, -1, dim))
+                extra_v.append(v_img[:, :, reg_flat].reshape(b, heads, g, -1, dim))
         if group.halo is not None:
             ring = group.halo.reshape(-1)
             extra_k.append(k_img[:, :, ring].reshape(b, heads, g, -1, dim))
@@ -507,7 +578,8 @@ def _quadrants(win: Window) -> list[Window]:
 
 
 def adaptive_tiling(energy: np.ndarray, h: int, w: int, size: int, w_min: int, txt_len: int,
-                    rng: Optional[np.random.Generator] = None) -> list[Window]:
+                    rng: Optional[np.random.Generator] = None,
+                    allow_splits: bool = True) -> list[Window]:
     """Base tiling of side ``size`` with the smooth windows split into quadrants (Appendix C).
 
     The gate alpha comes from the tile-energy coefficient of variation, so a flat
@@ -520,6 +592,12 @@ def adaptive_tiling(energy: np.ndarray, h: int, w: int, size: int, w_min: int, t
     rows = jittered_starts(h, size, rng) if rng is not None else even_starts(h, size)
     cols = jittered_starts(w, size, rng) if rng is not None else even_starts(w, size)
     boxes = [Window(r, c, min(h - 1, r + size - 1), min(w - 1, c + size - 1)) for r in rows for c in cols]
+    if not allow_splits:
+        # Window integrity (area-fix2 mechanism 3): the DWT energy map reads noise as
+        # detail before an 8-step distilled model has composed anything, and its
+        # quadrants are 11% of the canvas each — small enough to hallucinate a whole
+        # subject of their own.  A short schedule therefore keeps the base windows.
+        return boxes
     e = np.array([_mean_energy(energy, box) for box in boxes], dtype=np.float64).reshape(len(rows), len(cols))
 
     tile = max(1, size // 2)

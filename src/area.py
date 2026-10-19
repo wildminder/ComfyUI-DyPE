@@ -503,7 +503,17 @@ def _area_fine_layout(rt: _AreaRuntime, ctx: AreaContext, k_img: torch.Tensor,
         hidden = k_img.transpose(1, 2).reshape(*k_img.shape[:1], k_img.shape[2], -1)
     energy = detail_map(hidden, h, w)
     w_min = min(cfg.native, max(h, w))
-    windows = adaptive_tiling(energy, h, w, ctx.size, w_min, t, rng=tiling_rng(cfg.seed, ctx.step))
+    # Window integrity on short (distilled) schedules (area-fix2 mechanism 3):
+    # an 8-step model has not composed anything yet at sigma ~ 0.8, so the DWT
+    # energy map fires on noise and fragments the canvas into 44x44 quadrants
+    # that each hallucinate their own subject — keep the base windows whole
+    # (no splits) and the boundaries still (no jitter) instead.
+    short = is_short_schedule(ctx.total)
+    windows = adaptive_tiling(
+        energy, h, w, ctx.size, w_min, t,
+        rng=None if short else tiling_rng(cfg.seed, ctx.step),
+        allow_splits=(not short),
+    )
     if ctx.fine_step < ctx.floor_steps:
         # A1 — the bridge floor (``docs/2026-10-18-area-zimage-adaptation-research.md``
         # §4/§5-A1): on a SHORT schedule the cost cap cuts the bridge to zero and
@@ -891,6 +901,8 @@ def _zimage_attention(rt: _AreaRuntime, ctx: AreaContext, layout, q, k, v, heads
             q[:, :, :layout.cap_len], k[:, :, :layout.cap_len], v[:, :, :layout.cap_len],
             q[:, :, first:last], k[:, :, first:last], v[:, :, first:last],
             unrotate1(k, table)[:, :, first:last], fine,
+            rope_embedder=getattr(rt.dm, "rope_embedder", None),
+            cap_len=layout.cap_len,
         )
         out = stitch_fine_zeros(out_txt, out_img, layout)
     # comfy's own flatten: heads then head-dim, sequence back on axis 1
@@ -1156,10 +1168,30 @@ def _area_resolve_forward(rt: _AreaRuntime, params: dict) -> AreaContext:
     if step is None or max(h, w) <= rt.config.native:
         return ctx  # at/below the native extent AReA is a provable no-op
     phase1 = _phase1_count(rt, opts)
+    if is_short_schedule(total):
+        # The "+2 healing rule" (area-fix2): an Euler step only displaces the
+        # latent by 15-25% of its trajectory, so fewer than two fine steps
+        # cannot overwrite the 32 px footprint Phase I bakes in — the ripple
+        # would survive to the final step.  Cap the coarse prefix so at least
+        # two fine steps always remain, and say so once.
+        max_allowed_phase1 = max(1, total - 2)
+        if phase1 > max_allowed_phase1:
+            _warn_once(
+                "area-heal-cap",
+                "AReA-Z: phase1_steps (%d) capped to %d on a %d-step schedule. "
+                "Euler trajectory dynamics require at least 2 fine steps to completely "
+                "heal the coarse pooling footprint.",
+                phase1, max_allowed_phase1, total,
+            )
+            phase1 = max_allowed_phase1
     cfg = rt.config
     schedule = _area_schedule(rt, h, w, total, phase1, ctx.txt_len)
     phase, size = schedule.at(step)
     ctx.phase, ctx.size, ctx.step, ctx.h, ctx.w = phase, size, step, h, w
+    # The schedule length rides on the context so the layout builder can tell a
+    # short (distilled) schedule from a long one without peeking into caches
+    # (area-fix2 mechanism 3).
+    ctx.total = int(total) if total is not None else 0
     # The Phase II ordinal (how many fine steps ran before this one) and how many
     # of its leading steps the bridge floor exempts from the cost cap.  The floor
     # is keyed on the RESOLVED schedule's geometry, so steps / sigma / bootstrap
