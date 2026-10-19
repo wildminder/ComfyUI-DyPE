@@ -250,11 +250,13 @@ class TestNodeSchema:
         assert inputs["model_type"].kwargs["options"] == ["auto", "flux", "zimage"]
         assert inputs["model_type"].kwargs["default"] == "auto"
 
-    def test_node_phase1_mode_input_present_with_steps_default(self):
+    def test_node_phase1_mode_input_present_with_auto_default(self):
         inputs = {i.name: i for i in AReA.define_schema().inputs}
         mode = inputs["phase1_mode"]
-        assert mode.kwargs["options"] == ["steps", "sigma", "bootstrap"]
-        assert mode.kwargs["default"] == "steps"          # the reference's mode
+        # ``auto`` resolves per backbone — sigma on Z-Image (the schedule-aware
+        # switch), the reference's steps on FLUX
+        assert mode.kwargs["options"] == ["auto", "steps", "sigma", "bootstrap"]
+        assert mode.kwargs["default"] == "auto"
         # 0.89 = the paper's first-backbone value (theory.md:494), one
         # definition shared with the engine-facing constant
         assert inputs["phase1_sigma"].kwargs["default"] == ZIMAGE_SIGMA_STAR == 0.89
@@ -787,6 +789,24 @@ class TestPhaseRegimeAdvisory:
             count = sigma_prefix_count(sigmas, ZIMAGE_SIGMA_STAR)
             assert count == 2
             area._warn_regime(8, count, "coarse")
+            assert not self._warns()
+        finally:
+            area._warned.clear()
+
+    def test_sigma_mode_does_not_warn_even_when_the_count_trips(self):
+        """A sigma-resolved schedule is itself the remedy: no warning, even at a
+        count that would trip the third-of-steps threshold in step mode.
+
+        phase1_sigma = 0.89 resolves 3 of the 8 Turbo steps — above the
+        threshold — and sigma mode is what the advisory recommends, so warning
+        there would make the DEFAULT Z-Image run warn on every forward.
+        """
+        area._warned.clear()
+        try:
+            area._warn_regime(8, 3, "coarse", mode="steps")     # the threshold trips
+            assert self._warns()
+            area._warned.clear()
+            area._warn_regime(8, 3, "coarse", mode="sigma")     # sigma is the remedy
             assert not self._warns()
         finally:
             area._warned.clear()

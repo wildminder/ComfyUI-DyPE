@@ -41,9 +41,11 @@ def _phase1_switch_kwargs(phase1_mode: str, phase1_sigma: float) -> dict:
     flowing the moment the engine declares them (and so does nothing at all
     before it, which is what keeps the FLUX path byte-identical).
 
-    Both defaults — ``"steps"`` and ``0.89`` — reproduce the reference's
-    ``config.phase1_steps`` behaviour (``phase1_steps`` is the switch in
-    step mode), so nothing changes for a graph that never touches them.
+    Both default to ``"auto"``, which the engine resolves per backbone
+    (``apply_area_to_model``): FLUX gets the reference's ``steps`` mode, where
+    ``phase1_steps`` is the switch — so nothing changes for a FLUX graph that
+    never touches the knob — and Z-Image gets ``sigma`` mode at
+    ``phase1_sigma`` (the schedule-aware handoff).
     """
     accepted = inspect.signature(apply_area_to_model).parameters
     wanted = {"phase1_mode": str(phase1_mode), "phase1_sigma": float(phase1_sigma)}
@@ -67,10 +69,12 @@ class AReA(io.ComfyNode):
     ``model_type`` selects the backbone profile (``src.area_arch``): ``auto``
     reads it off the model, and the two supported backbones — FLUX and Z-Image
     (Lumina2 / NextDiT) — share the same 16 px patch grid, so one width/height
-    pair serves either.  ``phase1_mode`` picks how the Phase I -> Phase II
-    switch is expressed: the leading ``steps`` (the reference's constant) or
-    the leading steps whose noise level is still at or above
-    ``phase1_sigma``.  Three knobs tune short (distilled) schedules only and are
+    pair serves either.  ``phase1_mode`` and ``pooling`` default to ``auto``,
+    which the engine resolves per backbone: on Z-Image the switch is the
+    schedule-aware ``sigma`` mode (the leading steps still at or above
+    ``phase1_sigma``) and pooling is the norm-preserving ``mean`` mode, while
+    FLUX keeps the reference's ``steps`` constant and ``subsample`` pooling.
+    Three knobs tune short (distilled) schedules only and are
     ignored on a long one: ``bridge_floor_steps`` exempts the leading fine steps
     from the cost cap (they keep the paper's full bridge and halo),
     ``window_start`` / ``window_hold_steps`` reshape the window ramp.
@@ -118,9 +122,9 @@ class AReA(io.ComfyNode):
                 ),
                 io.Combo.Input(
                     "phase1_mode",
-                    options=["steps", "sigma", "bootstrap"],
-                    default="steps",
-                    tooltip="How the Phase I -> Phase II switch is expressed. 'steps' = the leading phase1_steps steps run Phase I (the reference's mode). 'sigma' = the leading steps whose noise level is still at or above phase1_sigma run Phase I, so the switch follows the schedule rather than a fixed count (8 of 28 sits at a sigma of roughly 0.88 on a shift-3.0 flow). The paper's sigma is a FLUX value and is advisory for the distilled Z-Image schedule. 'bootstrap' = the paper's Appendix F mode: no Phase I at all, windowed Phase II from the first step; the early steps must have composed the canvas in a separate native-resolution pass whose latent was upscaled and re-noised to phase1_sigma (see the README pattern).",
+                    options=["auto", "steps", "sigma", "bootstrap"],
+                    default="auto",
+                    tooltip="How the Phase I -> Phase II switch is expressed. 'auto' = resolved per backbone: 'sigma' on Z-Image (the leading steps still at or above phase1_sigma run Phase I, so the switch follows the schedule) and 'steps' on FLUX. 'steps' = the leading phase1_steps steps run Phase I (the reference's mode). 'sigma' = the leading steps whose noise level is still at or above phase1_sigma run Phase I, so the switch follows the schedule rather than a fixed count (8 of 28 sits at a sigma of roughly 0.88 on a shift-3.0 flow). 'bootstrap' = the paper's Appendix F mode: no Phase I at all, windowed Phase II from the first step; the early steps must have composed the canvas in a separate native-resolution pass whose latent was upscaled and re-noised to phase1_sigma (see the README pattern).",
                 ),
                 io.Float.Input(
                     "phase1_sigma",
@@ -129,9 +133,9 @@ class AReA(io.ComfyNode):
                 ),
                 io.Combo.Input(
                     "pooling",
-                    options=list(POOLING),
-                    default="subsample",
-                    tooltip="Phase I pooling: which token of each f x f image block the pooled key/value comes from. 'subsample' = block centre, 'mean' = block average, 'medoid' = the token closest to the block-mean key, 'random' = a token drawn per (seed, step, block). Keys must be pooled BEFORE the position rotation, so all four keep the survivors in the query's frame.",
+                    options=["auto"] + list(POOLING),
+                    default="auto",
+                    tooltip="Phase I pooling: which token of each f x f image block the pooled key/value comes from. 'auto' = resolved per backbone: 'mean' on Z-Image, 'subsample' on FLUX. 'subsample' = block centre. 'mean' = block average for values, and for keys the block-mean direction rescaled to the mean member norm (the centroid keeps every token contributing while the norm keeps the attention temperature at the un-pooled one). 'medoid' = the token closest to the block-mean key. 'random' = a token drawn per (seed, step, block). Keys must be pooled BEFORE the position rotation, so all four keep the survivors in the query's frame.",
                 ),
                 io.Int.Input(
                     "halo",
@@ -187,7 +191,7 @@ class AReA(io.ComfyNode):
         return validate_resolution(width, height)
 
     @classmethod
-    def execute(cls, model, width: int, height: int, model_type: str, enable_area: bool, phase1_steps: int = PHASE1_STEPS, pooling: str = "subsample", halo: int = 8, bridge_ratio: float = 0.5, bridge_floor_steps: int = 2, window_start: int = 0, window_hold_steps: int = 0, seed: int = 0, phase1_mode: str = "steps", phase1_sigma: float = ZIMAGE_SIGMA_STAR) -> io.NodeOutput:
+    def execute(cls, model, width: int, height: int, model_type: str, enable_area: bool, phase1_steps: int = PHASE1_STEPS, pooling: str = "auto", halo: int = 8, bridge_ratio: float = 0.5, bridge_floor_steps: int = 2, window_start: int = 0, window_hold_steps: int = 0, seed: int = 0, phase1_mode: str = "auto", phase1_sigma: float = ZIMAGE_SIGMA_STAR) -> io.NodeOutput:
         # Fallback for unlinked/None inputs
         width = 2048 if width is None else int(width)
         height = 2048 if height is None else int(height)

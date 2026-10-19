@@ -30,8 +30,15 @@ from nodes.area import AReA
 
 import src.area as area
 from src.area import apply_area_to_model, restore_area_attention_hook
-from src.area_attn import apply_rope1, bridge_registers, fit_extra_keys, windowed_step_cost
+from src.area_attn import (
+    POOLING,
+    apply_rope1,
+    bridge_registers,
+    fit_extra_keys,
+    windowed_step_cost,
+)
 from src.area_schedule import build_schedule, initial_factor, pooling_ramp
+from src.area_zimage import ZIMAGE_SIGMA_STAR
 
 try:
     from comfy.model_patcher import ModelPatcher
@@ -143,6 +150,32 @@ class MockFluxDiT(torch.nn.Module):
 def mock_flux_model() -> ModelPatcher:
     m = ModelPatcher()
     m.model.diffusion_model = MockFluxDiT()
+    m.model.model_sampling = types.SimpleNamespace()
+    return m
+
+
+class NextDiT(torch.nn.Module):
+    """The Z-Image pieces AReA's apply touches — the mirror of ``MockFluxDiT``.
+
+    The class name is load-bearing: ``src.area_arch``'s MRO walk reads it
+    (``NEXT_DIT_BACKBONE``, ``src/area_arch.py:67``), exactly as comfy names the
+    real backbone (``comfy/ldm/lumina/model.py:442``, bound as ``Lumina2``'s
+    ``unet_model``).  The ``rope_embedder`` is what ``src.model_detect``'s auto
+    probe keys on (``:74-75``).  No ``masked_pad_multiple`` — that one is the
+    Ming-Image marker — and no ``dec_net``, which is the pixel-space one.
+    """
+
+    def __init__(self):
+        super().__init__()
+        self.patch_size = 2
+        self.pad_tokens_multiple = 32
+        self.masked_pad_multiple = None
+        self.rope_embedder = torch.nn.Linear(4, 4)
+
+
+def mock_zimage_model() -> ModelPatcher:
+    m = ModelPatcher()
+    m.model.diffusion_model = NextDiT()
     m.model.model_sampling = types.SimpleNamespace()
     return m
 
@@ -324,15 +357,18 @@ class TestAReASchema:
                                 "window_hold_steps", "seed"]
         assert inputs["model_type"].kwargs["options"] == ["auto", "flux", "zimage"]
         assert inputs["phase1_steps"].kwargs["default"] == PHASE1      # backbones/flux.py:16
-        assert inputs["pooling"].kwargs["options"] == ["subsample", "mean", "medoid", "random"]
-        assert inputs["pooling"].kwargs["default"] == "subsample"
+        assert inputs["pooling"].kwargs["options"] == ["auto", "subsample", "mean",
+                                                       "medoid", "random"]
+        assert inputs["pooling"].kwargs["default"] == "auto"
         assert inputs["halo"].kwargs["default"] == 8
         assert inputs["bridge_ratio"].kwargs["default"] == 0.5
         assert inputs["enable_area"].kwargs["default"] is True
-        # the z-image switch's defaults reproduce the reference's step-count
-        # behaviour, so a graph that never touches them is unchanged
-        assert inputs["phase1_mode"].kwargs["options"] == ["steps", "sigma", "bootstrap"]
-        assert inputs["phase1_mode"].kwargs["default"] == "steps"
+        # "auto" resolves per backbone (``apply_area_to_model``): sigma mode
+        # on Z-Image, the reference's step-count behaviour on FLUX, so a graph
+        # that never touches the knob is unchanged
+        assert inputs["phase1_mode"].kwargs["options"] == ["auto", "steps", "sigma",
+                                                           "bootstrap"]
+        assert inputs["phase1_mode"].kwargs["default"] == "auto"
         assert inputs["phase1_sigma"].kwargs["default"] == 0.89
 
     def test_short_schedule_inputs_match_the_floor_design(self):
@@ -398,7 +434,73 @@ class TestAReASchema:
         model = out[0]
         assert model._area_config is not None
         assert model._area_config.phase1_steps == PHASE1
+        # FLUX's "auto" resolution: the reference's constants, unchanged
+        assert model._area_config.pooling == "subsample"
+        assert model._area_config.phase1_mode == "steps"
         restore_area_attention_hook(model)
+
+
+# ---------------------------------------------------------------------------
+# The auto defaults, resolved per backbone (AReA-Z, area-fix §3-File 3)
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.unit
+class TestAutoDefaults:
+    """``pooling = "auto"`` / ``phase1_mode = "auto"`` resolve per backbone.
+
+    Z-Image runs the AReA-Z adaptation — the norm-preserving centroid pooling
+    and the schedule-aware sigma handoff — while FLUX keeps the reference's
+    constants exactly (``apply_area_to_model`` resolves after the profile is
+    known, before the engine config freezes concrete modes).
+    """
+
+    def _config(self, model, model_type="auto", **kw):
+        # ``enable_area=False`` returns the clone with the resolved config and NO
+        # seam installed: the resolution is what this class pins, so no backend
+        # module has to be in sys.modules for it.
+        m = apply_area_to_model(model, model_type, WIDTH, HEIGHT,
+                                enable_area=False, **kw)
+        try:
+            return m._area_config
+        finally:
+            restore_area_attention_hook(m)
+
+    def test_flux_auto_resolves_to_the_reference_constants(self):
+        """FLUX is untouched: subsample pooling, steps mode, 8 of 28."""
+        cfg = self._config(mock_flux_model())
+        assert cfg.pooling == "subsample"
+        assert cfg.phase1_mode == "steps"
+        assert cfg.phase1_steps == PHASE1 == 8
+
+    def test_zimage_auto_resolves_to_the_adaptation_knobs(self):
+        """Z-Image runs the AReA-Z defaults: mean pooling, sigma handoff."""
+        cfg = self._config(mock_zimage_model())
+        assert cfg.pooling == "mean"
+        assert cfg.phase1_mode == "sigma"
+        assert cfg.phase1_sigma == ZIMAGE_SIGMA_STAR == 0.89
+
+    def test_explicit_knobs_pass_through_unchanged_on_both_backbones(self):
+        flux = self._config(mock_flux_model(), "flux", pooling="medoid", phase1_mode="sigma")
+        assert flux.pooling == "medoid"
+        assert flux.phase1_mode == "sigma"
+        zimage = self._config(mock_zimage_model(), "zimage", pooling="subsample",
+                              phase1_mode="steps")
+        assert zimage.pooling == "subsample"
+        assert zimage.phase1_mode == "steps"
+
+    def test_auto_never_lands_in_the_config(self):
+        """A half-resolved pair still resolves: "auto" never reaches AreaConfig."""
+        for model, expected in ((mock_flux_model(), "subsample"),
+                                (mock_zimage_model(), "mean")):
+            for pooling, phase1_mode in (("auto", "auto"), ("auto", "steps"),
+                                         ("subsample", "auto")):
+                cfg = self._config(model, "auto", pooling=pooling, phase1_mode=phase1_mode)
+                assert cfg.pooling in POOLING and cfg.pooling != "auto"
+                assert cfg.phase1_mode in ("steps", "sigma", "bootstrap")
+                assert cfg.phase1_mode != "auto"
+                if pooling == "auto":
+                    assert cfg.pooling == expected    # the per-backbone half
 
 
 # ---------------------------------------------------------------------------

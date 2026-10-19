@@ -1088,7 +1088,7 @@ def _area_img_in_hook(module, args, output):
     rt.hidden = output
 
 
-def _warn_regime(total: int, phase1: int, phase: Optional[str]) -> None:
+def _warn_regime(total: int, phase1: int, phase: Optional[str], mode: str = "steps") -> None:
     """Warn once when Phase I would flood a short (distilled) schedule.
 
     The node default (``phase1_steps=8``) is the reference's FLUX constant *of 28*.
@@ -1101,8 +1101,17 @@ def _warn_regime(total: int, phase1: int, phase: Optional[str]) -> None:
     :func:`~src.area_schedule.is_short_schedule` gate returns early), and a user
     who wants the flood keeps it by setting ``phase1_steps`` explicitly — the
     same discipline as I-Max's z-image schedule advisory (``src/imax.py:311-349``).
+
+    ``mode`` is the RESOLVED switch (the caller passes ``cfg.phase1_mode``).  A
+    sigma-resolved schedule is itself the remedy the advisory recommends: its
+    count already follows the schedule, and on the 8-step Turbo table
+    ``phase1_sigma = 0.89`` resolves 3 coarse steps, which trips the
+    third-of-steps threshold and would make the DEFAULT Z-Image run warn on
+    every forward — so sigma mode returns early.
     """
     if phase != "coarse" or not is_short_schedule(total):
+        return
+    if mode == "sigma":
         return
     if phase1 * 3 <= total:  # up to a third of the steps coarse: the paper's share
         return
@@ -1160,7 +1169,7 @@ def _area_resolve_forward(rt: _AreaRuntime, params: dict) -> AreaContext:
     ctx.fine_step = step - len(schedule.factors)
     ctx.floor_steps = (cfg.bridge_floor_steps
                        if phase == "fine" and is_short_schedule(total) else 0)
-    _warn_regime(total, phase1, phase)
+    _warn_regime(total, phase1, phase, cfg.phase1_mode)
     if step == 0 and rt.config.phase1_mode == "bootstrap" and phase == "fine":
         # Appendix F: Phase II must ENTER at the re-noise level the native
         # pre-pass handed over (sigma_star), so check the sampler's own table
@@ -1237,7 +1246,7 @@ def apply_area_to_model(
     height: int,
     enable_area: bool = True,
     phase1_steps: int = PHASE1_STEPS,
-    pooling: str = "subsample",
+    pooling: str = "auto",
     halo: int = 8,
     bridge_ratio: float = 0.5,
     bridge_floor_steps: int = 2,
@@ -1245,7 +1254,7 @@ def apply_area_to_model(
     window_hold_steps: int = 0,
     delay: int = 0,
     seed: int = 0,
-    phase1_mode: str = "steps",
+    phase1_mode: str = "auto",
     phase1_sigma: float = ZIMAGE_SIGMA_STAR,
 ):
     """Patch a ComfyUI FLUX or Z-Image model with AReA (arXiv 2610.17227).
@@ -1260,13 +1269,21 @@ def apply_area_to_model(
     nothing is patched — attention would be replaced by itself.
 
     ``phase1_mode`` / ``phase1_sigma`` are the Phase I -> II switch (Q4):
-    ``"steps"`` (the default) is the reference's fixed ``phase1_steps``, and
-    ``"sigma"`` counts the leading steps whose noise level is still at or above
-    ``phase1_sigma`` (``theory.md:240-246``) so the switch follows the schedule.
+    ``"steps"`` is the reference's fixed ``phase1_steps``, and ``"sigma"`` counts
+    the leading steps whose noise level is still at or above ``phase1_sigma``
+    (``theory.md:240-246``) so the switch follows the schedule.  Both default to
+    ``"auto"``, which resolves PER BACKBONE right after the profile is known
+    (AReA-Z, ``.dev/area-debug/area-fix.txt`` §3-File 3): Z-Image runs the
+    norm-preserving centroid pooling and the schedule-aware sigma handoff
+    (``phase1_sigma``, default ``ZIMAGE_SIGMA_STAR``), FLUX keeps the reference's
+    constants exactly — ``subsample`` pooling and ``steps`` mode with
+    ``phase1_steps`` — so the FLUX default path is byte-identical to before.
     ``phase1_steps`` is clamped to ``[0, total]`` and ``0`` means "all Phase II"
     (the reference's ``config.phase1_steps``, ported without its
     ``phase1_steps=0`` assert).  ``pooling`` is one of :data:`POOLING`
-    (``subsample`` / ``mean`` / ``medoid`` / ``random``), ``halo`` the widest
+    (``subsample`` / ``mean`` / ``medoid`` / ``random``; in ``mean`` mode the
+    values are the plain block average and the keys the norm-preserving
+    centroid, ``src/area_attn._norm_preserved_keys``), ``halo`` the widest
     Halo ring, ``bridge_ratio`` rho of ``R = round(rho * w)^2`` bridge tokens per
     window, and ``seed`` the key of every draw (windows, halos, random pooling).
 
@@ -1316,6 +1333,14 @@ def apply_area_to_model(
     # The arch profile validates the pin against the model's own backbone and
     # refuses the Lumina2 siblings AReA cannot patch (pixel space, Ming-Image).
     profile = resolve_area_arch(dm, model_type)
+
+    # AReA-Z defaults (.dev/area-debug/area-fix.txt §3-File 3): "auto" resolves per
+    # backbone — Z-Image runs the norm-preserving centroid pooling and the
+    # schedule-aware sigma handoff, FLUX keeps the reference's constants exactly.
+    if pooling == "auto":
+        pooling = "mean" if profile is ZIMAGE_PROFILE else "subsample"
+    if phase1_mode == "auto":
+        phase1_mode = "sigma" if profile is ZIMAGE_PROFILE else "steps"
 
     m._area_config = AreaConfig(
         phase1_steps=max(0, int(phase1_steps)),
