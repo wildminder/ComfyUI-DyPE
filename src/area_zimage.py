@@ -63,6 +63,7 @@ from typing import Optional
 import torch
 
 from .area_attn import apply_rope1
+from .area_schedule import coarse_grid
 
 logger = logging.getLogger("ComfyUI-DyPE")
 
@@ -570,6 +571,24 @@ def _zeros(n: int, device, dtype=torch.float32) -> torch.Tensor:
     return torch.zeros(1, int(n), ZIMAGE_AXES, device=device, dtype=dtype)
 
 
+def _block_offsets(n_blocks: int, size: int, f: int, uniform: float, device) -> torch.Tensor:
+    """The per-block key offset on one axis — the block's centroid inside its block.
+
+    A full ``f``-cell block's centroid sits at ``(f - 1) / (2f)`` (``uniform``),
+    the mean of its members' positions.  The LAST block of a partial axis owns
+    fewer than ``f`` cells (the grid does not tile), and its centroid is the
+    mean of *its* members, ``(members - 1) / (2f)`` — otherwise the pooled key
+    would sit a quarter of a block away from the tokens it stands for.  Every
+    other block keeps the full-block offset, so a grid that tiles exactly is
+    unchanged, bit for bit.
+    """
+    off = torch.full((int(n_blocks),), float(uniform), dtype=torch.float32, device=device)
+    if int(size) % int(f):
+        members = int(size) - (int(n_blocks) - 1) * int(f)
+        off[-1] = (members - 1) / (2.0 * int(f))
+    return off
+
+
 def coarse_ropes_zimage(
     embedder,
     layout: ZImageJointLayout,
@@ -579,8 +598,10 @@ def coarse_ropes_zimage(
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """The two Phase I rope tables — the reference's ``_coarse_ropes`` for lumina.
 
-    Queries keep full resolution while the pooled keys sit on the ``(h/f) x
-    (w/f)`` grid, so both are measured in the same units — CONTINUOUSLY
+    Queries keep full resolution while the pooled keys sit on the pooled grid
+    (``ceil(h/f) x ceil(w/f)`` — the ceil only differs from ``(h/f) x (w/f)``
+    on a grid the blocks do not tile, where the last block is partial), so both
+    are measured in the same units — CONTINUOUSLY
     (AReA-Z mechanism 1, ``.dev/area-debug/area-fix.txt`` Flaw 2): the reference
     floor-divided the query's position into its block's integer coordinate, so
     every ``f x f`` block shared one rope position and the phase jumped by a
@@ -612,16 +633,18 @@ def coarse_ropes_zimage(
             "Z-Image (Lumina2) loader."
         )
     f = int(f)
-    if f < 1 or layout.h < f or layout.w < f or layout.h % f or layout.w % f:
-        # The pooling ramp only ever supplies factors that tile the grid exactly
-        # (``src/area_schedule.py``'s common-divisor search); a factor that does
-        # not would crash the engine's block reshape three steps into a run.
+    if f < 1:
+        # The only real precondition: the block size must be a positive
+        # integer.  The grid does NOT have to tile — a patch grid with no
+        # common divisor >= 2 is pooled with a *partial* edge block
+        # (``src/area_schedule.py``'s resolver), and the pooled grid is then the
+        # ceil-based one.
         raise ValueError(
-            f"AReA: the pooling factor {f} does not tile the {layout.h}x"
-            f"{layout.w} patch grid, so the coarse rope grid cannot be built. "
-            "This forward runs plain attention."
+            f"AReA: the pooling factor {f} is not a valid pooling block size, "
+            "so the coarse rope grid cannot be built. This forward runs plain "
+            "attention."
         )
-    nh, nw = layout.h // f, layout.w // f
+    nh, nw = coarse_grid(layout.h, layout.w, f)
     ff = float(f)
     h_scale, w_scale, h_start, w_start = _axis_scales(rope_options)
 
@@ -649,11 +672,18 @@ def coarse_ropes_zimage(
     )
     # Keys: one entry per pooled block, at its block's GEOMETRIC CENTROID
     # ``R + (f - 1) / (2f)`` — the mean of the block's query positions, so the
-    # phase step across a block boundary equals the one inside the block.
+    # phase step across a block boundary equals the one inside the block.  A
+    # PARTIAL block (the last one on an axis the grid does not tile) has fewer
+    # members, so its centroid is the mean of *its* members instead
+    # (``_block_offsets``).
     coarse = torch.arange(nh * nw, device=device)
     kv_offset = (ff - 1.0) / (2.0 * ff)
-    kv_rows = ((coarse // nw).to(torch.float32) + kv_offset) * h_scale + h_start
-    kv_cols = ((coarse % nw).to(torch.float32) + kv_offset) * w_scale + w_start
+    row_off = _block_offsets(nh, layout.h, f, kv_offset, device)
+    col_off = _block_offsets(nw, layout.w, f, kv_offset, device)
+    block_rows = coarse // nw
+    block_cols = coarse % nw
+    kv_rows = (block_rows.to(torch.float32) + row_off[block_rows]) * h_scale + h_start
+    kv_cols = (block_cols.to(torch.float32) + col_off[block_cols]) * w_scale + w_start
     kv_image_ids = _ids(
         torch.full((nh * nw,), float(cap_len + 1), device=device),
         kv_rows, kv_cols, device,

@@ -15,6 +15,10 @@ The two phases, in the seam's terms:
   resolution while the key/value canvas shrinks to ``(h/f)(w/f)``.  The two rope
   tables — full grid for q, coarse grid for k/v — are applied by the caller with
   :func:`apply_rope1` (the reference's ``backbones/flux.py:180-190``).
+  A patch grid whose counts share no factor >= 2 has no exact tiling; there the
+  pooled canvas is the ceil-based grid and the last block on a partial axis is a
+  *partial* block, pooled over its real members only (the canvas and the token
+  stream are untouched either way).
 * **Phase II (fine)** — :func:`build_fine_layout` turns one step's window tiling
   into the grouped token/halo/weight buffers, and :func:`windowed_attention` runs
   each group as one ``F.scaled_dot_product_attention`` call on ``[b*g, heads,
@@ -67,6 +71,7 @@ from .area_schedule import (
     Window,
     _dedupe,
     _grown_box,
+    coarse_grid,
     even_starts,
     ring_size,
     step_rng,
@@ -143,13 +148,49 @@ class AreaContext:
 # ---------------------------------------------------------------------------
 
 
+def _partial_axis(h: int, w: int, f: int) -> bool:
+    """Whether the ``f x f`` pooling blocks do not tile the patch grid exactly.
+
+    The reference's Eq. 5 refuses a grid whose patch counts share no factor
+    >= 2, so on such a grid the blocks cannot tile it: the last block on a
+    partial axis owns fewer than ``f`` rows (or columns) and the cells it does
+    not own are *padding*, never canvas.  Every grid that tiles keeps the
+    reference's path, bit for bit — this predicate is the guard, not a rewrite.
+    """
+    f = max(1, int(f))
+    return int(h) % f != 0 or int(w) % f != 0
+
+
+def _block_mask(h: int, w: int, f: int, device) -> torch.Tensor:
+    """``[nh, nw, f, f]`` — 1 on the REAL cells of every block, 0 on the padded ones.
+
+    Block ``r`` owns rows ``[r*f, min(r*f+f-1, h-1)]`` and block ``c`` owns
+    columns ``[c*f, min(c*f+f-1, w-1)]``, so the blocks together cover every
+    row and every column of the canvas exactly once: no token is dropped and
+    none is pooled twice.  The mask is what turns a partial block's mean into
+    a mean over its REAL members only — an unmasked mean over the padded cells
+    would shrink that block's key norm and bias it.
+    """
+    nh, nw = coarse_grid(h, w, f)
+    rows = torch.arange(nh * f, device=device) < int(h)
+    cols = torch.arange(nw * f, device=device) < int(w)
+    mask = (rows[:, None] & cols[None, :]).reshape(nh, f, nw, f)
+    return mask.permute(0, 2, 1, 3).float()
+
+
 def _block_selection(k_img: torch.Tensor, h: int, w: int, f: int, pooling: str,
                      seed: int, step: int, block: int) -> Optional[torch.Tensor]:
     """Index in ``[0, f*f)`` of the token that represents each block, for the selecting poolings.
 
     ``k_img`` is ``[b, heads, h*w, d]``; the result is ``[b, h/f, w/f]`` and is
     shared by keys and values, so K and V always come from the same token.
+
+    On a grid the blocks do not tile (a partial edge block) the index is a
+    cell of the ``f x f`` block, mapped onto the block's real extent by
+    :func:`_pool_partial` — the padding cells are never selectable.
     """
+    if _partial_axis(h, w, f):
+        return _block_selection_partial(k_img, h, w, f, pooling, seed, step, block)
     b, heads, _, dim = k_img.shape
     nh, nw = h // f, w // f
     if pooling == "random":
@@ -172,9 +213,52 @@ def _block_selection(k_img: torch.Tensor, h: int, w: int, f: int, pooling: str,
     return None
 
 
+def _block_selection_partial(k_img: torch.Tensor, h: int, w: int, f: int, pooling: str,
+                              seed: int, step: int, block: int) -> Optional[torch.Tensor]:
+    """The selecting poolings on a grid the ``f x f`` blocks do not tile exactly.
+
+    Same contract as :func:`_block_selection` — one index in ``[0, f*f)`` per
+    block, shared by keys and values — but the block's mean is the mean over
+    its REAL members and the padded cells are masked out of the ``medoid``
+    argmin, so a partial block can never select a padding cell (which would
+    pool a zero vector).  The ``random`` draw keeps its ``(seed, step, block)``
+    key, so determinism is unchanged.
+    """
+    b, heads, _, dim = k_img.shape
+    nh, nw = coarse_grid(h, w, f)
+    if pooling == "random":
+        mix = (int(seed) & 0x7FFFFFFF) + int(step) * 2_654_435_761 + int(block) * 40_503 + _POOL_SALT
+        sel = np.random.default_rng(mix).integers(0, f * f, size=(nh, nw), dtype=np.int64)
+        return torch.from_numpy(sel).to(k_img.device).unsqueeze(0).expand(b, nh, nw).contiguous()
+    if pooling == "medoid":
+        mask = _block_mask(h, w, f, k_img.device).reshape(nh, nw, f * f)
+        grid = k_img.reshape(b, heads, h, w, dim)
+        rows_per_chunk = max(1, _MEDOID_CHUNK_ELEMS // max(1, nw * f * f * heads * dim))
+        parts = []
+        for r0 in range(0, nh, rows_per_chunk):
+            r1 = min(nh, r0 + rows_per_chunk)
+            nrows = r1 - r0
+            real = min(r1 * f, h) - r0 * f
+            kb = (F.pad(grid[:, :, r0 * f : min(r1 * f, h)], (0, 0, 0, nw * f - w, 0, nrows * f - real))
+                  .reshape(b, heads, nrows, f, nw, f, dim)
+                  .permute(0, 1, 2, 4, 3, 5, 6)
+                  .reshape(b, heads, nrows, nw, f * f, dim)
+                  .float())
+            real_cells = mask[r0:r1][None, None, :, :, :, None]
+            count = real_cells.sum(dim=4).clamp(min=1.0)
+            mean = (kb * real_cells).sum(dim=4) / count
+            dist = (kb - mean[:, :, :, :, None, :]).pow(2).sum(dim=-1)
+            dist = dist.masked_fill(real_cells.squeeze(-1) == 0, float("inf"))
+            parts.append(dist.sum(dim=1).argmin(dim=-1))
+        return torch.cat(parts, dim=1)
+    return None
+
+
 def _pool(x_img: torch.Tensor, h: int, w: int, f: int, pooling: str,
           sel: Optional[torch.Tensor]) -> torch.Tensor:
     """One token per ``f x f`` block of the image tokens, returned ``[b, heads, h*w/f^2, d]``."""
+    if _partial_axis(h, w, f):
+        return _pool_partial(x_img, h, w, f, pooling, sel)
     b, heads, _, dim = x_img.shape
     nh, nw = h // f, w // f
     grid = x_img.reshape(b, heads, h, w, dim)
@@ -190,6 +274,38 @@ def _pool(x_img: torch.Tensor, h: int, w: int, f: int, pooling: str,
     return pooled.reshape(b, heads, nh * nw, dim)
 
 
+def _pool_partial(x_img: torch.Tensor, h: int, w: int, f: int, pooling: str,
+                  sel: Optional[torch.Tensor]) -> torch.Tensor:
+    """One token per block on a grid the blocks do not tile exactly.
+
+    ``subsample`` takes the block centre clamped to the block's real extent,
+    ``mean`` averages over the block's REAL members only (the padded cells are
+    excluded, so a partial block is not shrunk by its own padding), and the
+    selecting poolings take the cell ``sel`` names, mapped onto the block's
+    real extent — a padded cell is never pooled.
+    """
+    b, heads, _, dim = x_img.shape
+    nh, nw = coarse_grid(h, w, f)
+    if pooling == "subsample":
+        off = f // 2
+        rows = (torch.arange(nh, device=x_img.device) * f + off).clamp(max=h - 1)
+        cols = (torch.arange(nw, device=x_img.device) * f + off).clamp(max=w - 1)
+        return x_img.index_select(2, (rows[:, None] * w + cols[None, :]).reshape(-1))
+    if pooling == "mean":
+        mask = _block_mask(h, w, f, x_img.device)
+        count = mask.sum(dim=(-2, -1)).clamp(min=1.0)
+        grid = x_img.reshape(b, heads, h, w, dim)
+        padded = F.pad(grid, (0, 0, 0, nw * f - w, 0, nh * f - h))
+        blocks = padded.reshape(b, heads, nh, f, nw, f, dim).float()
+        total = (blocks * mask.permute(0, 2, 1, 3)[None, None, :, :, :, :, None]).sum(dim=(3, 5))
+        return (total / count[None, None, :, :, None]).reshape(b, heads, nh * nw, dim).to(x_img.dtype)
+    # medoid / random: the selection names a cell of the f x f block, mapped onto its real extent
+    row = (torch.arange(nh, device=x_img.device).view(1, nh, 1) * f + sel // f).clamp(max=h - 1)
+    col = (torch.arange(nw, device=x_img.device).view(1, 1, nw) * f + sel % f).clamp(max=w - 1)
+    idx = (row * w + col).reshape(b, 1, nh * nw, 1).expand(b, heads, nh * nw, dim)
+    return x_img.gather(2, idx)
+
+
 def _norm_preserved_keys(k_img: torch.Tensor, h: int, w: int, f: int) -> torch.Tensor:
     """The ``mean`` pooling's keys: the block-mean DIRECTION at the mean MEMBER NORMS.
 
@@ -202,6 +318,8 @@ def _norm_preserved_keys(k_img: torch.Tensor, h: int, w: int, f: int) -> torch.T
     mean of the block's member norms, so the softmax scale stays the un-pooled
     one.  ``f == 1`` returns the keys untouched, bit for bit.
     """
+    if _partial_axis(h, w, f):
+        return _norm_preserved_keys_partial(k_img, h, w, f)
     b, heads, _, dim = k_img.shape
     nh, nw = h // f, w // f
     if f == 1:
@@ -209,6 +327,28 @@ def _norm_preserved_keys(k_img: torch.Tensor, h: int, w: int, f: int) -> torch.T
     grid = k_img.reshape(b, heads, nh, f, nw, f, dim).float()
     centroid = grid.mean(dim=(3, 5))
     norms = grid.norm(dim=-1).mean(dim=(3, 5))
+    pooled = centroid / (centroid.norm(dim=-1, keepdim=True) + 1e-8) * norms[..., None]
+    return pooled.reshape(b, heads, nh * nw, dim).to(k_img.dtype)
+
+
+def _norm_preserved_keys_partial(k_img: torch.Tensor, h: int, w: int, f: int) -> torch.Tensor:
+    """The norm-preserving keys on a grid the blocks do not tile exactly.
+
+    The centroid is the mean over the block's REAL members and the norm is the
+    mean of the REAL members' norms, so a partial block keeps the un-pooled
+    temperature instead of the shrunk one an unmasked mean would give it.
+    """
+    b, heads, _, dim = k_img.shape
+    nh, nw = coarse_grid(h, w, f)
+    mask = _block_mask(h, w, f, k_img.device)
+    count = mask.sum(dim=(-2, -1)).clamp(min=1.0)
+    grid = k_img.reshape(b, heads, h, w, dim)
+    padded = F.pad(grid, (0, 0, 0, nw * f - w, 0, nh * f - h))
+    blocks = padded.reshape(b, heads, nh, f, nw, f, dim).float()
+    cells = mask.permute(0, 2, 1, 3)[None, None, :, :, :, :, None]
+    centroid = (blocks * cells).sum(dim=(3, 5)) / count[None, None, :, :, None]
+    norms = (blocks.norm(dim=-1) * mask.permute(0, 2, 1, 3)[None, None]).sum(dim=(3, 5))
+    norms = norms / count[None, None]
     pooled = centroid / (centroid.norm(dim=-1, keepdim=True) + 1e-8) * norms[..., None]
     return pooled.reshape(b, heads, nh * nw, dim).to(k_img.dtype)
 
@@ -226,6 +366,12 @@ def pool_keys_values(key: torch.Tensor, value: torch.Tensor, txt_len: int, h: in
     drawn per ``(seed, step, block)``.  Keys must be unrotated — pooling after
     RoPE would rotate the survivors away from the query's frame — and K and V
     always come from the same token for the selecting poolings.
+
+    On a grid the blocks do not tile (a patch grid with no common divisor
+    >= 2) the pooled canvas is the ceil-based one and the last block on a
+    partial axis is a *partial* block: it owns fewer than ``f`` rows or
+    columns, is pooled over its real members only, and never contributes a
+    padded cell to the keys or the values.
     """
     k_img, v_img = key[:, :, txt_len:], value[:, :, txt_len:]
     sel = _block_selection(k_img, h, w, f, pooling, seed, step, block)

@@ -23,8 +23,11 @@ reference's ``area/schedule.py`` plus the pure-math tiling primitives of
 * **Boundary** — a native-size (or smaller) grid still builds a well-formed
   schedule here; the ``max(h, w) <= native`` short-circuit belongs to the caller
   (``src/area.py``, Phase 3), mirroring ``backbones/base.py:59-68``.
-* **Errors** — a grid with no common divisor >= 2 raises the reference's
-  actionable ``ValueError``.
+* **Errors** — :func:`initial_factor` raises the reference's actionable
+  ``ValueError`` on a grid with no common divisor >= 2 (that is the ported
+  contract, kept verbatim), while the engine-facing :func:`resolve_factor` and
+  :func:`build_schedule` never raise: they fall back to the extent rule, report
+  the grid as *adjusted* and pool ``f x f`` blocks with a partial edge block.
 
 Markers: @pytest.mark.unit
 Accept (user-run): pytest tests/test_area_schedule.py
@@ -49,11 +52,14 @@ from src.area_schedule import (
     _geometric_sizes,
     _grown_box,
     build_schedule,
+    coarse_grid,
     even_starts,
     grid_divisors,
     initial_factor,
     is_short_schedule,
+    legal_factors,
     pooling_ramp,
+    resolve_factor,
     ring_size,
     start_window,
     step_rng,
@@ -159,11 +165,110 @@ class TestGridDivisors:
         assert initial_factor(128, 128, 1) == 128
 
     def test_coprime_grid_raises_an_actionable_error(self):
+        """The reference's contract, ported verbatim: ``initial_factor`` raises.
+
+        The *engine* must never raise, so it goes through
+        :func:`resolve_factor` instead (see :class:`TestResolveFactor`).
+        """
         with pytest.raises(ValueError, match="no common divisor >= 2") as err:
             initial_factor(63, 65, NATIVE)
         message = str(err.value)
         assert "63x65" in message                     # names the offending grid
         assert "share a factor" in message            # names the remedy
+
+
+@pytest.mark.unit
+class TestResolveFactor:
+    """The engine-facing resolver: a factor for *every* grid, never a raise."""
+
+    def test_matches_initial_factor_on_a_tiling_grid(self):
+        for h, w in _grids():
+            factor, adjusted = resolve_factor(h, w, NATIVE)
+            assert not adjusted
+            assert factor == initial_factor(h, w, NATIVE)
+
+    def test_hand_computed(self):
+        assert resolve_factor(128, 128, NATIVE) == (2, False)
+        assert resolve_factor(130, 130, NATIVE) == (5, False)
+        assert resolve_factor(99, 99, NATIVE) == (3, False)
+        # no common divisor >= 2: the extent rule takes over and the grid is
+        # reported as adjusted (the blocks no longer tile it exactly)
+        assert resolve_factor(125, 32, NATIVE) == (2, True)
+        assert resolve_factor(63, 65, NATIVE) == (2, True)
+
+    def test_never_raises(self):
+        for h in range(1, 20):
+            for w in range(1, 20):
+                factor, adjusted = resolve_factor(h, w, NATIVE)
+                assert factor >= 2
+                assert isinstance(adjusted, bool)
+
+    def test_adjusted_factor_keeps_the_pooled_grid_inside_the_native_extent(self):
+        """The fallback follows Eq. 5's *extent* rule: pool just enough that
+        the coarse grid still fits the native extent."""
+        for h, w in [(125, 32), (63, 65), (127, 33), (200, 101), (129, 100)]:
+            factor, adjusted = resolve_factor(h, w, NATIVE)
+            assert adjusted
+            nh, nw = coarse_grid(h, w, factor)
+            assert max(nh, nw) <= NATIVE
+            assert factor == max(2, -(-max(h, w) // NATIVE))   # the smallest such factor
+
+    def test_adjusted_factor_is_never_larger_than_it_has_to_be(self):
+        """A factor of 4 when 3 would do is not the extent rule."""
+        for h, w in [(200, 101), (129, 100), (193, 101)]:
+            factor, _ = resolve_factor(h, w, NATIVE)
+            assert factor >= 3
+            assert max(coarse_grid(h, w, factor - 1)) > NATIVE
+
+
+@pytest.mark.unit
+class TestCoarseGrid:
+    """The pooled grid: ceil on a partial axis, floor on a tiling one."""
+
+    def test_tiling_grid_is_floor_division(self):
+        assert coarse_grid(128, 128, 2) == (64, 64)
+        assert coarse_grid(130, 130, 5) == (26, 26)
+        assert coarse_grid(96, 144, 3) == (32, 48)
+
+    def test_partial_axis_rounds_up(self):
+        assert coarse_grid(125, 32, 2) == (63, 16)      # 125 = 62 blocks + 1 row
+        assert coarse_grid(63, 65, 2) == (32, 33)
+        assert coarse_grid(10, 10, 3) == (4, 4)
+
+    def test_the_blocks_partition_the_canvas(self):
+        """Every canvas cell belongs to exactly one block: no row and no column
+        is dropped by the partial edge block."""
+        for h, w, f in [(125, 32, 2), (63, 65, 2), (200, 101, 4), (10, 7, 3), (1, 1, 2)]:
+            nh, nw = coarse_grid(h, w, f)
+            rows = [row for r in range(nh) for row in range(r * f, min(r * f + f, h))]
+            cols = [col for c in range(nw) for col in range(c * f, min(c * f + f, w))]
+            assert rows == list(range(h))
+            assert cols == list(range(w))
+            # the blocks cover the canvas exactly: one pooled token per block
+            # of the coarse grid, and every canvas cell in exactly one of them
+            covered = sum(min(r * f + f, h) - r * f for r in range(nh)) * \
+                sum(min(c * f + f, w) - c * f for c in range(nw))
+            assert covered == h * w
+            assert nh * nw == len(range(nh)) * len(range(nw))
+
+    def test_pooled_token_count(self):
+        """The user's grid: 125x32 pooled by 2 -> 63x16 = 1008 of 4000 tokens."""
+        nh, nw = coarse_grid(125, 32, 2)
+        assert (nh, nw) == (63, 16)
+        assert nh * nw == 1008
+
+
+@pytest.mark.unit
+class TestLegalFactors:
+    """The factor set the ramp may draw from."""
+
+    def test_tiling_grid_keeps_the_grid_divisors(self):
+        assert legal_factors(128, 128, 2, False) == [d for d in grid_divisors(128, 128) if d <= 2]
+        assert legal_factors(130, 130, 5, False) == [1, 2, 5]
+
+    def test_adjusted_grid_allows_every_block_size(self):
+        assert legal_factors(125, 32, 2, True) == [2]
+        assert legal_factors(200, 101, 4, True) == [2, 3, 4]
 
 
 @pytest.mark.unit
@@ -191,6 +296,26 @@ class TestPoolingRamp:
         assert pooling_ramp(5, 1, 130, 130) == [5]
         assert pooling_ramp(5, 0, 130, 130) == [5]
 
+    def test_the_legal_set_replaces_the_grid_divisors(self):
+        """On a grid that does not tile, the ramp snaps to the legal set (every
+        block size) instead of the grid's divisors — whose only member <= f_0
+        would be 1."""
+        assert legal_factors(125, 32, 2, False) == [1]     # the tiling set: no factor
+        legal = legal_factors(125, 32, 2, True)
+        assert pooling_ramp(2, 8, 125, 32, factors=legal) == [2] * 8
+
+    def test_the_ramp_invariants_hold_on_the_legal_set(self):
+        for h, w in [(125, 32), (200, 101), (63, 65)]:
+            f0, adjusted = resolve_factor(h, w, NATIVE)
+            legal = legal_factors(h, w, f0, adjusted)
+            for steps in (2, 5, 8, 12):
+                plan = pooling_ramp(f0, steps, h, w, factors=legal)
+                assert len(plan) == steps
+                assert plan[0] == f0                       # starts at f_0
+                assert plan[-1] == F_MIN                   # ends at f_min
+                assert all(b <= a for a, b in zip(plan, plan[1:]))   # non-increasing
+                assert all(d in legal for d in plan)       # always a legal block size
+
     def test_schedule_clamps_phase1_steps(self):
         """The node clamps its widget the same way; 0 means "all Phase II"."""
         for h, w in _grids():
@@ -199,6 +324,33 @@ class TestPoolingRamp:
             all_coarse = build_schedule(h, w, 28, 999, NATIVE)             # -> all coarse steps
             assert len(all_coarse.factors) == 28 and all_coarse.windows == ()
             assert build_schedule(h, w, 28, 0, NATIVE).factors == ()
+
+
+@pytest.mark.unit
+class TestAdjustedSchedule:
+    """A grid with no common divisor >= 2 still builds a well-formed schedule."""
+
+    def test_the_users_grid_builds(self):
+        """512x2000 px -> a 125x32 patch grid (gcd 1)."""
+        sched = build_schedule(125, 32, 28, 8, NATIVE)
+        assert sched.factors == (2,) * 8
+        assert len(sched.windows) == 20
+        assert sched.at(0) == ("coarse", 2)
+        assert sched.at(8) == ("fine", sched.windows[0])
+
+    def test_never_raises(self):
+        for h in range(1, 17):
+            for w in range(1, 17):
+                sched = build_schedule(h, w, 28, 8, NATIVE)
+                assert len(sched.factors) == 8
+                assert len(sched.windows) == 20
+
+    def test_the_tiling_path_is_unchanged(self):
+        """The schedule goldens of the tiling path — the fallback must not move
+        a grid that already tiles."""
+        assert build_schedule(80, 80, 28, 8, NATIVE).factors == (2,) * 8
+        assert build_schedule(96, 144, 28, 8, NATIVE).factors == (3, 3, 3, 3, 2, 2, 2, 2)
+        assert build_schedule(130, 130, 28, 8, NATIVE).factors == (5, 5, 5, 5, 2, 2, 2, 2)
 
 
 @pytest.mark.unit

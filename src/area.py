@@ -128,7 +128,13 @@ from .area_arch import (
     _ArchProfile,
     resolve_area_arch,
 )
-from .area_schedule import AreaSchedule, build_schedule, initial_factor, is_short_schedule
+from .area_schedule import (
+    AreaSchedule,
+    build_schedule,
+    coarse_grid,
+    is_short_schedule,
+    resolve_factor,
+)
 from .area_zimage import (
     ZIMAGE_GROUP_ORDER,
     ZIMAGE_SEAM_MODULE,
@@ -196,6 +202,27 @@ def _warn_dynamic_embedder(embedder) -> None:
             "DyPE / I-Max / SEGA positional scaling.",
             type(embedder).__name__,
         )
+
+
+def _warn_grid_adjusted(h: int, w: int, width_px: int, height_px: int, factor: int) -> None:
+    """Tell the user once that the patch grid could not be tiled exactly.
+
+    The pooling ramp needs a common divisor >= 2 of the patch grid to tile it
+    exactly; a grid with none (125x32, from 512x2000 px) is *adjusted* instead
+    of refused: Phase I pools ``f x f`` blocks whose last block on a partial
+    axis is a partial block, and the canvas, the latent and the output
+    resolution are untouched.  The key is the grid, so every resolution is
+    announced once and a grid that already tiles is never announced.
+    """
+    nh, nw = coarse_grid(h, w, factor)
+    _warn_once(
+        f"area-grid-factor:{h}x{w}",
+        "AReA: the %dx%d patch grid (%dx%d px) has no common divisor >= 2, so the "
+        "pooling ramp cannot tile it exactly. Phase I pools %dx%d blocks with a "
+        "partial edge block (pooled grid %dx%d) instead of refusing to run. The "
+        "canvas, the latent and the output resolution are unchanged (%dx%d px).",
+        h, w, width_px, height_px, factor, factor, nh, nw, width_px, height_px,
+    )
 
 
 @dataclass(frozen=True)
@@ -455,9 +482,11 @@ def _area_coarse_ropes(rt: _AreaRuntime, h: int, w: int, f: int, txt_len: int,
     """The two Phase I rope tables (the reference's ``_coarse_ropes``).
 
     Queries keep full resolution and ride on their block's coarse position, the
-    pooled keys sit on the ``(h/f) x (w/f)`` grid, so both are measured in the
-    same units.  Tables come from the *installed* embedder so a chained DyPE/SEGA
-    embedder composes (the reference calls its own ``pos_embed``).
+    pooled keys sit on the pooled grid (``ceil(h/f) x ceil(w/f)`` — the ceil
+    only differs from ``(h/f) x (w/f)`` on a grid the blocks do not tile, where
+    the last block on a partial axis is a partial block), so both are measured
+    in the same units.  Tables come from the *installed* embedder so a chained
+    DyPE/SEGA embedder composes (the reference calls its own ``pos_embed``).
     """
     embedder = getattr(rt.dm, "pe_embedder", None)
     if embedder is None:
@@ -470,11 +499,12 @@ def _area_coarse_ropes(rt: _AreaRuntime, h: int, w: int, f: int, txt_len: int,
     cached = rt.ropes.get(key)
     if cached is not None:
         return cached
+    nh, nw = coarse_grid(h, w, f)
     pos = torch.arange(h * w, device=device)
-    coarse = torch.arange((h // f) * (w // f), device=device)
+    coarse = torch.arange(nh * nw, device=device)
     rope_q = embedder(_area_rope_ids(txt_len, pos // w // f, pos % w // f, device, torch.float32))
     rope_kv = embedder(
-        _area_rope_ids(txt_len, coarse // (w // f), coarse % (w // f), device, torch.float32)
+        _area_rope_ids(txt_len, coarse // nw, coarse % nw, device, torch.float32)
     )
     rt.ropes[key] = (rope_q, rope_kv)
     return rope_q, rope_kv
@@ -1167,6 +1197,13 @@ def _area_resolve_forward(rt: _AreaRuntime, params: dict) -> AreaContext:
     step, total = _area_locate(opts.get("sample_sigmas"), opts.get("sigmas"))
     if step is None or max(h, w) <= rt.config.native:
         return ctx  # at/below the native extent AReA is a provable no-op
+    # The runtime grid comes from the LATENT, not from the widget, so the
+    # apply-time check cannot cover it: a grid that cannot be tiled exactly is
+    # adjusted (never refused) and announced here — once per grid, so a widget
+    # and a latent that agree say it once in total.
+    factor, adjusted = resolve_factor(h, w, rt.config.native)
+    if adjusted:
+        _warn_grid_adjusted(h, w, w * PATCH_PX, h * PATCH_PX, factor)
     phase1 = _phase1_count(rt, opts)
     if is_short_schedule(total):
         # The "+2 healing rule" (area-fix2): an Euler step only displaces the
@@ -1415,11 +1452,17 @@ def apply_area_to_model(
         )
         return m
 
-    # GEOMETRY PRE-CHECK (schedule.py:39-48): the pooling ramp needs a common
-    # divisor >= 2 of the patch grid to tile it exactly, and a grid with none
-    # would otherwise fail three steps into the sampling run.  Fail here, at
-    # apply time, with the reference's actionable message.
-    initial_factor(h, w, NATIVE_PATCHES)
+    # GEOMETRY (schedule.py:39-48): the pooling ramp tiles the patch grid with
+    # a common divisor >= 2; a grid with none (125x32, from 512x2000 px) has
+    # no exact tiling, and used to fail here at apply time — and again, from
+    # the latent, three steps into the sampling run.  The engine never raises
+    # for a grid: the factor is resolved (the extent rule without the
+    # divisibility constraint) and the last pooling block on a partial axis is
+    # a partial block.  The canvas, the latent and the output resolution are
+    # untouched; the user is told once.
+    factor, adjusted = resolve_factor(h, w, NATIVE_PATCHES)
+    if adjusted:
+        _warn_grid_adjusted(h, w, width, height, factor)
 
     _area_install_seam(m, dm, profile)
 

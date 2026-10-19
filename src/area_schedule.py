@@ -35,6 +35,14 @@ Deviations from the reference, all deliberate and pinned by
   short-schedule geometry overrides and :func:`window_sizes` a ``hold`` rung —
   both absent from the reference, both ignored (zeroed) on a long schedule, so
   the FLUX default stays byte-identical.
+* The engine never raises for a patch grid with no common divisor >= 2.
+  :func:`initial_factor` keeps the reference's strict raise (it is the literal
+  port of the reference's ``schedule.py:39-49``), and the engine-facing
+  :func:`resolve_factor` replaces it: on such a grid the factor comes from the
+  extent rule instead of the divisibility rule, the pooling blocks no longer
+  tile the grid exactly (the last block on a partial axis is a *partial*
+  block) and the caller is told the grid was *adjusted*.  The canvas, the
+  token stream and the latent are untouched by the adjustment.
 """
 from __future__ import annotations
 
@@ -186,7 +194,13 @@ def grid_divisors(h: int, w: int) -> list[int]:
 
 
 def initial_factor(h: int, w: int, native: int) -> int:
-    """f_0 of Eq. 5: the smallest grid divisor >= 2 whose pooled grid fits the native extent."""
+    """f_0 of Eq. 5: the smallest grid divisor >= 2 whose pooled grid fits the native extent.
+
+    This is the reference's contract, ported verbatim, and it **raises** on a
+    grid with no common divisor >= 2.  The engine must never raise, so the
+    engine-facing entry point is :func:`resolve_factor` — a grid that reaches
+    :func:`initial_factor` directly re-introduces the reference's crash.
+    """
     divisors = [d for d in grid_divisors(h, w) if d >= 2]
     if not divisors:
         raise ValueError(
@@ -197,9 +211,71 @@ def initial_factor(h: int, w: int, native: int) -> int:
     return min(fits) if fits else max(divisors)
 
 
-def pooling_ramp(f0: int, steps: int, h: int, w: int, f_min: int = F_MIN) -> list[int]:
-    """Eqs. 2 and 4: f decreases linearly from f_0 to f_min, snapped to non-increasing grid divisors."""
-    divisors = [d for d in grid_divisors(h, w) if d <= f0]
+def coarse_grid(h: int, w: int, f: int) -> tuple[int, int]:
+    """The pooled grid ``(ceil(h/f), ceil(w/f))`` — Phase I's canvas for a factor ``f``.
+
+    Ceil, not floor: a factor that does not divide the grid leaves a *partial*
+    edge block, and the pooled canvas is one cell larger on that axis.  For a
+    factor that tiles the grid exactly this is ``(h//f, w//f)``, so the
+    tiling path is unchanged.
+    """
+    f = max(1, int(f))
+    return (-(-int(h) // f), -(-int(w) // f))
+
+
+def resolve_factor(h: int, w: int, native: int) -> tuple[int, bool]:
+    """The engine's ``f_0`` — the factor of the pooling ramp, and whether it was *adjusted*.
+
+    Never raises: any grid gets a factor.  ``(factor, adjusted)`` is
+
+    * ``(f_0, False)`` on a grid with a common divisor >= 2 — exactly
+      :func:`initial_factor`, byte for byte;
+    * ``(f, True)`` on a grid with none: the factor is then the smallest one
+      ``>= 2`` whose pooled grid still fits the native extent (Eq. 5's extent
+      rule without the divisibility constraint), so the pooling blocks no
+      longer tile the grid exactly and the last block on a partial axis is a
+      *partial* block.
+
+    The canvas, the token stream and the latent are untouched either way — only
+    the block partition of the pooling changes.
+    """
+    h, w = int(h), int(w)
+    divisors = [d for d in grid_divisors(h, w) if d >= 2]
+    if divisors:                                    # the reference's Eq. 5, unchanged
+        fits = [d for d in divisors if max(h, w) / d <= native]
+        return (min(fits) if fits else max(divisors)), False
+    native = max(1, int(native))
+    return max(2, -(-max(h, w) // native)), True
+
+
+def legal_factors(h: int, w: int, f0: int, adjusted: bool) -> list[int]:
+    """The factor set the ramp may draw from.
+
+    On a grid that tiles, that is the grid's own divisors up to ``f_0`` — the
+    reference's set, unchanged.  On an adjusted grid every block size is
+    legal (the partial edge block covers the remainder), so the set is every
+    integer in ``[2, f_0]``.
+    """
+    if not adjusted:
+        return [d for d in grid_divisors(h, w) if d <= f0]
+    return list(range(2, int(f0) + 1))
+
+
+def pooling_ramp(f0: int, steps: int, h: int, w: int, f_min: int = F_MIN,
+                  factors: Sequence[int] | None = None) -> list[int]:
+    """Eqs. 2 and 4: f decreases linearly from f_0 to f_min, snapped to non-increasing legal factors.
+
+    ``factors`` is the *legal* factor set the ramp snaps to; ``None`` keeps the
+    reference's set (the grid divisors up to ``f_0``).  On a grid that does not
+    tile, the caller passes every legal block size instead
+    (:func:`legal_factors`), and the ramp's shape is unchanged.
+    """
+    if factors is None:
+        divisors = [d for d in grid_divisors(h, w) if d <= f0]
+    else:
+        divisors = sorted({int(d) for d in factors if int(d) <= int(f0)})
+    if not divisors:
+        divisors = [int(f0)]
     if f_min not in divisors:
         f_min = min(divisors, key=lambda d: (abs(d - f_min), -d))
     if steps <= 1:
@@ -342,6 +418,12 @@ def build_schedule(
     engine's own no-pooling representation — so Phase I begins on an established
     canvas.  Gated like the knobs above, and clamped so the ramp never shrinks
     below ``phase1_steps`` pooled rungs.
+
+    The schedule is built for **any** grid: the pooling factor comes from
+    :func:`resolve_factor`, which never raises.  On a grid with no common
+    divisor >= 2 the factor is the extent rule's, the ramp snaps to the legal
+    set (:func:`legal_factors`) and the last pooling block on a partial axis is
+    a partial block — the canvas and the token stream are unchanged.
     """
     phase1_steps = max(0, min(int(phase1_steps), int(steps)))
     extent = max(h, w)
@@ -351,7 +433,9 @@ def build_schedule(
     # delay would silently start Phase II on the whole grid instead of the
     # pooled handoff ("no Phase I at all" is phase1_steps=0 / bootstrap).
     delay = max(0, min(int(delay), phase1_steps - 1)) if is_short_schedule(steps) else 0
-    ramp = pooling_ramp(initial_factor(h, w, native), phase1_steps, h, w) if phase1_steps else []
+    f0, adjusted = resolve_factor(h, w, native)
+    ramp = (pooling_ramp(f0, phase1_steps, h, w, factors=legal_factors(h, w, f0, adjusted))
+            if phase1_steps else [])
     factors = [1] * delay + ramp[:phase1_steps - delay]
     phase2_steps = steps - phase1_steps
     windows: list[int] = []

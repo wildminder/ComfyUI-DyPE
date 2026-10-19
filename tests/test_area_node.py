@@ -549,11 +549,24 @@ class TestApplyGates:
         assert _unet_wrapper(m) is None
         assert any("provable no-op" in rec.message for rec in caplog.records)
 
-    def test_geometry_without_a_common_divisor_raises_at_apply(self, flux_layers):
+    def test_geometry_without_a_common_divisor_is_adjusted_not_refused(self, flux_layers,
+                                                                       caplog):
         # 128 x 129 patches (2048 x 2064 px) share no divisor >= 2, so no
-        # pooling factor tiles the grid exactly (schedule.py:39-48).
-        with pytest.raises(ValueError, match="no common divisor >= 2"):
-            apply_area_to_model(mock_flux_model(), "flux", 2048, 2064)
+        # pooling factor tiles the grid exactly (schedule.py:39-48).  The
+        # ENGINE adjusts the pooling geometry (a partial edge block) instead of
+        # refusing the run; the reference's strict raise stays in
+        # ``initial_factor`` (``src/area_schedule.py``), which the engine never
+        # calls.
+        with caplog.at_level(logging.WARNING, logger="ComfyUI-DyPE"):
+            m = apply_area_to_model(mock_flux_model(), "flux", 2048, 2064)
+        try:
+            assert m._area_config is not None
+        finally:
+            restore_area_attention_hook(m)
+        # one advisory, naming the grid it could not tile
+        assert caplog.text.count("no common divisor >= 2") == 1
+        assert "129x128" in caplog.text
+        assert "area-grid-factor:129x128" in area._warned
 
     def test_phase1_steps_and_pooling_are_clamped(self, patched):
         assert patched._area_config.phase1_steps == PHASE1

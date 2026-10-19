@@ -36,7 +36,9 @@ from src.area_attn import (
     CELLS,
     POOLING,
     AreaContext,
+    _block_mask,
     _block_selection,
+    _norm_preserved_keys,
     _pool,
     _token_matrix,
     apply_rope1,
@@ -48,7 +50,7 @@ from src.area_attn import (
     token_importance,
     windowed_attention,
 )
-from src.area_schedule import Window, even_starts, window_tokens
+from src.area_schedule import Window, coarse_grid, even_starts, window_tokens
 
 B, HEADS, DIM, TEXT = 2, 3, 8, 5
 
@@ -74,6 +76,30 @@ def _blocks(x_img: torch.Tensor, h: int, w: int, f: int) -> torch.Tensor:
     return (x_img.reshape(b, heads, h // f, f, w // f, f, dim)
             .permute(0, 1, 2, 4, 3, 5, 6)
             .reshape(b, heads, h // f, w // f, f * f, dim))
+
+
+def _reference_pool(x_img: torch.Tensor, h: int, w: int, f: int, pooling: str,
+                    sel: torch.Tensor | None) -> torch.Tensor:
+    """The reference's pooling, rebuilt block by block from the definition.
+
+    An oracle independent of the implementation's reshape: the pooled token of
+    block ``(r, c)`` is the block centre (``subsample``), the block average
+    (``mean``) or the member ``sel`` names (``medoid`` / ``random``).
+    """
+    b, heads, _, dim = x_img.shape
+    grid = x_img.reshape(b, heads, h, w, dim)
+    out = []
+    for r in range(h // f):
+        for c in range(w // f):
+            block = grid[:, :, r * f:(r + 1) * f, c * f:(c + 1) * f, :]
+            if pooling == "subsample":
+                out.append(block[:, :, f // 2, f // 2, :])
+            elif pooling == "mean":
+                out.append(block.mean(dim=(2, 3)))
+            else:
+                idx = sel[:, r, c].view(b, 1, 1, 1).expand(b, heads, 1, dim)
+                out.append(block.reshape(b, heads, f * f, dim).gather(2, idx).squeeze(2))
+    return torch.stack(out, dim=2).reshape(b, heads, (h // f) * (w // f), dim)
 
 
 @pytest.mark.unit
@@ -201,6 +227,142 @@ class TestPoolKeysValues:
         for pooling in POOLING:
             pk, pv = pool_keys_values(k, v, TEXT, h, w, f, pooling)
             assert pk.shape[2] == TEXT + (h // f) * (w // f)
+
+
+@pytest.mark.unit
+class TestPartialEdgeBlock:
+    """A patch grid whose counts share no factor >= 2 has no exact pooling tiling.
+
+    The reference's Eq. 5 refuses such a grid; the engine resolves it to a
+    factor whose blocks do NOT tile it, so the last block on a partial axis
+    owns fewer than ``f`` rows or columns.  These pin that partition: every
+    canvas token is pooled exactly once, the partial block is averaged over its
+    REAL members only, and the pooled token is always a real canvas token.
+    """
+
+    #: the user's 512x2000 px canvas: 125x32 patches, gcd(125, 32) == 1, factor 2
+    GRID = (125, 32, 2)
+
+    def test_the_pooled_grid_is_the_ceil_of_the_factor(self):
+        h, w, f = self.GRID
+        nh, nw = coarse_grid(h, w, f)
+        assert (nh, nw) == (63, 16)
+        _, k, v = _seam(h=h, w=w, seed=3)
+        for pooling in POOLING:
+            pk, pv = pool_keys_values(k, v, TEXT, h, w, f, pooling, seed=5, step=2, block=1)
+            assert pk.shape == (B, HEADS, TEXT + nh * nw, DIM)
+            assert pv.shape == pk.shape
+            assert torch.equal(pk[:, :, :TEXT], k[:, :, :TEXT])
+            assert torch.equal(pv[:, :, :TEXT], v[:, :, :TEXT])
+
+    def test_the_blocks_cover_every_token_exactly_once(self):
+        h, w, f = self.GRID
+        nh, nw = coarse_grid(h, w, f)
+        rows = [range(r * f, min(r * f + f, h)) for r in range(nh)]
+        cols = [range(c * f, min(c * f + f, w)) for c in range(nw)]
+        assert [i for r in rows for i in r] == list(range(h))
+        assert [i for c in cols for i in c] == list(range(w))
+        mask = _block_mask(h, w, f, "cpu")
+        assert mask.shape == (nh, nw, f, f)
+        assert int(mask.sum()) == h * w                      # every cell pooled exactly once
+
+    def test_the_mean_is_taken_over_the_real_members_only(self):
+        h, w, f = 9, 6, 4                                   # both axes partial
+        _, k, _ = _seam(h=h, w=w, seed=5)
+        nh, nw = coarse_grid(h, w, f)
+        pooled = _pool(k[:, :, TEXT:], h, w, f, "mean", None).reshape(B, HEADS, -1, DIM)
+        grid = k[:, :, TEXT:].reshape(B, HEADS, h, w, DIM)
+        for r, c in ((0, 0), (nh - 1, nw - 1), (nh - 1, 0), (0, nw - 1)):
+            members = grid[:, :, r * f:min((r + 1) * f, h), c * f:min((c + 1) * f, w), :]
+            want = members.mean(dim=(2, 3))
+            assert torch.allclose(pooled[:, :, r * nw + c], want, atol=1e-6), (r, c)
+
+    def test_the_partial_block_is_not_averaged_over_its_padding(self):
+        """The masked mean, not the mean of the zero-padded block: an unmasked
+        mean would divide the real members' sum by the padded block's size and
+        shrink the partial block's key."""
+        h, w, f = 9, 6, 4
+        _, k, _ = _seam(h=h, w=w, seed=5)
+        nh, nw = coarse_grid(h, w, f)
+        pooled = _pool(k[:, :, TEXT:], h, w, f, "mean", None).reshape(B, HEADS, -1, DIM)
+        grid = k[:, :, TEXT:].reshape(B, HEADS, h, w, DIM)
+        padded = torch.zeros(B, HEADS, nh * f, nw * f, DIM)
+        padded[:, :, :h, :w] = grid
+        unmasked = padded.reshape(B, HEADS, nh, f, nw, f, DIM).mean(dim=(3, 5))
+        assert not torch.allclose(pooled, unmasked.reshape(B, HEADS, -1, DIM), atol=1e-6)
+
+    def test_the_norm_preserved_keys_keep_the_unpooled_temperature(self):
+        """The partial block's key is the masked centroid at the mean norm of its
+        REAL members — the temperature the un-pooled canvas would have had."""
+        h, w, f = 9, 6, 4
+        _, k, _ = _seam(h=h, w=w, seed=5)
+        nh, nw = coarse_grid(h, w, f)
+        keys = _norm_preserved_keys(k[:, :, TEXT:], h, w, f).reshape(B, HEADS, -1, DIM)
+        grid = k[:, :, TEXT:].reshape(B, HEADS, h, w, DIM)
+        r, c = nh - 1, nw - 1
+        members = grid[:, :, r * f:min((r + 1) * f, h), c * f:min((c + 1) * f, w), :]
+        centroid = members.mean(dim=(2, 3))
+        norms = members.norm(dim=-1).mean(dim=(2, 3))
+        want = centroid / (centroid.norm(dim=-1, keepdim=True) + 1e-8) * norms[..., None]
+        assert torch.allclose(keys[:, :, r * nw + c], want, atol=1e-5)
+
+    def test_subsample_takes_the_clamped_block_centre(self):
+        h, w, f = 9, 6, 4
+        _, k, _ = _seam(h=h, w=w, seed=5)
+        nh, nw = coarse_grid(h, w, f)
+        pooled = _pool(k[:, :, TEXT:], h, w, f, "subsample", None).reshape(B, HEADS, -1, DIM)
+        grid = k[:, :, TEXT:].reshape(B, HEADS, h, w, DIM)
+        for r, c in ((0, 0), (nh - 1, nw - 1), (nh - 1, 0)):
+            row = min(r * f + f // 2, h - 1)
+            col = min(c * f + f // 2, w - 1)
+            assert torch.equal(pooled[:, :, r * nw + c], grid[:, :, row, col]), (r, c)
+
+    def test_the_selecting_poolings_always_take_a_real_token(self):
+        """A padded cell is a zero vector, so no block may ever select one."""
+        h, w, f = 9, 6, 4
+        _, k, v = _seam(h=h, w=w, seed=3)
+        nh, nw = coarse_grid(h, w, f)
+        grid = v[:, :, TEXT:].reshape(B, HEADS, h, w, DIM)
+        for pooling in ("medoid", "random"):
+            _, pv = pool_keys_values(k, v, TEXT, h, w, f, pooling, 5, 2, 1)
+            pooled = pv[:, :, TEXT:].reshape(B, HEADS, nh, nw, DIM)
+            for r, c in ((nh - 1, nw - 1), (nh - 1, 0), (0, nw - 1)):
+                block = grid[:, :, r * f:min((r + 1) * f, h), c * f:min((c + 1) * f, w), :]
+                hit = (pooled[:, :, r, c].unsqueeze(2).unsqueeze(3) == block).all(dim=-1)
+                assert bool(hit.any(dim=2).any(dim=2).all()), (pooling, r, c)
+
+    def test_a_grid_of_two_primes_still_pools(self):
+        """The engine's fallback grid: 127 and 33 share no factor >= 2."""
+        h, w, f = 127, 33, 2
+        _, k, v = _seam(h=h, w=w, seed=1)
+        nh, nw = coarse_grid(h, w, f)
+        assert (nh, nw) == (64, 17)
+        pk, pv = pool_keys_values(k, v, TEXT, h, w, f, "mean")
+        assert pk.shape == (B, HEADS, TEXT + nh * nw, DIM)
+        assert torch.isfinite(pk).all() and torch.isfinite(pv).all()
+
+    def test_the_partial_pooling_is_deterministic(self):
+        h, w, f = 9, 6, 4
+        _, k, v = _seam(h=h, w=w, seed=3)
+        for pooling in POOLING:
+            one = pool_keys_values(k, v, TEXT, h, w, f, pooling, 5, 2, 1)
+            two = pool_keys_values(k, v, TEXT, h, w, f, pooling, 5, 2, 1)
+            assert torch.equal(one[0], two[0]) and torch.equal(one[1], two[1]), pooling
+
+    def test_the_exact_tiling_path_is_unchanged(self):
+        """A grid that tiles keeps the reference's pooling — the partial path is
+        a guard around the old body, not a rewrite of it."""
+        for h, w, f in ((8, 8, 2), (12, 16, 4), (16, 24, 8)):
+            _, k, _ = _seam(h=h, w=w, seed=11)
+            img = k[:, :, TEXT:]
+            for pooling in POOLING:
+                sel = _block_selection(img, h, w, f, pooling, 5, 2, 1)
+                got = _pool(img, h, w, f, pooling, sel)
+                want = _reference_pool(img, h, w, f, pooling, sel)
+                if pooling == "mean":
+                    assert torch.allclose(got, want, atol=1e-6), (h, w, f)
+                else:
+                    assert torch.equal(got, want), (h, w, f)
 
 
 @pytest.mark.unit
