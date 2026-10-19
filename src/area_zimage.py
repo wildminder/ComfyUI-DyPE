@@ -579,20 +579,31 @@ def coarse_ropes_zimage(
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """The two Phase I rope tables — the reference's ``_coarse_ropes`` for lumina.
 
-    Queries keep full resolution and ride on their BLOCK's coarse position while
-    the pooled keys sit on the ``(h/f) x (w/f)`` grid, so both are measured in
-    the same units.  The tables come from the model's own ``rope_embedder`` (so
-    a chained positional-scaling embedder composes, ``src/area.py:279-316``) but
-    from lumina's ids: the caption block rides the t axis (``arange(cap_len) +
-    1``, ``model.py:664-667`` — FLUX's zero text ids are NOT copied) and every
-    image token of the frame carries one t value, ``cap_len + 1``, with its
-    row/col on the other two axes (``pos_ids_x``, ``model.py:421-437``).
+    Queries keep full resolution while the pooled keys sit on the ``(h/f) x
+    (w/f)`` grid, so both are measured in the same units — CONTINUOUSLY
+    (AReA-Z mechanism 1, ``.dev/area-debug/area-fix.txt`` Flaw 2): the reference
+    floor-divided the query's position into its block's integer coordinate, so
+    every ``f x f`` block shared one rope position and the phase jumped by a
+    whole unit at every block boundary — at Z-Image's low rope theta (256, vs
+    FLUX's 10 000) an ``f = 2`` boundary jump is about 1 rad (~57 degrees), a
+    32 px square wave injected into the velocity field.  Here each query keeps
+    its own position scaled by ``1/f`` and the pooled key sits at its block's
+    geometric centroid, ``R + (f - 1) / (2f)`` — the mean of its block's query
+    positions — so the phase jump across a boundary equals the one inside the
+    block and the staircase is gone; ``f == 1`` degenerates exactly (offset 0,
+    positions unchanged).  The tables come from the model's own
+    ``rope_embedder`` (so a chained positional-scaling embedder composes,
+    ``src/area.py:279-316``) but from lumina's ids: the caption block rides the
+    t axis (``arange(cap_len) + 1``, ``model.py:664-667`` — FLUX's zero text ids
+    are NOT copied) and every image token of the frame carries one t value,
+    ``cap_len + 1``, with its row/col on the other two axes (``pos_ids_x``,
+    ``model.py:421-437``).
 
     ``rope_q`` covers the whole padded stream in STREAM order — caption block,
-    image at coarse positions, image pad on the model's own zero ids — and
-    ``rope_kv`` the engine's Phase I key order: the caption block (never pooled),
-    the image pad (unchanged), then the coarse grid.  That is why the two tables
-    differ while the caption half is shared.
+    image at continuous coarse positions, image pad on the model's own zero ids
+    — and ``rope_kv`` the engine's Phase I key order: the caption block (never
+    pooled), the image pad (unchanged), then the coarse grid.  That is why the
+    two tables differ while the caption half is shared.
     """
     if embedder is None:
         raise ValueError(
@@ -611,6 +622,7 @@ def coarse_ropes_zimage(
             "This forward runs plain attention."
         )
     nh, nw = layout.h // f, layout.w // f
+    ff = float(f)
     h_scale, w_scale, h_start, w_start = _axis_scales(rope_options)
 
     # The caption block: t = 1..cap_len, row/col zero (model.py:664-667).
@@ -624,18 +636,24 @@ def coarse_ropes_zimage(
     # The image pad: position (0, 0, 0), an identity rotation (model.py:727).
     pad_ids = _zeros(layout.img_pad, device)
 
-    # Queries: one entry per image token, riding its block's coarse position.
+    # Queries: one entry per image token at its OWN position on the coarse
+    # grid (``r / f``) — no floor division, so the f^2 tokens of a block stay
+    # distinct instead of collapsing onto one coordinate with a phase jump at
+    # every boundary (mechanism 1).
     pos = torch.arange(layout.h * layout.w, device=device)
-    q_rows = ((pos // layout.w) // f).to(torch.float32) * h_scale + h_start
-    q_cols = ((pos % layout.w) // f).to(torch.float32) * w_scale + w_start
+    q_rows = (pos // layout.w).to(torch.float32) / ff * h_scale + h_start
+    q_cols = (pos % layout.w).to(torch.float32) / ff * w_scale + w_start
     q_image_ids = _ids(
         torch.full((layout.h * layout.w,), float(cap_len + 1), device=device),
         q_rows, q_cols, device,
     )
-    # Keys: one entry per pooled block on the coarse grid.
+    # Keys: one entry per pooled block, at its block's GEOMETRIC CENTROID
+    # ``R + (f - 1) / (2f)`` — the mean of the block's query positions, so the
+    # phase step across a block boundary equals the one inside the block.
     coarse = torch.arange(nh * nw, device=device)
-    kv_rows = (coarse // nw).to(torch.float32) * h_scale + h_start
-    kv_cols = (coarse % nw).to(torch.float32) * w_scale + w_start
+    kv_offset = (ff - 1.0) / (2.0 * ff)
+    kv_rows = ((coarse // nw).to(torch.float32) + kv_offset) * h_scale + h_start
+    kv_cols = ((coarse % nw).to(torch.float32) + kv_offset) * w_scale + w_start
     kv_image_ids = _ids(
         torch.full((nh * nw,), float(cap_len + 1), device=device),
         kv_rows, kv_cols, device,

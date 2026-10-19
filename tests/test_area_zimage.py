@@ -24,6 +24,8 @@ Accept (user-run): pytest tests/test_area_zimage.py tests/test_area_node.py
 """
 from __future__ import annotations
 
+from typing import Optional
+
 import pytest
 import torch
 from nodes.area import AReA
@@ -41,6 +43,7 @@ from src.area_zimage import (
     ZIMAGE_AXES,
     ZIMAGE_SIGMA_STAR,
     ZImageRopeRecorder,
+    _axis_scales,
     coarse_ropes_zimage,
     sigma_prefix_count,
     stitch_fine_zeros,
@@ -395,7 +398,7 @@ class TestUnrotate:
 @pytest.mark.unit
 class TestCoarseRopes:
     def test_coarse_rope_builder_q_and_kv_grids(self):
-        """The two Phase I tables: q on the full stream at BLOCK positions, kv on the coarse grid."""
+        """The two Phase I tables: q at continuous scaled positions, kv at block centroids."""
         embedder = MockEmbedND()
         layout = zimage_layout(TXT_LEN, CAP_LEN, H, W, SEQ_LEN)
         assert layout.img_pad == IMG_PAD                 # the pad policy is live here
@@ -419,31 +422,134 @@ class TestCoarseRopes:
                               torch.eye(2).expand_as(
                                   rope_kv[0, 0, CAP_LEN:CAP_LEN + IMG_PAD]).clone())
 
-        # an image query rides its BLOCK's coarse position, not its own: the
-        # token at (row 3, col 5) rides (1, 2) at f=2 — built by hand from the
-        # fixture's theta so a hardcoded theta/table cannot pass
+        # an image query rides its OWN continuously scaled position, not the
+        # floor-divided block coordinate: the token at (row 3, col 5) rides
+        # (1.5, 2.5) at f=2 — built by hand from the fixture's theta so a
+        # hardcoded theta/table cannot pass
         q_index = CAP_LEN + 3 * W + 5
-        block_ids = torch.zeros(1, 1, ZIMAGE_AXES)
-        block_ids[0, 0, 0] = IMG_T
-        block_ids[0, 0, 1] = 1.0
-        block_ids[0, 0, 2] = 2.0
-        assert torch.allclose(rope_q[0, 0, q_index], embedder(block_ids)[0, 0, 0])
-        own_ids = block_ids.clone()
+        scaled_ids = torch.zeros(1, 1, ZIMAGE_AXES)
+        scaled_ids[0, 0, 0] = IMG_T
+        scaled_ids[0, 0, 1] = 1.5
+        scaled_ids[0, 0, 2] = 2.5
+        assert torch.allclose(rope_q[0, 0, q_index], embedder(scaled_ids)[0, 0, 0])
+        # neither the reference's floor-divided block coordinate (1, 2) ...
+        block_ids = scaled_ids.clone()
+        block_ids[0, 0, 1], block_ids[0, 0, 2] = 1.0, 2.0
+        assert not torch.allclose(rope_q[0, 0, q_index], embedder(block_ids)[0, 0, 0])
+        # ... nor the token's own full-resolution position
+        own_ids = scaled_ids.clone()
         own_ids[0, 0, 1], own_ids[0, 0, 2] = 3.0, 5.0
         assert not torch.allclose(rope_q[0, 0, q_index], embedder(own_ids)[0, 0, 0])
 
-        # the pooled keys are the coarse grid in raster order, all on one t value
+        # the pooled keys sit at each block's GEOMETRIC CENTROID, in raster order
+        centroid = (F - 1) / (2 * F)                     # 0.25 at f=2
         for k in range((H // F) * (W // F)):
             kid = torch.zeros(1, 1, ZIMAGE_AXES)
             kid[0, 0, 0] = IMG_T
-            kid[0, 0, 1] = float(k // (W // F))
-            kid[0, 0, 2] = float(k % (W // F))
+            kid[0, 0, 1] = float(k // (W // F)) + centroid
+            kid[0, 0, 2] = float(k % (W // F)) + centroid
             assert torch.allclose(rope_kv[0, 0, CAP_LEN + IMG_PAD + k], embedder(kid)[0, 0, 0])
 
         # theta comes from the installed embedder, not a literal in the adapter
         other = MockEmbedND(theta=500.0)
         other_kv = coarse_ropes_zimage(other, layout, F, "cpu")[1]
         assert not torch.allclose(other_kv, rope_kv)
+
+
+# ---------------------------------------------------------------------------
+# The continuous coarse positions (M1 — area-fix Flaw 2)
+# ---------------------------------------------------------------------------
+
+
+class PassthroughEmbedder:
+    """The ids the adapter builds, handed back unchanged.
+
+    ``coarse_ropes_zimage`` embeds ids, so a passthrough stand-in is the only
+    way to read the POSITIONS it computed: the returned "tables" are the
+    ``(t, row, col)`` ids themselves (``_head_shared`` leaves a ``[1, n, 3]``
+    tensor alone — neither of axes 1/2 is the singleton it flips).
+    """
+
+    def __init__(self):
+        self.calls: list = []
+
+    def __call__(self, ids: torch.Tensor) -> torch.Tensor:
+        self.calls.append(ids.clone())
+        return ids
+
+
+@pytest.mark.unit
+class TestContinuousCoarseRope:
+    """M1: continuous anti-aliased coarse positions, no floor division.
+
+    The reference gave every ``f x f`` block one integer rope coordinate and
+    jumped a whole unit at each boundary — at Z-Image's ``theta = 256`` that is
+    about 1 rad (~57 degrees) per two tokens, a 32 px square wave in the
+    velocity field (``.dev/area-debug/area-fix.txt`` Flaw 2).  Here each query
+    keeps ``r / f`` and each pooled key sits at ``R + (f - 1) / (2f)``: the
+    block's tokens stay distinct and the phase step across a boundary equals the
+    one inside the block.  ``f == 1`` degenerates exactly.
+    """
+
+    def _ids(self, f: int, rope_options: Optional[dict] = None):
+        embedder = PassthroughEmbedder()
+        layout = zimage_layout(TXT_LEN, CAP_LEN, H, W, SEQ_LEN)
+        rope_q, rope_kv = coarse_ropes_zimage(embedder, layout, f, "cpu", rope_options)
+        h_scale, w_scale, h_start, w_start = _axis_scales(rope_options)
+        return layout, rope_q, rope_kv, (h_scale, w_scale, h_start, w_start)
+
+    def test_block_members_get_distinct_query_positions(self):
+        """The four tokens of a 2x2 block sit at (R,C), (R,C+.5), (R+.5,C), (R+.5,C+.5)."""
+        _, rope_q, _, _ = self._ids(F)
+        corners = (0, 0), (0, 1), (1, 0), (1, 1)         # the block at rows 0-1, cols 0-1
+        for dr, dc in corners:
+            pos = rope_q[0, CAP_LEN + dr * W + dc, :]
+            assert (float(pos[1]), float(pos[2])) == (dr / F, dc / F)
+        # all four are DISTINCT — the floor division's collapse is gone
+        seen = {tuple(rope_q[0, CAP_LEN + dr * W + dc, 1:].tolist()) for dr, dc in corners}
+        assert len(seen) == 4
+
+    def test_pooled_keys_sit_at_the_block_centroid(self):
+        """Every pooled key sits at the mean of its block's query positions."""
+        _, _, rope_kv, _ = self._ids(F)
+        base = CAP_LEN + IMG_PAD                           # the coarse grid starts here
+        nh, nw = H // F, W // F
+        for blk in range(nh * nw):
+            pos = rope_kv[0, base + blk, :]
+            assert (float(pos[1]), float(pos[2])) == (
+                blk // nw + (F - 1) / (2 * F),
+                blk % nw + (F - 1) / (2 * F),
+            )
+
+    def test_query_columns_advance_by_a_constant_step(self):
+        """No staircase: the column step is exactly ``w_scale / f`` everywhere."""
+        _, rope_q, _, (_, w_scale, _, _) = self._ids(F)
+        row0 = rope_q[0, CAP_LEN:CAP_LEN + W, 2]
+        assert torch.allclose(row0[1:] - row0[:-1],
+                              torch.full((W - 1,), w_scale / F), atol=1e-6)
+
+    def test_a_positional_scaling_composes_with_the_continuous_map(self):
+        """``scale_x``/``shift_x`` (``pos_ids_x``) scale the continuous positions."""
+        _, rope_q, rope_kv, (h_scale, w_scale, h_start, w_start) = self._ids(
+            F, {"scale_y": 3.0, "scale_x": 2.0, "shift_y": 0.25, "shift_x": -1.0})
+        pos = rope_q[0, CAP_LEN + 3 * W + 5, :]
+        assert (float(pos[1]), float(pos[2])) == (
+            1.5 * h_scale + h_start, 2.5 * w_scale + w_start)
+        base = CAP_LEN + IMG_PAD
+        key = rope_kv[0, base, :]                           # block (0, 0)
+        assert (float(key[1]), float(key[2])) == (
+            0.25 * h_scale + h_start, 0.25 * w_scale + w_start)
+
+    def test_factor_one_is_full_resolution(self):
+        """``f == 1`` degenerates exactly: the offset is 0 and r/1 = r."""
+        _, rope_q, rope_kv, _ = self._ids(1)
+        pos = torch.arange(IMG_TOKENS)
+        assert torch.allclose(rope_q[0, CAP_LEN:CAP_LEN + IMG_TOKENS, 1], (pos // W).float())
+        assert torch.allclose(rope_q[0, CAP_LEN:CAP_LEN + IMG_TOKENS, 2], (pos % W).float())
+        coarse = torch.arange(IMG_TOKENS)
+        base = CAP_LEN + IMG_PAD
+        assert torch.allclose(rope_kv[0, base:base + IMG_TOKENS, 1], (coarse // W).float())
+        assert torch.allclose(rope_kv[0, base:base + IMG_TOKENS, 2], (coarse % W).float())
 
 
 # ---------------------------------------------------------------------------
