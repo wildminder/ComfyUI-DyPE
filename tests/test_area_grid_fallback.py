@@ -77,7 +77,14 @@ GOLDENS = {
     "flux160_coarse": "52ed0106c10bd149ea66b16728efd973",
     # Z-Image: the seam file's own 65x65 canvas, coarse and fine step.
     "zimage65_coarse": "394b3e8a2529bb35436fbaea4618d808",
-    "zimage65_fine": "694ecab825562441a447a4426ac996be",
+    # The FINE golden moved with area-fix3 (the GTCN): the Phase II caption
+    # anchoring re-ropes the caption at each window's own origin, so the fine
+    # step's answer changes.  Reverting the anchoring reproduces the previous
+    # value exactly, which is what makes this a GTCN-only delta.  The COARSE
+    # golden above and every FLUX golden are unchanged (a 65x65 canvas at
+    # f = 5 already fits the trained extent, so the Phase I scaling is a
+    # no-op there, and FLUX never passes a rope embedder).
+    "zimage65_fine": "b16a038f4050d776d9c77a4a91192d0a",
     # The pooled keys / values of the 80x80 grid, per pooling mode.
     "pool_subsample_k": "93fb5f62bc218d3d2a6deab3124eff6f",
     "pool_subsample_v": "a5392ef83c215b60d9c89862258107c9",

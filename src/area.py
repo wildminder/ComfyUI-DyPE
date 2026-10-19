@@ -115,6 +115,7 @@ from .area_attn import (
     apply_rope1,
     bridge_registers,
     build_fine_layout,
+    caption_window_ids,
     detail_map,
     fit_extra_keys,
     pool_keys_values,
@@ -141,6 +142,7 @@ from .area_zimage import (
     ZIMAGE_SEAM_SYMBOL,
     ZIMAGE_SIGMA_STAR,
     ZImageRopeRecorder,
+    _head_shared,
     capture_tables,
     coarse_ropes_zimage,
     sigma_prefix_count,
@@ -870,6 +872,29 @@ def _zimage_coarse_ropes(rt: _AreaRuntime, layout, f: int, device, kw: dict):
     return ropes
 
 
+def _zimage_caption_rope(rt: _AreaRuntime, ctx: AreaContext, fine: FineLayout,
+                          t: int, device):
+    """The GTCN caption anchor table, built ONCE per step (cached on the context).
+
+    The table depends only on the step's windows, the caption length and the
+    model's rope embedder — all of them fixed for the step — so the step's
+    attention calls (one per refiner layer) share it instead of rebuilding it
+    per call.  The cache lives on the STEP's context, so a new step (new
+    windows, new timestep) always rebuilds it: a dynamic positional embedder
+    (DyPE / I-Max / SEGA) is therefore never served a stale table.
+    """
+    cached = ctx.data.get("caption_rope")
+    if cached is not None:
+        return cached
+    embedder = getattr(rt.dm, "rope_embedder", None)
+    if embedder is None:
+        return None
+    _warn_dynamic_embedder(embedder)
+    table = _head_shared(embedder(caption_window_ids(fine, t, device)))
+    ctx.data["caption_rope"] = table
+    return table
+
+
 def _zimage_attention(rt: _AreaRuntime, ctx: AreaContext, layout, q, k, v, heads, kw):
     """The AReA computation of one Z-Image attention call, or ``None`` to delegate.
 
@@ -933,6 +958,7 @@ def _zimage_attention(rt: _AreaRuntime, ctx: AreaContext, layout, q, k, v, heads
             unrotate1(k, table)[:, :, first:last], fine,
             rope_embedder=getattr(rt.dm, "rope_embedder", None),
             cap_len=layout.cap_len,
+            caption_rope=_zimage_caption_rope(rt, ctx, fine, layout.cap_len, q.device),
         )
         out = stitch_fine_zeros(out_txt, out_img, layout)
     # comfy's own flatten: heads then head-dim, sequence back on axis 1

@@ -567,10 +567,58 @@ def _group_window_ids(group: WindowGroup, layout: FineLayout) -> list[int]:
     return found
 
 
+def caption_window_ids(layout: FineLayout, t: int, device) -> torch.Tensor:
+    """``[n_windows, t, 3]`` — the caption's rope ids, anchored to EACH window.
+
+    **GTCN, Phase II (area-fix3, ``.dev/area-debug/area-fix3.txt``).**  Lumina2
+    puts every caption token at the spatial origin (``(t, 0, 0)``,
+    ``comfy/ldm/lumina/model.py:664-667``), so a window far from the origin
+    meets the prompt through a rope phase the model was never trained on — at
+    Z-Image's theta (256, one rad per token) a 200-token distance wraps the
+    rotation ~32 times and the text cross-attention collapses into noise.  Each
+    window therefore sees the caption at ITS OWN origin: the spatial axes
+    carry that window's ``(r0, c0)`` and the caption's distance inside the
+    window is bounded by the window's side (<= 63 tokens).
+
+    The **t axis is zero — an identity rotation** — because the seam's caption
+    keys are ALREADY rotated in the t axis by the model itself
+    (``embed_cap``: ``cap_pos_ids[:, :, 0] = arange(len) + 1``) and the rope
+    table's axes are INDEPENDENT frequency bands (``EmbedND`` concatenates one
+    band per axis, ``comfy/ldm/flux/layers.py:15-29``).  An identity t slot
+    therefore preserves the model's own t rotation and adds only the
+    window-origin rotation on the spatial bands; the product is exactly
+    ``R(t_i, r_win, c_win)`` — the caption as the model would have placed it
+    over that window, with its own t positions (1..t) intact.
+
+    One row per window of the layout, in the layout's own order, so a group
+    picks its members' rows through the group's window mapping
+    (:func:`_group_window_ids`) — never through the window's position in the
+    group.
+    """
+    n = len(layout.windows)
+    ids = torch.zeros(n, int(t), 3, device=device, dtype=torch.float32)
+    for i, win in enumerate(layout.windows):
+        ids[i, :, 1] = float(win.r0)
+        ids[i, :, 2] = float(win.c0)
+    return ids
+
+
+def _rope_per_group(x: torch.Tensor, rope: torch.Tensor, b: int, heads: int, g: int,
+                    t: int, dim: int) -> torch.Tensor:
+    """``[b, heads, g, t, d]`` — ``x`` rotated by each group's OWN rope table.
+
+    The table is head-shared (``[g, 1, t, d/2, 2, 2]``), so the group axis and
+    the head axis travel together as the batch: ``[g, b * heads, t, d]``.
+    """
+    flat = (x.unsqueeze(2).expand(b, heads, g, t, dim)
+            .permute(2, 0, 1, 3, 4).reshape(g, b * heads, t, dim))
+    return apply_rope1(flat, rope).reshape(g, b, heads, t, dim).permute(1, 2, 0, 3, 4)
+
+
 def windowed_attention(q_txt: torch.Tensor, k_txt: torch.Tensor, v_txt: torch.Tensor,
                        q_img: torch.Tensor, k_img: torch.Tensor, v_img: torch.Tensor,
                        k_img_unrotated: torch.Tensor, layout: FineLayout,
-                       rope_embedder=None, cap_len: int = 32
+                       rope_embedder=None, cap_len: int = 32, caption_rope=None
                        ) -> tuple[torch.Tensor, torch.Tensor]:
     """Attention inside each window, its keys extended by the Halo ring and the bridge tokens.
 
@@ -580,12 +628,24 @@ def windowed_attention(q_txt: torch.Tensor, k_txt: torch.Tensor, v_txt: torch.Te
     over windows: every window re-runs the same text queries and keys, so averaging
     is the refusal to let window count leak into the text stream.
 
-    ``rope_embedder`` (with ``cap_len``) turns on the bridge ROPE HORIZON
-    SATURATION (area-fix2 mechanism 2): the bridge keys are taken from the UNROTATED
-    keys and re-roped at the saturated positions instead of riding the true-position
-    rotation, so no query meets a distant key through more rope phase than the model
-    was trained on.  Without an embedder (the FLUX call) the bridge keeps the paper's
-    true-position keys, which is why this is a keyword-only opt-in.
+    ``rope_embedder`` (with ``cap_len``) turns on two Z-Image-only rope
+    mechanisms; without one (the FLUX call) the paper's behaviour is kept
+    untouched, bit for bit:
+
+    * the bridge ROPE HORIZON SATURATION (area-fix2 mechanism 2): the bridge keys
+      are taken from the UNROTATED keys and re-roped at the saturated positions
+      instead of riding the true-position rotation, so no query meets a distant
+      key through more rope phase than the model was trained on;
+    * the GTCN's CAPTION ANCHORING (area-fix3): the caption is re-roped at each
+      window's own origin, so the prompt stays inside the model's trained
+      phase even for a window far from the canvas' top-left corner — see
+      :func:`caption_window_ids` for the route and its evidence.
+
+    ``caption_rope`` is that anchor table, ALREADY built: the caller may pass it
+    (the Z-Image seam builds it once per step and shares it between the step's
+    attention calls — the table depends only on the step's windows, the caption
+    length and the model's embedder, all of them fixed for the step).  Without
+    it the table is built here, which is what every other caller does.
     """
     b, heads, n_img, dim = q_img.shape
     t = q_txt.shape[2]
@@ -593,14 +653,38 @@ def windowed_attention(q_txt: torch.Tensor, k_txt: torch.Tensor, v_txt: torch.Te
     out_txt = torch.zeros(b, heads, t, dim, dtype=q_img.dtype, device=q_img.device)
     score = token_importance(k_img_unrotated) if layout.registers > 0 else None
 
+    # GTCN Phase II (area-fix3): the caption's anchor table, ONE call for the
+    # whole layout — one row per window, the caption at that window's origin.
+    # The table's t axis is zero (an identity rotation), so the model's own t
+    # rotation of the caption survives and only the window-origin rotation is
+    # added — see ``caption_window_ids``.  Without an embedder (the FLUX call)
+    # the caption keeps the paper's own positions, bit for bit.
+    cap_rope = None
+    if rope_embedder is not None:
+        if caption_rope is None:
+            # ``area_zimage`` imports this module, so the helper is imported
+            # here (the same discipline the bridge branch below uses) — the
+            # FLUX path never imports it at all.
+            from .area_zimage import _head_shared
+            caption_rope = _head_shared(
+                rope_embedder(caption_window_ids(layout, t, q_img.device)))
+        cap_rope = caption_rope
+
     for group in layout.groups:
         g, n = group.tokens.shape
         flat = group.tokens.reshape(-1)
 
-        def gather(x_txt, x_img):
-            # [b, heads, g, t+n, d]: the text tokens attend in every window of the group
-            local = x_img[:, :, flat].reshape(b, heads, g, n, dim)
-            return torch.cat([x_txt.unsqueeze(2).expand(b, heads, g, t, dim), local], dim=3)
+        if cap_rope is not None:
+            # the group's OWN windows (never ``layout.windows[:g]``)
+            win_ids = torch.tensor(_group_window_ids(group, layout),
+                                   device=q_img.device, dtype=torch.long)
+            rope = cap_rope.index_select(0, win_ids)
+            q_txt_g = _rope_per_group(q_txt, rope, b, heads, g, t, dim)
+            k_txt_g = _rope_per_group(k_txt, rope, b, heads, g, t, dim)
+        else:
+            q_txt_g = q_txt.unsqueeze(2).expand(b, heads, g, t, dim)
+            k_txt_g = k_txt.unsqueeze(2).expand(b, heads, g, t, dim)
+        v_txt_g = v_txt.unsqueeze(2).expand(b, heads, g, t, dim)
 
         extra_k, extra_v = [], []
         if score is not None:
@@ -622,6 +706,9 @@ def windowed_attention(q_txt: torch.Tensor, k_txt: torch.Tensor, v_txt: torch.Te
                 ids[:, :, 0] = float(cap_len + 1)
                 ids[:, :, 1] = torch.stack(sat_rows)
                 ids[:, :, 2] = torch.stack(sat_cols)
+                # ``area_zimage`` imports this module, so the helper is imported
+                # here — the FLUX path never reaches this branch and never
+                # imports it.
                 from .area_zimage import _head_shared
                 rope = _head_shared(rope_embedder(ids))
                 reg_flat = reg.reshape(-1)
@@ -642,9 +729,12 @@ def windowed_attention(q_txt: torch.Tensor, k_txt: torch.Tensor, v_txt: torch.Te
 
         # the group runs as one SDPA call on [b*g, heads, t+n, d]; comfy keeps heads on axis 1, so
         # the group axis has to travel past the head axis to reach a shape SDPA accepts
-        q = gather(q_txt, q_img).permute(0, 2, 1, 3, 4).reshape(b * g, heads, t + n, dim)
-        k = torch.cat([gather(k_txt, k_img)] + extra_k, dim=3).permute(0, 2, 1, 3, 4).reshape(b * g, heads, -1, dim)
-        v = torch.cat([gather(v_txt, v_img)] + extra_v, dim=3).permute(0, 2, 1, 3, 4).reshape(b * g, heads, -1, dim)
+        local = q_img[:, :, flat].reshape(b, heads, g, n, dim)
+        q = torch.cat([q_txt_g, local], dim=3).permute(0, 2, 1, 3, 4).reshape(b * g, heads, t + n, dim)
+        k = torch.cat([k_txt_g, k_img[:, :, flat].reshape(b, heads, g, n, dim)] + extra_k,
+                      dim=3).permute(0, 2, 1, 3, 4).reshape(b * g, heads, -1, dim)
+        v = torch.cat([v_txt_g, v_img[:, :, flat].reshape(b, heads, g, n, dim)] + extra_v,
+                      dim=3).permute(0, 2, 1, 3, 4).reshape(b * g, heads, -1, dim)
         out = F.scaled_dot_product_attention(q, k, v).reshape(b, g, heads, t + n, dim)
 
         out_txt += out[:, :, :, :t].sum(dim=1)

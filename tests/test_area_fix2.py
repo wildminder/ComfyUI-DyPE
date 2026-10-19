@@ -455,15 +455,21 @@ class TestBridgeSaturationWiring:
         """The saturated ids of a group are measured from THAT group's window."""
         layout = _two_group_layout()
         q, k, v, k_unrot = _stream()
-        seen: list = []
+        calls: list = []
 
         def recording_embedder(ids):
-            seen.append(ids.detach().clone())
+            # EVERY call is recorded: the caption's anchor table (area-fix3) is
+            # built once before the group loop, the bridge's table once per
+            # group inside it.  The bridge's tables are therefore the calls
+            # AFTER the first — selected by that ROLE, never by a predicate on
+            # the axis the assertions below check.
+            calls.append(ids.detach().clone())
             return _rope_table(ids)
 
         windowed_attention(q[:, :, :TXT], k[:, :, :TXT], v[:, :, :TXT],
                            q[:, :, TXT:], k[:, :, TXT:], v[:, :, TXT:],
                            k_unrot, layout, rope_embedder=recording_embedder, cap_len=TXT)
+        seen = calls[1:]
         assert len(seen) == len(layout.groups)
 
         score = token_importance(k_unrot)
@@ -489,15 +495,18 @@ class TestBridgeSaturationWiring:
         """
         layout = _two_group_layout()
         q, k, v, k_unrot = _stream()
-        seen: list = []
+        calls: list = []
 
         def recording_embedder(ids):
-            seen.append(ids.detach().clone())
+            # every call is recorded (the bridge's tables are the calls after
+            # the first — see the test above)
+            calls.append(ids.detach().clone())
             return _rope_table(ids)
 
         windowed_attention(q[:, :, :TXT], k[:, :, :TXT], v[:, :, :TXT],
                            q[:, :, TXT:], k[:, :, TXT:], v[:, :, TXT:],
                            k_unrot, layout, rope_embedder=recording_embedder, cap_len=TXT)
+        seen = calls[1:]
         score = token_importance(k_unrot)
         group = layout.groups[1]
         reg = select_registers(score, group.tokens, layout.registers, GRP_H, GRP_W)
@@ -510,15 +519,18 @@ class TestBridgeSaturationWiring:
         """The re-roped bridge keys are the UNROTATED keys, not the rotated ones."""
         layout = _two_group_layout()
         q, k, v, k_unrot = _stream()
-        seen: list = []
+        calls: list = []
 
         def recording_embedder(ids):
-            seen.append(ids.detach().clone())
+            # every call is recorded (the bridge's tables are the calls after
+            # the first — see the test above)
+            calls.append(ids.detach().clone())
             return _rope_table(ids)
 
         windowed_attention(q[:, :, :TXT], k[:, :, :TXT], v[:, :, :TXT],
                            q[:, :, TXT:], k[:, :, TXT:], v[:, :, TXT:],
                            k_unrot, layout, rope_embedder=recording_embedder, cap_len=TXT)
+        seen = calls[1:]
         assert len(sdpa_capture) == len(layout.groups)
 
         score = token_importance(k_unrot)
@@ -549,7 +561,14 @@ class TestBridgeSaturationWiring:
             return real(reg, win, h, w, device)
 
         def recording_embedder(ids):
-            seen["ids"] = ids.detach().clone()
+            seen.setdefault("ids", []).append(ids.detach().clone())
+            # The FIRST call is the caption's anchor table (area-fix3), built
+            # once before the group loop; every call AFTER it is the bridge's
+            # own table, one per group.  The role is decided by the call
+            # ORDER — a predicate on the t axis would filter out the very
+            # thing the assertion below checks, and make it unable to fail.
+            if len(seen["ids"]) == 1:
+                return _rope_table(ids)
             # the t axis carries the caption position (cap_len + 1)
             assert torch.all(ids[..., 0] == TXT + 1)
             # and the rows/cols stay inside the trained extent of the window centre

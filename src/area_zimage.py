@@ -86,6 +86,7 @@ __all__ = [
     "ZIMAGE_SEAM_MODULE",
     "ZIMAGE_SEAM_SYMBOL",
     "ZIMAGE_SIGMA_STAR",
+    "ZIMAGE_TRAINED_TOKENS",
     "ZImageJointLayout",
     "ZImageRopeRecorder",
     "capture_tables",
@@ -115,6 +116,13 @@ ZIMAGE_SIGMA_STAR = 0.89
 #: lumina rope ids carry three axes — ``(t, row, col)`` (``pos_ids_x``,
 #: ``comfy/ldm/lumina/model.py:421-437``); FLUX's are ``(zero, row, col)``.
 ZIMAGE_AXES = 3
+
+#: The model's TRAINED extent, in tokens — 1024 px over the 16 px patch grid
+#: (``src/area.py``'s ``NATIVE_PATCHES``, the same 64).  Every rope distance
+#: the model ever saw is inside it, so a canvas wider than this is compressed
+#: back into it: the GTCN's canvas extent ratio (area-fix3,
+#: ``.dev/area-debug/area-fix3.txt``).
+ZIMAGE_TRAINED_TOKENS = 64
 
 #: Z-Image pads the caption AND the image token count to a multiple of 32
 #: (``pad_zimage``, ``comfy/ldm/lumina/model.py:418-420``).  The arch profile
@@ -620,6 +628,27 @@ def coarse_ropes_zimage(
     ``cap_len + 1``, with its row/col on the other two axes (``pos_ids_x``,
     ``model.py:421-437``).
 
+    **GTCN — the canvas extent ratio (area-fix3, ``.dev/area-debug/area-fix3.txt``).**
+    Lumina2 puts EVERY caption token at the spatial origin (``(t, 0, 0)``,
+    ``model.py:664-667``), so the rope distance between an image token and the
+    prompt is the token's own distance from the origin — and at Z-Image's theta
+    (256, one rad per token) a distance beyond the trained 64 tokens wraps the
+    rotation several times and the text cross-attention collapses into noise.
+    The image coordinates are therefore compressed by the canvas extent ratio
+    ``s = max(1, h / 64)`` per axis, so the canvas always fits the trained
+    domain; the CAPTION stays at the origin, which is what bounds the distance
+    to it, and the t axis is never touched.
+
+    The block units this table already measures in ARE a compression by the
+    pooling factor ``f``, and the factor rule (Eq. 5) keeps ``f >= h / 64`` for
+    the first ramp rungs — so the units already hold the canvas inside the
+    trained domain there.  The scaling is applied only where it is NEEDED: the
+    compression factor is ``max(f, s)`` per axis and the coordinates are scaled
+    by ``f / max(f, s)`` — exactly ``1.0`` (a no-op, bit for bit) when the block
+    units already fit, and the spec's ``r / s`` when they do not (the ramp's
+    later rungs, whose factor has fallen below the canvas ratio — exactly the
+    rungs that used to leave the canvas out of the trained domain).
+
     ``rope_q`` covers the whole padded stream in STREAM order — caption block,
     image at continuous coarse positions, image pad on the model's own zero ids
     — and ``rope_kv`` the engine's Phase I key order: the caption block (never
@@ -648,6 +677,19 @@ def coarse_ropes_zimage(
     ff = float(f)
     h_scale, w_scale, h_start, w_start = _axis_scales(rope_options)
 
+    # GTCN — the canvas extent ratio, per axis: the trained extent is
+    # ``ZIMAGE_TRAINED_TOKENS`` tokens, so a canvas of ``h`` tokens is
+    # compressed by ``h / 64`` to stay inside it.  The coordinates below are
+    # already block units (a compression by the pooling factor ``f``), so the
+    # factor that actually compresses the canvas is ``max(f, s)`` and the
+    # multiplier applied to the block units is ``f / max(f, s)`` — ``1.0``
+    # (bit-for-bit no-op) wherever the block units already hold the canvas
+    # inside the trained domain, and the spec's ``r / s`` where they do not.
+    s_y = max(1.0, float(layout.h) / float(ZIMAGE_TRAINED_TOKENS))
+    s_x = max(1.0, float(layout.w) / float(ZIMAGE_TRAINED_TOKENS))
+    norm_y = ff / max(ff, s_y)
+    norm_x = ff / max(ff, s_x)
+
     # The caption block: t = 1..cap_len, row/col zero (model.py:664-667).
     cap_len = layout.cap_len
     cap_ids = _ids(
@@ -660,30 +702,31 @@ def coarse_ropes_zimage(
     pad_ids = _zeros(layout.img_pad, device)
 
     # Queries: one entry per image token at its OWN position on the coarse
-    # grid (``r / f``) — no floor division, so the f^2 tokens of a block stay
-    # distinct instead of collapsing onto one coordinate with a phase jump at
-    # every boundary (mechanism 1).
+    # grid (``r / f``, then the GTCN multiplier) — no floor division, so the
+    # f^2 tokens of a block stay distinct instead of collapsing onto one
+    # coordinate with a phase jump at every boundary (mechanism 1).
     pos = torch.arange(layout.h * layout.w, device=device)
-    q_rows = (pos // layout.w).to(torch.float32) / ff * h_scale + h_start
-    q_cols = (pos % layout.w).to(torch.float32) / ff * w_scale + w_start
+    q_rows = (pos // layout.w).to(torch.float32) / ff * norm_y * h_scale + h_start
+    q_cols = (pos % layout.w).to(torch.float32) / ff * norm_x * w_scale + w_start
     q_image_ids = _ids(
         torch.full((layout.h * layout.w,), float(cap_len + 1), device=device),
         q_rows, q_cols, device,
     )
     # Keys: one entry per pooled block, at its block's GEOMETRIC CENTROID
     # ``R + (f - 1) / (2f)`` — the mean of the block's query positions, so the
-    # phase step across a block boundary equals the one inside the block.  A
-    # PARTIAL block (the last one on an axis the grid does not tile) has fewer
-    # members, so its centroid is the mean of *its* members instead
-    # (``_block_offsets``).
+    # phase step across a block boundary equals the one inside the block — and
+    # scaled by the same GTCN multiplier, so the keys stay the mean of their
+    # block's query positions.  A PARTIAL block (the last one on an axis the
+    # grid does not tile) has fewer members, so its centroid is the mean of
+    # *its* members instead (``_block_offsets``).
     coarse = torch.arange(nh * nw, device=device)
     kv_offset = (ff - 1.0) / (2.0 * ff)
     row_off = _block_offsets(nh, layout.h, f, kv_offset, device)
     col_off = _block_offsets(nw, layout.w, f, kv_offset, device)
     block_rows = coarse // nw
     block_cols = coarse % nw
-    kv_rows = (block_rows.to(torch.float32) + row_off[block_rows]) * h_scale + h_start
-    kv_cols = (block_cols.to(torch.float32) + col_off[block_cols]) * w_scale + w_start
+    kv_rows = (block_rows.to(torch.float32) + row_off[block_rows]) * norm_y * h_scale + h_start
+    kv_cols = (block_cols.to(torch.float32) + col_off[block_cols]) * norm_x * w_scale + w_start
     kv_image_ids = _ids(
         torch.full((nh * nw,), float(cap_len + 1), device=device),
         kv_rows, kv_cols, device,
