@@ -57,9 +57,13 @@ the pack's own rope helpers) only, like every other adapter in the pack.
   ``txt_len + h*w`` long.
 * **The coarse tables.**  Krea-2's rope ids are FLUX-shaped — the caption sits
   at the origin and every image token carries ``(0, row, col)`` with axis 0
-  the FRAME index (``model.py:291-294``, ``:346``) — so the Phase I tables are
-  FLUX's own recipe (floor-divided block coordinates, plan Q9) built through
-  the model's OWN embedder: :func:`coarse_ropes_krea`.
+  the FRAME index (``model.py:291-294``, ``:346``) — so the Phase I tables
+  carry FLUX's SHAPE of ids, but the block positions are **CONTINUOUS**
+  (AReA-Z mechanism 1): the reference's floor division collapses every
+  ``f x f`` block onto one rope position and injects a one-radian square wave
+  into the velocity field at every block boundary — the pack's measured
+  Z-Image 32 px ripple, which the Krea-2 run reproduces.  The tables are built
+  through the model's OWN embedder: :func:`coarse_ropes_krea`.
 * **The eligibility guard.**  The four text-fusion calls run with 20 heads and
   their stream length is a PREFIX of the joint stream's, so a length check
   alone cannot tell them apart.  :func:`krea_stream_eligible` is the exact
@@ -75,7 +79,7 @@ from typing import Optional
 
 import torch
 
-from .area_rope import flux_style_ids, head_shared
+from .area_rope import block_offsets, flux_style_ids, head_shared
 from .area_schedule import coarse_grid
 
 logger = logging.getLogger("ComfyUI-DyPE")
@@ -497,23 +501,48 @@ def coarse_ropes_krea(
     device,
     recorder: Optional[KreaRopeRecorder] = None,
 ) -> tuple[torch.Tensor, torch.Tensor]:
-    """The two Phase I rope tables — FLUX's recipe, Krea-2's ids.
+    """The two Phase I rope tables — CONTINUOUS block positions, Krea-2's ids.
 
     Queries keep full resolution and ride on their block's coarse position;
     the pooled keys sit on the pooled grid (``ceil(h/f) x ceil(w/f)`` — the
     ceil only differs from ``(h/f) x (w/f)`` on a grid the blocks do not tile,
     where the last block on a partial axis is a partial block), so both are
-    measured in the same units.  This is FLUX's own recipe
-    (``_area_coarse_ropes``, ``src/area.py:482-512``) reused as-is, because
-    Krea-2's rope ids ARE FLUX-shaped: the caption sits at the origin and every
-    image token carries ``(0, row, col)`` with axis 0 the FRAME index
-    (``comfy/ldm/krea2/model.py:291-294``, ``:346``, ``:361``).
+    measured in the same units.  Krea-2's rope ids ARE FLUX-shaped: the caption
+    sits at the origin and every image token carries ``(0, row, col)`` with
+    axis 0 the FRAME index (``comfy/ldm/krea2/model.py:291-294``, ``:346``,
+    ``:361``).
 
-    The block coordinates are FLUX's **floor division** (``row // f``), not
-    Z-Image's continuous refinement (plan Q9): Z-Image's refinement exists
-    because its theta of 256 makes every band fast, while Krea-2's theta of
-    1000 keeps the low bands slow — the FLUX recipe is the reference-faithful
-    choice there.
+    **The block positions are CONTINUOUS (AReA-Z mechanism 1).**  The
+    reference floor-divides a query's position into its block's INTEGER
+    coordinate, so all ``f x f`` tokens of a block share ONE rope position and
+    the phase jumps by a whole unit at every block boundary — a square wave
+    whose period is the block (32 px at ``f = 2``) injected into the velocity
+    field.  That is the pack's own measured Z-Image ripple (``.dev/area-debug/
+    area-fix.txt`` Flaw 2, and the 32 px periodic energy of
+    ``.dev/docs/2026-10-17-area-zimage-ripple-diagnosis.md``), and the user's
+    Krea-2 run reproduces it ("the ripple artifacts appear (the same as
+    z-image)").  Here every query keeps its own position scaled by ``1/f`` and
+    the pooled key sits at its block's GEOMETRIC CENTROID, ``R + (f - 1) / (2f)``
+    — the mean of the block's query positions — so the phase step across a
+    boundary equals the one inside the block and the staircase is gone;
+    ``f == 1`` degenerates exactly (offset 0, positions unchanged).
+
+    The jump the staircase produces is ONE RADIAN in the TOP frequency band —
+    and the top band is ``theta ** 0 = 1`` rad per token for EVERY theta
+    (``comfy/ldm/flux/math.py:20-32``), so it is a property of the FLOOR
+    DIVISION, not of the backbone's theta.  Plan Q9 argued the floor division
+    was safe for Krea-2 because its theta of 1000 "keeps the low bands slow";
+    that argument only covers the low bands, and the artefact lives in the top
+    one.  The port the plan deferred (``§11.7``) is therefore what this does.
+
+    **GTCN — the canvas extent ratio (area-fix3).**  The coordinates below are
+    already block units (a compression by the pooling factor ``f``), so the
+    factor that actually compresses the canvas is ``max(f, s)`` per axis, with
+    ``s = max(1, h / 64)`` the canvas' extent ratio against the trained
+    extent (:data:`KREA_NATIVE_TOKENS`); the multiplier applied is
+    ``f / max(f, s)`` — exactly ``1.0`` (a bit-for-bit no-op) where the block
+    units already hold the canvas inside the trained domain, and ``f / s``
+    where they do not.
 
     The tables come from the model's OWN embedder, so a chained DyPE/SEGA
     embedder composes — and the capture is PAUSED around the two calls, so the
@@ -545,17 +574,40 @@ def coarse_ropes_krea(
     if recorder is None:
         recorder = _RECORDERS.get(id(embedder))
     nh, nw = coarse_grid(layout.h, layout.w, f)
+    ff = float(f)
+
+    # GTCN (area-fix3) — the canvas extent ratio, per axis.
+    s_y = max(1.0, float(layout.h) / float(KREA_NATIVE_TOKENS))
+    s_x = max(1.0, float(layout.w) / float(KREA_NATIVE_TOKENS))
+    norm_y = ff / max(ff, s_y)
+    norm_x = ff / max(ff, s_x)
+
+    # Queries: one entry per image token at its OWN position on the coarse
+    # grid (``r / f``, then the GTCN multiplier) — no floor division, so the
+    # f^2 tokens of a block stay distinct instead of collapsing onto one
+    # coordinate with a phase jump at every boundary (mechanism 1).
     pos = torch.arange(layout.h * layout.w, device=device)
+    q_rows = (pos // layout.w).to(torch.float32) / ff * norm_y
+    q_cols = (pos % layout.w).to(torch.float32) / ff * norm_x
+    q_ids = flux_style_ids(layout.txt_len, q_rows, q_cols, device, torch.float32)
+
+    # Keys: one entry per pooled block, at its block's GEOMETRIC CENTROID
+    # ``R + (f - 1) / (2f)`` — the mean of the block's query positions, so the
+    # phase step across a block boundary equals the one inside the block — and
+    # scaled by the same GTCN multiplier, so the keys stay the mean of their
+    # block's query positions.  A PARTIAL block (the last one on an axis the
+    # grid does not tile) has fewer members, so its centroid is the mean of
+    # *its* members instead (``block_offsets``).
     coarse = torch.arange(nh * nw, device=device)
-    # FLUX's floor-divided block coordinates (plan Q9): the query of a token
-    # rides on its block's integer coordinate, the pooled key sits on its
-    # block's own coordinate.
-    q_ids = flux_style_ids(
-        layout.txt_len, pos // layout.w // f, pos % layout.w // f, device, torch.float32
-    )
-    kv_ids = flux_style_ids(
-        layout.txt_len, coarse // nw, coarse % nw, device, torch.float32
-    )
+    kv_offset = (ff - 1.0) / (2.0 * ff)
+    row_off = block_offsets(nh, layout.h, f, kv_offset, device)
+    col_off = block_offsets(nw, layout.w, f, kv_offset, device)
+    block_rows = coarse // nw
+    block_cols = coarse % nw
+    kv_rows = (block_rows.to(torch.float32) + row_off[block_rows]) * norm_y
+    kv_cols = (block_cols.to(torch.float32) + col_off[block_cols]) * norm_x
+    kv_ids = flux_style_ids(layout.txt_len, kv_rows, kv_cols, device, torch.float32)
+
     if recorder is not None:
         # The pause guard: the coarse tables go through the model's OWN
         # embedder, and the capture hook would otherwise record them as extra

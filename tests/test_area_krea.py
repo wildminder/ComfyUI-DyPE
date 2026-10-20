@@ -396,7 +396,13 @@ class TestKreaCoarseTables:
         assert torch.equal(rope_kv, torch.full((1, 1, 12, 3, 2, 2), 2.0))
 
     def test_coarse_query_table_covers_text_plus_full_grid(self):
-        """The query table keeps the caption AND every image token."""
+        """The query table keeps the caption AND every image token.
+
+        The block positions are CONTINUOUS (AReA-Z mechanism 1): every token
+        keeps its own position scaled by ``1/f`` instead of collapsing onto
+        its block's integer coordinate (the floor division, plan Q9), so the
+        phase does not jump by a whole unit at every block boundary.
+        """
         spy = _SpyEmbedder()
         layout = krea_layout(txt_len=8, h=4, w=4, stream_len=24)
         coarse_ropes_krea(spy, layout, 2, torch.device("cpu"))
@@ -404,19 +410,25 @@ class TestKreaCoarseTables:
         assert q_ids.shape == (1, 8 + 16, 3)
         # the caption rides at the origin (FLUX's zero text ids)
         assert torch.equal(q_ids[0, :8], torch.zeros(8, 3))
-        # the image rides on its block's floor-divided coordinate (plan Q9)
-        assert torch.equal(q_ids[0, 8:, 1], torch.tensor([0.] * 8 + [1.] * 8))
-        assert torch.equal(q_ids[0, 8:, 2], torch.tensor([0., 0., 1., 1.] * 4))
+        # the image rides on its own continuous position (row / f)
+        assert torch.equal(q_ids[0, 8:, 1], torch.tensor([0.] * 4 + [0.5] * 4
+                                                          + [1.] * 4 + [1.5] * 4))
+        assert torch.equal(q_ids[0, 8:, 2], torch.tensor([0., 0.5, 1., 1.5] * 4))
 
     def test_coarse_key_table_sits_on_the_ceil_based_coarse_grid(self):
-        """The pooled keys sit on the ceil-based grid (a partial edge block counts)."""
+        """The pooled keys sit on the ceil-based grid (a partial edge block counts).
+
+        They sit at their block's GEOMETRIC CENTROID — ``R + (f - 1) / (2f)``,
+        the mean of the block's query positions — so the phase step across a
+        block boundary equals the one inside the block.
+        """
         spy = _SpyEmbedder()
         layout = krea_layout(txt_len=8, h=4, w=4, stream_len=24)
         coarse_ropes_krea(spy, layout, 2, torch.device("cpu"))
         kv_ids = spy.calls[1]
         assert kv_ids.shape == (1, 8 + 4, 3)      # ceil(4/2) x ceil(4/2)
-        assert torch.equal(kv_ids[0, 8:, 1], torch.tensor([0., 0., 1., 1.]))
-        assert torch.equal(kv_ids[0, 8:, 2], torch.tensor([0., 1., 0., 1.]))
+        assert torch.equal(kv_ids[0, 8:, 1], torch.tensor([0.25, 0.25, 1.25, 1.25]))
+        assert torch.equal(kv_ids[0, 8:, 2], torch.tensor([0.25, 1.25, 0.25, 1.25]))
 
     def test_coarse_key_grid_is_ceil_based_on_a_partial_axis(self):
         """A grid the blocks do not tile pools onto a ceil-sized canvas."""

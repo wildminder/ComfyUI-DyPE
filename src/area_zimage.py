@@ -66,6 +66,7 @@ from typing import Optional
 
 import torch
 
+from .area_rope import block_offsets as _block_offsets
 from .area_rope import head_shared as _head_shared
 from .area_rope import unrotate1, unrotate_table
 from .area_schedule import coarse_grid
@@ -543,24 +544,6 @@ def _zeros(n: int, device, dtype=torch.float32) -> torch.Tensor:
     no-op, which is what "the pad k/v pass through unchanged" means in tensors.
     """
     return torch.zeros(1, int(n), ZIMAGE_AXES, device=device, dtype=dtype)
-
-
-def _block_offsets(n_blocks: int, size: int, f: int, uniform: float, device) -> torch.Tensor:
-    """The per-block key offset on one axis — the block's centroid inside its block.
-
-    A full ``f``-cell block's centroid sits at ``(f - 1) / (2f)`` (``uniform``),
-    the mean of its members' positions.  The LAST block of a partial axis owns
-    fewer than ``f`` cells (the grid does not tile), and its centroid is the
-    mean of *its* members, ``(members - 1) / (2f)`` — otherwise the pooled key
-    would sit a quarter of a block away from the tokens it stands for.  Every
-    other block keeps the full-block offset, so a grid that tiles exactly is
-    unchanged, bit for bit.
-    """
-    off = torch.full((int(n_blocks),), float(uniform), dtype=torch.float32, device=device)
-    if int(size) % int(f):
-        members = int(size) - (int(n_blocks) - 1) * int(f)
-        off[-1] = (members - 1) / (2.0 * int(f))
-    return off
 
 
 def coarse_ropes_zimage(

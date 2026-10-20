@@ -479,9 +479,29 @@ def tiling_rng(seed: int, step: int) -> np.random.Generator:
     return step_rng(seed, step, TILING_SALT)
 
 
-def bridge_registers(size: int, bridge_ratio: float) -> int:
-    """R of the bridge: ``round(rho * w)^2`` tokens per window, 0 when the bridge is off."""
-    return max(1, int(round(float(bridge_ratio) * int(size)))) ** 2 if bridge_ratio > 0 else 0
+def bridge_registers(size: int, bridge_ratio: float, h: Optional[int] = None,
+                     w: Optional[int] = None) -> int:
+    """R of the bridge: ``round(rho * w)^2`` tokens per window, 0 when the bridge is off.
+
+    The square formula is the paper's (``R = (rho * w)^2`` registers for a
+    SQUARE window of side ``w``, App. E).  A window is clipped by the canvas,
+    so on a canvas NARROWER than the window side it holds ``side x width``
+    tokens instead of ``side^2`` — and the square formula then hands the bridge
+    ``side / width`` times the share of the window's content the paper's ratio
+    (``rho^2``) asks for.  With the canvas's ``h`` and ``w`` the count follows
+    the window's ACTUAL shape — ``round(rho * min(side, h)) x
+    round(rho * min(side, w))`` — and the bridge-to-content ratio is the
+    designed one on every aspect.  Without them (the FLUX and Z-Image paths)
+    the value is the square one, bit for bit.
+    """
+    if bridge_ratio <= 0:
+        return 0
+    side = int(size)
+    if h is None or w is None:
+        return max(1, int(round(float(bridge_ratio) * side))) ** 2
+    rows = max(1, int(round(float(bridge_ratio) * min(side, int(h)))))
+    cols = max(1, int(round(float(bridge_ratio) * min(side, int(w)))))
+    return rows * cols
 
 
 def build_fine_layout(windows: list[Window], h: int, w: int, halo: int, registers: int,

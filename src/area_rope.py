@@ -36,6 +36,7 @@ import torch
 from .area_attn import apply_rope1
 
 __all__ = [
+    "block_offsets",
     "flux_style_ids",
     "head_shared",
     "unrotate1",
@@ -87,6 +88,28 @@ def unrotate1(x: torch.Tensor, table: torch.Tensor) -> torch.Tensor:
     the table's dtype and is cast back.
     """
     return apply_rope1(x, unrotate_table(head_shared(table)))
+
+
+def block_offsets(n_blocks: int, size: int, f: int, uniform: float, device) -> torch.Tensor:
+    """The per-block key offset on one axis — the block's centroid inside its block.
+
+    A full ``f``-cell block's centroid sits at ``(f - 1) / (2f)`` (``uniform``),
+    the mean of its members' positions.  The LAST block of a partial axis owns
+    fewer than ``f`` cells (the grid does not tile), and its centroid is the
+    mean of *its* members, ``(members - 1) / (2f)`` — otherwise the pooled key
+    would sit a quarter of a block away from the tokens it stands for.  Every
+    other block keeps the full-block offset, so a grid that tiles exactly is
+    unchanged, bit for bit.
+
+    Shared by the two adapters that build continuous coarse tables (Z-Image
+    and Krea-2) — the offset is a property of the pooling blocks, not of a
+    backbone.
+    """
+    off = torch.full((int(n_blocks),), float(uniform), dtype=torch.float32, device=device)
+    if int(size) % int(f):
+        members = int(size) - (int(n_blocks) - 1) * int(f)
+        off[-1] = (members - 1) / (2.0 * int(f))
+    return off
 
 
 def flux_style_ids(txt_len: int, rows: torch.Tensor, cols: torch.Tensor,

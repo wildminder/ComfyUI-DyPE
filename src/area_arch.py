@@ -108,6 +108,14 @@ class _ArchProfile:
     seq_pad_multiple: int     # 0 (flux, krea2) | 32 (zimage) — see the module docstring
     accepts: str              # human-readable model match string
     native_tokens: int = 64   # the trained extent in TOKENS (1024 px / 16 px)
+    #: Whether the Phase II bridge's register count follows the WINDOW'S
+    #: ACTUAL SHAPE instead of the window SIDE alone.  The paper's bridge is
+    #: ``R = (rho * w)^2`` registers for a SQUARE window of side ``w``
+    #: (App. E); a window clipped by a canvas narrower than its side holds
+    #: fewer tokens, so the square formula over-provisions the bridge and the
+    #: window's own content loses the share of the attention the bridge is
+    #: meant to have.  Krea-2 only (the FLUX and Z-Image paths are frozen).
+    bridge_shape_aware: bool = False
 
     def patch_count(self, pixels: int) -> int:
         """Tokens per axis for ``pixels`` — ceil div by ``px_per_patch``.
@@ -150,6 +158,11 @@ KREA_PROFILE = _ArchProfile(
     "krea2", KREA_BACKBONE, KREA_PX_PER_PATCH, 0,
     "Krea-2 (SingleStreamDiT) diffusion model",
     native_tokens=KREA_NATIVE_TOKENS,
+    # The bridge's register count follows the window's actual shape here: the
+    # Krea-2 canvas the user runs (512 x 2000 px -> a 125 x 32 token grid) is
+    # narrower than the Phase II window side (64), so the square formula would
+    # hand every window half of the attention to the OTHER half's content.
+    bridge_shape_aware=True,
 )
 
 #: The ``model_type`` requests a Krea-2 backbone accepts.  Everything else is a

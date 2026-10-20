@@ -602,6 +602,13 @@ def _area_fine_layout(rt: _AreaRuntime, ctx: AreaContext, k_img: torch.Tensor,
         rng=None if short else tiling_rng(cfg.seed, ctx.step),
         allow_splits=(not short),
     )
+    # The bridge's register count follows the window's ACTUAL SHAPE on the
+    # backbones whose profile asks for it (Krea-2): the paper's ``(rho*w)^2``
+    # is the count for a SQUARE window, and a window clipped by a canvas
+    # narrower than its side holds fewer tokens, so the square formula would
+    # over-provision the bridge and dilute the window's own content.  The
+    # FLUX and Z-Image paths keep the square count, bit for bit.
+    shape = (h, w) if getattr(rt.profile, "bridge_shape_aware", False) else (None, None)
     if ctx.fine_step < ctx.floor_steps:
         # A1 — the bridge floor (``docs/2026-10-18-area-zimage-adaptation-research.md``
         # §4/§5-A1): on a SHORT schedule the cost cap cuts the bridge to zero and
@@ -610,7 +617,7 @@ def _area_fine_layout(rt: _AreaRuntime, ctx: AreaContext, k_img: torch.Tensor,
         # leading ``floor_steps`` fine steps therefore keep the paper's full
         # ``round(rho*w)^2`` bridge and the configured halo, exempt from the cap —
         # an explicit, warned cost decision, not a silent one.
-        registers, halo = bridge_registers(ctx.size, cfg.bridge_ratio), cfg.halo
+        registers, halo = bridge_registers(ctx.size, cfg.bridge_ratio, *shape), cfg.halo
         cost = windowed_step_cost(windows, h, w, t, registers, halo)
         if cost > 1.0:
             _warn_once(
@@ -624,7 +631,7 @@ def _area_fine_layout(rt: _AreaRuntime, ctx: AreaContext, k_img: torch.Tensor,
                 ctx.floor_steps, registers, halo, cost,
             )
     else:
-        registers = bridge_registers(ctx.size, cfg.bridge_ratio)
+        registers = bridge_registers(ctx.size, cfg.bridge_ratio, *shape)
         # Never cost more than a full-attention step: cut bridge tokens, then the Halo.
         registers, halo = fit_extra_keys(windows, h, w, t, registers, cfg.halo)
     layout = build_fine_layout(windows, h, w, halo, registers, cfg.seed, ctx.step,
@@ -1963,14 +1970,20 @@ def apply_area_to_model(
 
     ``phase1_mode`` / ``phase1_sigma`` are the Phase I -> II switch (Q4):
     ``"steps"`` is the reference's fixed ``phase1_steps``, and ``"sigma"`` counts
-    the leading steps whose noise level is still at or above ``phase1_sigma``
-    (``theory.md:240-246``) so the switch follows the schedule.  Both default to
-    ``"auto"``, which resolves PER BACKBONE right after the profile is known
+    the leading steps whose noise level is still at or above
+    ``phase1_sigma`` (``theory.md:240-246``) so the switch follows the schedule.
+    Both default to ``"auto"``, which resolves PER BACKBONE right after the profile is known
     (AReA-Z, ``.dev/area-debug/area-fix.txt`` §3-File 3): Z-Image runs the
     norm-preserving centroid pooling and the schedule-aware sigma handoff
     (``phase1_sigma``, default ``ZIMAGE_SIGMA_STAR``), FLUX keeps the reference's
     constants exactly — ``subsample`` pooling and ``steps`` mode with
     ``phase1_steps`` — so the FLUX default path is byte-identical to before.
+    Krea-2 runs the norm-preserving centroid pooling (the reference's
+    ``subsample`` leaves the pooled values on an f-stride lattice, and with the
+    floor-divided block positions the block's queries collapse onto one rope
+    position — the pack's measured Z-Image 32 px ripple, which the Krea-2 run
+    reproduces) and the ``steps`` mode, so the user's ``phase1_steps`` knob
+    stays authoritative.
     ``phase1_steps`` is clamped to ``[0, total]`` and ``0`` means "all Phase II"
     (the reference's ``config.phase1_steps``, ported without its
     ``phase1_steps=0`` assert).  ``pooling`` is one of :data:`POOLING`
@@ -2035,8 +2048,17 @@ def apply_area_to_model(
     # AReA-Z defaults (.dev/area-debug/area-fix.txt §3-File 3): "auto" resolves per
     # backbone — Z-Image runs the norm-preserving centroid pooling and the
     # schedule-aware sigma handoff, FLUX keeps the reference's constants exactly.
+    # Krea-2 joins Z-Image on the POOLING: "subsample" keeps one token of every
+    # f x f block, so the pooled VALUES live on an f-stride lattice, and the
+    # block's f^2 queries — which the reference's floor division put on ONE rope
+    # position — then receive nearly the same output, i.e. a piecewise-constant
+    # field with the block's period (32 px at f = 2).  That is the pack's
+    # measured Z-Image ripple (area-fix.txt Flaw 3) and the Krea-2 run
+    # reproduces it; the norm-preserving centroid keys and the averaged values
+    # remove it (area-fix.txt mechanism 2).  FLUX keeps "subsample" — its path
+    # is byte-frozen.
     if pooling == "auto":
-        pooling = "mean" if profile is ZIMAGE_PROFILE else "subsample"
+        pooling = "subsample" if profile is FLUX_PROFILE else "mean"
     if phase1_mode == "auto":
         phase1_mode = "sigma" if profile is ZIMAGE_PROFILE else "steps"
 
