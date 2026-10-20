@@ -355,7 +355,8 @@ class TestAReASchema:
                                 "pooling", "halo", "bridge_ratio",
                                 "bridge_floor_steps", "window_start",
                                 "window_hold_steps", "seed"]
-        assert inputs["model_type"].kwargs["options"] == ["auto", "flux", "zimage"]
+        assert inputs["model_type"].kwargs["options"] == ["auto", "flux", "zimage",
+                                                          "krea2"]
         assert inputs["phase1_steps"].kwargs["default"] == PHASE1      # backbones/flux.py:16
         assert inputs["pooling"].kwargs["options"] == ["auto", "subsample", "mean",
                                                        "medoid", "random"]
@@ -370,6 +371,49 @@ class TestAReASchema:
                                                            "bootstrap"]
         assert inputs["phase1_mode"].kwargs["default"] == "auto"
         assert inputs["phase1_sigma"].kwargs["default"] == 0.89
+
+    def test_node_model_type_combo_offers_krea2(self):
+        """The third backbone is selectable (S9).
+
+        Krea-2 (``SingleStreamDiT``) has its own seam and its own profile
+        (``src/area_arch.py``); without the combo value the node could never
+        ask for it.
+        """
+        inputs = {i.name: i for i in AReA.define_schema().inputs}
+        assert "krea2" in inputs["model_type"].kwargs["options"]
+
+    def test_node_model_type_default_stays_auto(self):
+        """The default stays ``auto`` — the auto path is untouched."""
+        inputs = {i.name: i for i in AReA.define_schema().inputs}
+        assert inputs["model_type"].kwargs["default"] == "auto"
+
+    def test_flux_and_zimage_options_are_unchanged(self):
+        """The existing options keep their ORDER (a saved workflow's index).
+
+        ``krea2`` is APPENDED, so a graph that stored ``0``/``1``/``2`` still
+        selects auto / FLUX / Z-Image.
+        """
+        inputs = {i.name: i for i in AReA.define_schema().inputs}
+        options = inputs["model_type"].kwargs["options"]
+        assert options[:3] == ["auto", "flux", "zimage"]
+        assert options[-1] == "krea2"
+        assert options.index("flux") < options.index("zimage")
+
+    def test_node_execute_forwards_the_model_type(self, monkeypatch):
+        """The combo's value reaches the engine unchanged."""
+        seen = {}
+
+        def fake(model, model_type, width, height, **kwargs):
+            seen["model_type"] = model_type
+            seen["width"] = width
+            return model
+
+        monkeypatch.setattr("nodes.area.apply_area_to_model", fake)
+        model = mock_flux_model()
+        out = AReA.execute(model, WIDTH, HEIGHT, "krea2", True)
+        assert seen["model_type"] == "krea2"
+        assert seen["width"] == WIDTH
+        assert out[0] is model
 
     def test_short_schedule_inputs_match_the_floor_design(self):
         """The three A1/A4 knobs: names, defaults and widget ranges."""

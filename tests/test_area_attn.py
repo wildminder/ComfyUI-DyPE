@@ -747,3 +747,84 @@ class TestNoGlobalRngReads:
         assert np_state[1].tolist() == np.random.get_state()[1].tolist()
         assert np_state[2] == np.random.get_state()[2]
         assert torch.equal(torch_state, torch.random.get_rng_state())
+
+
+# ---------------------------------------------------------------------------
+# The ONE additive engine keyword: ``img_axis0`` (plan 2026-10-20, §7/S8)
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.unit
+class TestImgAxis0:
+    """``windowed_attention(..., img_axis0=None)`` — the bridge's axis-0 position.
+
+    Z-Image's image tokens carry ``t = cap_len + 1`` (the first token after
+    the caption block) and Krea-2's carry the FRAME index, which is 0 for an
+    image (``comfy/ldm/krea2/model.py:291-294``).  The bridge keys are
+    re-roped at that axis-0 value, so the parameter is additive and defaults
+    to today's behaviour — the Z-Image golden cannot move.
+    """
+
+    def _embedder(self, seen):
+        """A fake rope embedder: records the ids, returns a head-shared table.
+
+        The table carries one rotation band per axis plus one zero band, so it
+        has the ``dim // 2`` bands :func:`apply_rope1` consumes.
+        """
+        def embed(ids):
+            seen.append(ids.clone())
+            bands = []
+            for axis in range(3):
+                angle = ids[..., axis].float().unsqueeze(-1)
+                bands.append(torch.stack([torch.cos(angle), -torch.sin(angle),
+                                          torch.sin(angle), torch.cos(angle)],
+                                         dim=-1).reshape(*ids.shape[:-1], 1, 2, 2))
+            bands.append(torch.zeros_like(bands[0]))       # the spare band
+            return torch.cat(bands, dim=-3).unsqueeze(1)    # [g, 1, n, dim//2, 2, 2]
+        return embed
+
+    def _call(self, img_axis0=None, seed: int = 3):
+        """One windowed call with a non-empty bridge.
+
+        Returns ``(bridge_ids, outputs)``: the ids the BRIDGE was re-roped at
+        (the caption anchor's own ids are filtered out — they carry the
+        caption's length on axis 1, the bridge's carry the register count).
+        """
+        h = w = 8
+        q, k, v = _seam(h=h, w=w, seed=11)
+        layout = build_fine_layout([Window(0, 0, 3, 7), Window(4, 0, 7, 7)], h, w,
+                                   3, 2, 7, seed, torch.float32, "cpu")
+        seen = []
+        kwargs = {} if img_axis0 is None else {"img_axis0": img_axis0}
+        out = windowed_attention(q[:, :, :TEXT], k[:, :, :TEXT], v[:, :, :TEXT],
+                                  q[:, :, TEXT:], k[:, :, TEXT:], v[:, :, TEXT:],
+                                  k[:, :, TEXT:], layout,
+                                  rope_embedder=self._embedder(seen),
+                                  cap_len=TEXT, **kwargs)
+        bridge = [i for i in seen if i.dim() == 3 and i.shape[1] == layout.registers]
+        return bridge, out
+
+    def test_img_axis0_default_keeps_the_zimage_bridge_behaviour(self):
+        """``None`` is Z-Image's convention — ``cap_len + 1``, as today."""
+        seen, out = self._call()
+        assert seen, "the bridge never re-roped its keys"
+        for ids in seen:
+            assert ids.shape[-1] == 3
+            assert torch.allclose(ids[:, :, 0],
+                                  torch.full_like(ids[:, :, 0], TEXT + 1))
+        # the default is exactly the explicit ``None`` — no behaviour change
+        seen_explicit, out_explicit = self._call(img_axis0=None)
+        assert torch.equal(out[0], out_explicit[0])
+        assert torch.equal(out[1], out_explicit[1])
+
+    def test_img_axis0_ropes_the_bridge_keys_at_the_backbones_axis_zero(self):
+        """A backbone's own axis-0 (Krea-2's frame index: 0) re-ropes there."""
+        seen, out = self._call(img_axis0=0.0)
+        assert seen, "the bridge never re-roped its keys"
+        for ids in seen:
+            assert torch.allclose(ids[:, :, 0], torch.zeros_like(ids[:, :, 0]))
+            assert not torch.allclose(ids[:, :, 0],
+                                      torch.full_like(ids[:, :, 0], TEXT + 1))
+        # and the re-roping really moved the answer
+        _seen_default, out_default = self._call()
+        assert not torch.equal(out[0], out_default[0])

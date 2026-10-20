@@ -12,6 +12,43 @@ except ModuleNotFoundError:  # Python 3.10
 
 PROJECT_ROOT = pathlib.Path(__file__).parent.parent
 SRC_DIR = PROJECT_ROOT / "src"
+TESTS_DIR = PROJECT_ROOT / "tests"
+
+#: The markers the CI subset selects (``.github/workflows/tests.yml``:
+#: ``python -m pytest -q -m "unit or mock_integration"``).  A test file that
+#: carries NEITHER is silently DESELECTED by that command — the failure mode
+#: this project has already been bitten by, which is why the guard below
+#: exists.
+CI_MARKERS = ("unit", "mock_integration")
+
+
+def ci_markers_in(path: pathlib.Path) -> set:
+    """The CI markers a test file actually uses.
+
+    Read from the AST, not from the text: a marker merely MENTIONED in a
+    docstring must not pass for a marker that is APPLIED.  Both spellings
+    count — ``@pytest.mark.unit`` on a test and a module-level
+    ``pytestmark = pytest.mark.unit``.
+    """
+    tree = ast.parse(path.read_text(encoding="utf-8"))
+    found = set()
+    for node in ast.walk(tree):
+        if not isinstance(node, ast.Attribute) or node.attr not in CI_MARKERS:
+            continue
+        mark = node.value
+        if (isinstance(mark, ast.Attribute) and mark.attr == "mark"
+                and isinstance(mark.value, ast.Name) and mark.value.id == "pytest"):
+            found.add(node.attr)
+    return found
+
+
+def area_test_files_without_ci_marker() -> list:
+    """Every AReA test file that the CI subset would silently deselect."""
+    missing = []
+    for path in sorted(TESTS_DIR.glob("test_area_*.py")):
+        if not ci_markers_in(path):
+            missing.append(path.name)
+    return missing
 
 
 @pytest.mark.unit
@@ -140,3 +177,42 @@ class TestNodeCategory:
         content = init_file.read_text(encoding="utf-8")
         assert "model_patches/unet" not in content, \
             "Category still references 'unet'"
+
+
+@pytest.mark.unit
+class TestCiMarkerGuard:
+    """Every AReA test file must be SELECTED by the CI's marker subset.
+
+    The CI runs ``pytest -q -m "unit or mock_integration"``
+    (``.github/workflows/tests.yml``).  A test file that carries neither marker
+    is not a failure — it is SILENTLY deselected, so a whole file can stop
+    being run without anyone noticing.  The AReA family grew by six files
+    during the Krea-2 adaptation, so the guard covers all of them.
+    """
+
+    def test_the_ci_markers_are_declared_in_pyproject(self):
+        """An undeclared marker is an error under ``--strict-markers``."""
+        with open(PROJECT_ROOT / "pyproject.toml", "rb") as handle:
+            data = tomllib.load(handle)
+        markers = data["tool"]["pytest"]["ini_options"]["markers"]
+        for marker in CI_MARKERS:
+            assert any(marker in m for m in markers), (
+                f"the {marker!r} marker is not declared in pyproject.toml"
+            )
+
+    def test_every_area_test_file_carries_a_ci_marker(self):
+        """No AReA test file may fall out of the CI selection."""
+        missing = area_test_files_without_ci_marker()
+        assert missing == [], (
+            "these AReA test files carry no @pytest.mark.unit / "
+            f"@pytest.mark.mock_integration marker and are silently deselected "
+            f"by the CI subset: {missing}"
+        )
+
+    def test_the_guard_covers_the_new_krea_files(self):
+        """The guard's own scope includes the files the Krea-2 work added."""
+        covered = {path.name for path in TESTS_DIR.glob("test_area_*.py")}
+        for name in ("test_area_krea.py", "test_area_krea_seam.py",
+                     "test_area_krea_seam_probe.py", "test_area_rope.py",
+                     "test_area_flux_identity.py"):
+            assert name in covered, f"{name} is not covered by the marker guard"

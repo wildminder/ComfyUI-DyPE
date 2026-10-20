@@ -3,11 +3,11 @@
 AReA is a *model-side* attention replacement, so apply time starts with one
 question: which diffusion backbone is this?  The engine (``src/area_attn.py``,
 ``src/area_schedule.py``) is backbone-agnostic — it pools keys, builds windows
-and reads rope tables — and every FLUX/Z-Image difference lives in the adapter
-that feeds it.  :class:`_ArchProfile` is that difference in five fields,
+and reads rope tables — and every FLUX/Z-Image/Krea-2 difference lives in the
+adapter that feeds it.  :class:`_ArchProfile` is that difference in six fields,
 resolved once (plan §4, Q7/Q9).
 
-**Two backbones, one node.** FLUX (``Flux``, ``comfy/ldm/flux/model.py``) and
+**Three backbones, one node.** FLUX (``Flux``, ``comfy/ldm/flux/model.py``) and
 Z-Image (``NextDiT``, ``comfy/ldm/lumina/model.py:442``, bound by
 ``Lumina2.unet_model`` at ``comfy/model_base.py:1510``) share today's geometry:
 the Flux VAE downscales 8x and both patchify 2x2, so one token covers **16 px**
@@ -16,6 +16,21 @@ validation covers both.  They differ where the sequence is padded: Z-Image pads
 cap AND image tokens to a multiple of 32
 (``comfy/ldm/lumina/model.py:418-420``, applied at ``:665`` and ``:725-727``),
 FLUX pads to nothing.
+
+**Krea-2** (``SingleStreamDiT``, ``comfy/ldm/krea2/model.py:234``) joins them
+in S4 (plan 2026-10-20, §7/S4).  Its token size is the same **16 px**
+(``KREA_PX_PER_PATCH`` — an 8x VAE and a 2x2 patch, ASSUMED: the VAE family is
+the checkpoint's, not the source's) and it pads nothing at all
+(``seq_pad_multiple == 0``, ``comfy/ldm/krea2/model.py:355``), so its profile
+differs from FLUX's only in the backbone name, the pixel factor's provenance and
+the trained extent in tokens (``native_tokens``).
+
+**The trained extent in TOKENS.**  FLUX and Z-Image both train on 1024 px over
+a 16 px token grid, i.e. 64 tokens (``src/area.py:159``, the module constant
+``NATIVE_PATCHES``); the profile carries that number as ``native_tokens`` so a
+backbone with a different pixel factor can carry a different one (Krea-2's is
+``KREA_NATIVE_TOKENS``, ASSUMED for the same reason).  The field has a default,
+so the existing constructions stay valid and their values are unchanged.
 
 **Why the MRO and not just the probes.** :func:`resolve_model_type`
 (``src/model_detect.py``) is the single source of truth for which backend a
@@ -39,6 +54,13 @@ checkpoint, and patching them would corrupt the geometry AReA assumes:
   length, so the image tokens can no longer be located in the joint stream.
 * a requested ``model_type`` that contradicts the model's own backbone.
 
+**Krea-2's own rejections.**  The Krea-2 branch sits BEFORE the Lumina2 one and
+has the same two rules: a pin of ``flux``/``zimage`` on a Krea-2 model, and a
+pin of ``krea2`` on a model that is not a Krea-2, are both contradictions and
+raise (plan Q15).  Krea-2's *runtime* rejections — video latents, reference
+latents, the four auxiliary 20-head calls — belong to the forward-time
+resolution (``src/area.py``), not to the profile.
+
 Nunchaku (quantized, fused kernels) is neither: fused attention bypasses the
 seam entirely, so it is warned about and returned **unchanged** by the caller
 (``src/area.py:605-614``, the HAP precedent at ``src/hap.py:897-903``) instead
@@ -50,11 +72,14 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import Optional
 
+from .area_krea import KREA_BACKBONE, KREA_NATIVE_TOKENS, KREA_PX_PER_PATCH
 from .model_detect import resolve_model_type
 
 __all__ = [
     "FLUX_BACKBONE",
     "FLUX_PROFILE",
+    "KREA_PROFILE",
+    "KREA_REQUESTS",
     "NEXT_DIT_BACKBONE",
     "PIXEL_SPACE_BACKBONE",
     "ZIMAGE_PROFILE",
@@ -77,11 +102,12 @@ PIXEL_SPACE_BACKBONE = "NextDiTPixelSpace"
 class _ArchProfile:
     """Everything about the backbone that is NOT resolved per forward."""
 
-    model_type: str           # "flux" | "zimage" — ``resolve_model_type``'s key
-    unet_backbone: str        # class name: "Flux" | "NextDiT"
-    px_per_patch: int         # 16 on both (VAE 8 x patchify 2)
-    seq_pad_multiple: int     # 0 (flux) | 32 (zimage) — see the module docstring
+    model_type: str           # "flux" | "zimage" | "krea2" — ``resolve_model_type``'s key
+    unet_backbone: str        # class name: "Flux" | "NextDiT" | "SingleStreamDiT"
+    px_per_patch: int         # 16 on all three (VAE 8 x patchify 2)
+    seq_pad_multiple: int     # 0 (flux, krea2) | 32 (zimage) — see the module docstring
     accepts: str              # human-readable model match string
+    native_tokens: int = 64   # the trained extent in TOKENS (1024 px / 16 px)
 
     def patch_count(self, pixels: int) -> int:
         """Tokens per axis for ``pixels`` — ceil div by ``px_per_patch``.
@@ -111,6 +137,27 @@ ZIMAGE_PROFILE = _ArchProfile(
 FLUX_PROFILE = _ArchProfile(
     "flux", FLUX_BACKBONE, 16, 0, "FLUX.1 (Flux) diffusion model"
 )
+
+#: Krea-2 (``comfy/ldm/krea2/model.py:234``) — a single-stream MMDiT with 48
+#: query heads over 12 KV heads and a 12-layer text-fusion adapter whose four
+#: 20-head calls run BEFORE the main blocks (``model.py:341``).
+#:
+#: ``seq_pad_multiple`` is 0: the joint stream is ``cat((context, img), dim=1)``
+#: (``model.py:355``) — text first, then the image, no padding at all.  The
+#: pixel factor and the trained extent come from the adapter, which labels them
+#: ASSUMED (no checkpoint in the dev environment — ``src/area_krea.py``).
+KREA_PROFILE = _ArchProfile(
+    "krea2", KREA_BACKBONE, KREA_PX_PER_PATCH, 0,
+    "Krea-2 (SingleStreamDiT) diffusion model",
+    native_tokens=KREA_NATIVE_TOKENS,
+)
+
+#: The ``model_type`` requests a Krea-2 backbone accepts.  Everything else is a
+#: contradiction and raises: the resolver pins the backbone by CLASS NAME first
+#: (``src/model_detect.py:45-49``), so ``resolve_model_type`` cannot report the
+#: contradiction for a Krea-2 model — the requested string has to be checked
+#: here.
+KREA_REQUESTS = ("auto", "krea2")
 
 
 def _mro_names(diffusion_model) -> tuple[str, ...]:
@@ -142,7 +189,7 @@ def resolve_area_arch(diffusion_model, requested_type: str = "auto") -> Optional
             MRO walk and the attribute probes run on it directly.
         requested_type: the node's ``model_type`` knob.  ``"auto"`` probes;
             ``"flux"`` / ``"zimage"`` (or the ``"z_image"`` spelling,
-            ``src/model_detect.py:62-63``) pins.
+            ``src/model_detect.py:62-63``) / ``"krea2"`` pins.
 
     Returns:
         The profile to patch, or ``None`` for a Nunchaku model — fused kernels
@@ -153,11 +200,26 @@ def resolve_area_arch(diffusion_model, requested_type: str = "auto") -> Optional
     Raises:
         ValueError: when the model is a Lumina2 sibling AReA cannot patch
             (pixel space, Ming-Image), or the requested type contradicts the
-            model's own backbone.  Every message names the offender AND the
-            remedy (house rule, ``src/hap.py:876-895``).
+            model's own backbone — a ``flux``/``zimage`` pin on a Krea-2 model,
+            a ``krea2`` pin on a non-Krea-2 one, or any other contradiction.
+            Every message names the offender AND the remedy (house rule,
+            ``src/hap.py:876-895``).
     """
     mro = _mro_names(diffusion_model)
     detected_type = resolve_model_type(diffusion_model, requested_type)
+
+    if KREA_BACKBONE in mro:
+        # A Krea-2 backbone (``comfy/ldm/krea2/model.py:234``).  The resolver
+        # pins it by CLASS NAME (``src/model_detect.py:45-49``), so a Krea-2
+        # model resolves to "krea2" whatever the node asked for — the
+        # contradiction has to be read off the REQUESTED string.
+        if requested_type not in KREA_REQUESTS:
+            raise ValueError(
+                f"AReA was asked for {requested_type!r} but this model is a "
+                "Krea-2 (SingleStreamDiT) diffusion model. Set the node's "
+                "model_type to 'krea2' (or leave it on 'auto')."
+            )
+        return KREA_PROFILE
 
     if NEXT_DIT_BACKBONE in mro:
         # A Lumina2-family backbone.  The pixel-space sibling deletes
@@ -191,6 +253,18 @@ def resolve_area_arch(diffusion_model, requested_type: str = "auto") -> Optional
     # --- not a Lumina2 backbone -------------------------------------------
     if detected_type == "nunchaku":
         return None
+    if detected_type == "krea2":
+        # The node asked for Krea-2 (an explicit "krea2" pin short-circuits the
+        # resolver, src/model_detect.py:54-55) but the backbone is not a
+        # SingleStreamDiT — the same class of contradiction as the Z-Image
+        # probe below.
+        raise ValueError(
+            "AReA was asked for 'krea2' but this model's backbone is not a "
+            "SingleStreamDiT (comfy/ldm/krea2/model.py:234), so AReA's Krea-2 "
+            "geometry (the joint [text | image] stream, the 16 px token grid) "
+            "cannot be trusted. Load a Krea-2 checkpoint, or set the node's "
+            "model_type to 'flux' / 'zimage' (or leave it on 'auto')."
+        )
     if detected_type == "zimage":
         # The rope_embedder probe claims Z-Image but the backbone disagrees —
         # a pin on a non-Lumina2 model, or an upstream rename of NextDiT.
@@ -203,8 +277,9 @@ def resolve_area_arch(diffusion_model, requested_type: str = "auto") -> Optional
         )
     if detected_type != "flux":
         raise ValueError(
-            "AReA supports FLUX and Z-Image, but the resolved model type is "
-            f"{detected_type!r}. Load an unmodified (non-quantized) FLUX model, "
-            "or use SPA / DyPE / SEGA for this architecture."
+            "AReA supports FLUX, Z-Image and Krea-2, but the resolved model "
+            f"type is {detected_type!r}. Load an unmodified (non-quantized) "
+            "FLUX, Z-Image or Krea-2 model, or use SPA / DyPE / SEGA for this "
+            "architecture."
         )
     return FLUX_PROFILE

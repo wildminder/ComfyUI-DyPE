@@ -247,7 +247,11 @@ class TestPhase1Switch:
 class TestNodeSchema:
     def test_node_model_type_combo_offers_zimage(self):
         inputs = {i.name: i for i in AReA.define_schema().inputs}
-        assert inputs["model_type"].kwargs["options"] == ["auto", "flux", "zimage"]
+        # Krea-2 was appended by the Krea-2 adaptation (S9); the options that
+        # were already there keep their order, so a saved workflow's index is
+        # unchanged.
+        assert inputs["model_type"].kwargs["options"] == ["auto", "flux", "zimage",
+                                                          "krea2"]
         assert inputs["model_type"].kwargs["default"] == "auto"
 
     def test_node_phase1_mode_input_present_with_auto_default(self):

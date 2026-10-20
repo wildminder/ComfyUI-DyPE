@@ -618,7 +618,8 @@ def _rope_per_group(x: torch.Tensor, rope: torch.Tensor, b: int, heads: int, g: 
 def windowed_attention(q_txt: torch.Tensor, k_txt: torch.Tensor, v_txt: torch.Tensor,
                        q_img: torch.Tensor, k_img: torch.Tensor, v_img: torch.Tensor,
                        k_img_unrotated: torch.Tensor, layout: FineLayout,
-                       rope_embedder=None, cap_len: int = 32, caption_rope=None
+                       rope_embedder=None, cap_len: int = 32, caption_rope=None,
+                       img_axis0: Optional[float] = None
                        ) -> tuple[torch.Tensor, torch.Tensor]:
     """Attention inside each window, its keys extended by the Halo ring and the bridge tokens.
 
@@ -646,6 +647,15 @@ def windowed_attention(q_txt: torch.Tensor, k_txt: torch.Tensor, v_txt: torch.Te
     attention calls — the table depends only on the step's windows, the caption
     length and the model's embedder, all of them fixed for the step).  Without
     it the table is built here, which is what every other caller does.
+
+    ``img_axis0`` is the rope AXIS-0 position the bridge keys are re-roped at
+    (the horizon-saturation branch above).  It is the backbone's own axis-0
+    value for an image token: ``None`` keeps Z-Image's convention
+    (``cap_len + 1`` — the first token after the caption block), and a backbone
+    that puts its image tokens at the frame index passes that index instead
+    (Krea-2's image tokens carry axis 0 = 0,
+    ``comfy/ldm/krea2/model.py:291-294``).  The default reproduces today's
+    behaviour byte for byte, so the Z-Image golden cannot move.
     """
     b, heads, n_img, dim = q_img.shape
     t = q_txt.shape[2]
@@ -703,7 +713,13 @@ def windowed_attention(q_txt: torch.Tensor, k_txt: torch.Tensor, v_txt: torch.Te
                     sat_cols.append(sat_c)
                 ids = torch.zeros(g, layout.registers, 3, device=q_img.device,
                                   dtype=torch.float32)
-                ids[:, :, 0] = float(cap_len + 1)
+                # The bridge keys are re-roped at the backbone's own axis-0
+                # position for an image token: Z-Image's convention is
+                # ``cap_len + 1`` (the first token after the caption block) and
+                # it is the DEFAULT, so the Z-Image golden cannot move; a
+                # backbone whose image tokens carry the frame index instead
+                # (Krea-2: axis 0 = 0) passes its own value.
+                ids[:, :, 0] = float(cap_len + 1) if img_axis0 is None else float(img_axis0)
                 ids[:, :, 1] = torch.stack(sat_rows)
                 ids[:, :, 2] = torch.stack(sat_cols)
                 # ``area_zimage`` imports this module, so the helper is imported

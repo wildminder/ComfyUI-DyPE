@@ -18,6 +18,10 @@ different angles inside one block), so the model's own table has to be inverted
 col)`` (``pos_ids_x``, ``model.py:421-437``) and its caption tokens carry real
 t-axis values (``cap_pos_ids[:, :, 0] = arange(len) + 1``, ``model.py:664-667``),
 so FLUX's all-zero text ids (``src/area.py:264-277``) are NOT copied.
+The three helpers that undo the rotation — :func:`unrotate_table`,
+:func:`unrotate1` and :func:`_head_shared` — are shared with the Krea-2
+adapter and live in ``src/area_rope.py``; the names here are re-exports of the
+very same objects (plan 2026-10-20, §5.1/S3).
 
 **Capture — the model's own tables, in call order.**  lumina calls
 ``rope_embedder`` once per token GROUP (caption, then image — ``embed_all``,
@@ -62,7 +66,8 @@ from typing import Optional
 
 import torch
 
-from .area_attn import apply_rope1
+from .area_rope import head_shared as _head_shared
+from .area_rope import unrotate1, unrotate_table
 from .area_schedule import coarse_grid
 
 logger = logging.getLogger("ComfyUI-DyPE")
@@ -160,52 +165,13 @@ def sigma_prefix_count(sigmas, sigma_star: float) -> int:
 # ---------------------------------------------------------------------------
 # Un-rotating the seam's tensors
 # ---------------------------------------------------------------------------
-
-
-def unrotate_table(table: torch.Tensor) -> torch.Tensor:
-    """The inverse of a rope table — the rotation by the NEGATED angle.
-
-    ``math.rope()`` (``comfy/ldm/flux/math.py:20-32``) stacks
-    ``[cos, -sin, sin, cos]`` into the 2x2 block ``[[cos, -sin], [sin, cos]]``, a
-    rotation by ``+position * omega``; its inverse is that block with the two
-    off-diagonals negated (``[[cos, sin], [-sin, cos]]``), which for a rotation
-    matrix is also the transpose.  Negating — rather than transposing — keeps the
-    intent explicit and is what plan §4 pins.
-
-    The caller's table is not touched (the result is a fresh tensor), so a table
-    can be inverted and then reused for the forward rotation.
-    """
-    inverse = table.clone()
-    inverse[..., 0, 1] = -table[..., 0, 1]
-    inverse[..., 1, 0] = -table[..., 1, 0]
-    return inverse
-
-
-def _head_shared(table: torch.Tensor) -> torch.Tensor:
-    """A rope table in the head-shared layout ``[b, 1, N, axes, 2, 2]``.
-
-    ``EmbedND`` already returns this layout (``emb.unsqueeze(1)``,
-    ``comfy/ldm/flux/layers.py:15-29``) and lumina views the very same tensor as
-    ``[b, N, 1, axes, 2, 2]`` after ``movedim(1, 2)`` (``model.py:666``), so a
-    table may legitimately arrive in either.  The two are told apart by which of
-    axes 1/2 is the singleton, and the flip is a view (no copy).  This is the
-    layout :func:`src.area_attn.apply_rope1` consumes.
-    """
-    if table.dim() >= 3 and table.shape[1] != 1 and table.shape[2] == 1:
-        return table.movedim(1, 2)
-    return table
-
-
-def unrotate1(x: torch.Tensor, table: torch.Tensor) -> torch.Tensor:
-    """Undo one rope rotation of ``x`` ``[b, heads, N, d]`` by ``table``.
-
-    The inverse of :func:`src.area_attn.apply_rope1` — the engine's own rotation
-    applied with :func:`unrotate_table` — so the seam's already-rotated q/k come
-    back to the unrotated frame Phase I must pool from, and a pooled key can be
-    re-roped exactly (plan §4).  Values and dtype follow comfy: the math runs in
-    the table's dtype and is cast back.
-    """
-    return apply_rope1(x, unrotate_table(_head_shared(table)))
+#
+# ``unrotate_table``, ``unrotate1`` and ``_head_shared`` live in
+# ``src/area_rope.py`` — they are backbone-agnostic (Krea-2's seam is rotated
+# the same way, ``comfy/ldm/krea2/model.py:93``), so they are shared rather than
+# duplicated (plan 2026-10-20, §5.1/S3).  The names below are RE-EXPORTS of the
+# very same objects, so ``src/area.py`` and the existing tests keep importing
+# them from here unchanged.
 
 
 # ---------------------------------------------------------------------------

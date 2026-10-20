@@ -7,8 +7,8 @@ and :mod:`src.area_attn` instead of dense attention.  The node
 (``nodes/area.py``) is a thin schema/execute shell over
 :func:`apply_area_to_model`.
 
-**Two seams, one engine.**  FLUX and Z-Image (Lumina2) are different backbones with
-different seams, so :func:`apply_area_to_model` resolves an
+**Three seams, one engine.**  FLUX, Z-Image (Lumina2) and Krea-2 are different
+backbones with different seams, so :func:`apply_area_to_model` resolves an
 :class:`~src.area_arch._ArchProfile` once and installs exactly one of them:
 
 * FLUX — the bound ``attention`` of ``comfy.ldm.flux.layers`` (below);
@@ -21,6 +21,24 @@ different seams, so :func:`apply_area_to_model` resolves an
   lumina's ids; this module owns the ref-counted install and the per-forward state.
   Unlike FLUX — where SPA binds a *different* symbol — SPA patches this very symbol for
   Z-Image too (``src/spa.py:590-591``), so the install refuses to wrap a foreign hook.
+* Krea-2 — the bound ``optimized_attention_masked`` of
+  ``comfy.ldm.krea2.model`` (``comfy/ldm/krea2/model.py:21`` binds the name, ``:99-100``
+  calls it), a single-stream MMDiT whose joint stream is ``[text | image]`` with NO
+  padding (``model.py:355``), whose 48-head main blocks are told apart from the four
+  20-head text-fusion calls by the head count and the published ``img_slice``
+  (``model.py:369``), and whose latent is **5-D** in the normal image case (the Wan21
+  latent format has three dimensions — ``comfy/latent_formats.py:731`` — so comfy
+  unsqueezes the sampler's 4-D latent, ``comfy/sample.py:58-59``).  The krea-2 adapter
+  (:mod:`src.area_krea`) owns the rope capture, the joint layout and the eligibility
+  guard; this module owns the ref-counted install, the per-forward state, the
+  forward-time resolution and the two phases themselves (``_krea_attention``) — the
+  model rotates q/k itself, so both phases start from the UN-ROTATED frame, and the
+  answer is the flattened ``[b, n, heads*d]`` the model's gate multiplies.  SPA patches
+  this very symbol for Krea-2 too
+  (``src/spa.py:583-589``), so the install refuses to wrap a foreign hook — and a
+  quantized/fused attention kernel bypasses the seam altogether, so the install proves
+  the model's own attention class still resolves the symbol and leaves the model
+  UNCHANGED when it does not.
 
 Phase I ("coarse") pools image K/V to one token per ``f x f`` block and runs
 cross-scale attention on a coarse rope grid while the queries stay at full
@@ -125,10 +143,24 @@ from .area_attn import (
 )
 from .area_arch import (
     FLUX_PROFILE,
+    KREA_PROFILE,
     ZIMAGE_PROFILE,
     _ArchProfile,
     resolve_area_arch,
 )
+from .area_krea import (
+    KREA_PATCH,
+    KREA_SEAM_MODULE,
+    KREA_SEAM_SYMBOL,
+    KreaRopeRecorder,
+    capture_krea_table,
+    coarse_ropes_krea,
+    krea_latent_grid,
+    krea_layout,
+    krea_squeeze_latent,
+    krea_stream_eligible,
+)
+from .area_rope import flux_style_ids
 from .area_schedule import (
     AreaSchedule,
     build_schedule,
@@ -288,6 +320,11 @@ class _AreaRuntime:
     hook, so only ``embed_cap`` / ``embed_all``'s two groups are ever recorded —
     and ``joint`` is the resolved pad layout of the current forward (``None``
     until the joint stream is identified).
+
+    Krea-2 reuses the same two fields with its own types: ``recorder`` is a
+    :class:`~src.area_krea.KreaRopeRecorder` (the model's ONE rope table per
+    forward, captured through a forward hook on its own ``pe_embedder``) and
+    ``joint`` is the resolved joint layout of the current forward.
     """
 
     __slots__ = ("config", "dm", "profile", "ctx", "hidden", "ropes", "schedules",
@@ -316,6 +353,11 @@ _AREA_RUNTIME: Optional[_AreaRuntime] = None
 #: other's forward and the two never share a runtime.
 _ZRUNTIME: Optional[_AreaRuntime] = None
 
+#: The same for Krea-2 — a THIRD seam, a third module and a third symbol, so
+#: its runtime never reaches FLUX's or Z-Image's wrapper.  The unet wrapper
+#: assigns exactly one of the three per forward.
+_KRUNTIME: Optional[_AreaRuntime] = None
+
 # Seam install bookkeeping: the patched module, the original symbol, the
 # ``img_in`` hook handle and the number of patchers consuming them.  A second
 # AReA apply re-uses the wrapper instead of wrapping our own wrapper, and the
@@ -331,6 +373,15 @@ _SEAM = {"module": None, "attr": None, "orig": None, "hook": None, "consumers": 
 # consumer of this install, since the hook that feeds it is registered once on
 # the first consumer's model (the same reason the symbol is ref-counted).
 _ZSEAM = {"module": None, "attr": None, "orig": None, "hook": None, "recorder": None,
+          "consumers": 0}
+
+# The Krea-2 twin — a THIRD module and symbol (``comfy.ldm.krea2.model``'s own
+# bound ``optimized_attention_masked``), so a THIRD ref-count: the three
+# installs never share one.  ``hook`` holds every handle this install
+# registered on the first consumer's diffusion model (the rope capture on
+# ``pe_embedder`` and the image-embedder hook on ``first``), and ``recorder``
+# is the capture :func:`src.area_krea.capture_krea_table` built for it.
+_KSEAM = {"module": None, "attr": None, "orig": None, "hook": None, "recorder": None,
           "consumers": 0}
 
 
@@ -464,19 +515,18 @@ def _phase1_count(rt: _AreaRuntime, opts: dict) -> int:
     return sigma_prefix_count(table.detach().float().flatten().cpu()[:-1], cfg.phase1_sigma)
 
 
-def _area_rope_ids(txt_len: int, rows: torch.Tensor, cols: torch.Tensor,
-                   device, dtype) -> torch.Tensor:
-    """``[1, txt_len + n, 3]`` rope position ids: zero text ids, image rows/cols.
-
-    ``ldm/flux/model.py:192-194`` builds exactly this (text ids all zero, image
-    ids carrying row/col on axes 1/2 with the axis-0 index at 0), so a stock
-    ``pe_embedder`` returns the same table the model itself computes for the
-    canvas.
-    """
-    ids = torch.zeros(1, txt_len + int(rows.numel()), 3, device=device, dtype=dtype)
-    ids[0, txt_len:, 1] = rows.to(dtype)
-    ids[0, txt_len:, 2] = cols.to(dtype)
-    return ids
+#: ``[1, txt_len + n, 3]`` rope position ids: zero text ids, image rows/cols.
+#:
+#: ``ldm/flux/model.py:192-194`` builds exactly this (text ids all zero, image
+#: ids carrying row/col on axes 1/2 with the axis-0 index at 0), so a stock
+#: ``pe_embedder`` returns the same table the model itself computes for the
+#: canvas.
+#:
+#: The builder is shared with the Krea-2 adapter (whose ids have the same FLUX
+#: shape) and lives in ``src/area_rope.py`` — this is a thin ALIAS of
+#: :func:`src.area_rope.flux_style_ids`, not a copy, so the two can never drift
+#: apart (plan 2026-10-20, §5.1/S3).
+_area_rope_ids = flux_style_ids
 
 
 def _area_coarse_ropes(rt: _AreaRuntime, h: int, w: int, f: int, txt_len: int,
@@ -513,7 +563,7 @@ def _area_coarse_ropes(rt: _AreaRuntime, h: int, w: int, f: int, txt_len: int,
 
 
 def _area_fine_layout(rt: _AreaRuntime, ctx: AreaContext, k_img: torch.Tensor,
-                      hook_name: str = "diffusion_model.img_in") -> Optional[FineLayout]:
+                      hook_name: Optional[str] = None) -> Optional[FineLayout]:
     """Build (once per step) the Phase II layout — the reference's ``_after_embedding``."""
     layout = ctx.data.get("layout")
     if layout is not None:
@@ -521,6 +571,12 @@ def _area_fine_layout(rt: _AreaRuntime, ctx: AreaContext, k_img: torch.Tensor,
     cfg = rt.config
     h, w, t = ctx.h, ctx.w, ctx.txt_len
     hidden = rt.hidden
+    if hook_name is None:
+        # The detail map's source is the backbone's own image embedder: FLUX's
+        # ``img_in``, Z-Image's refiner entry (passed explicitly), Krea-2's
+        # ``first`` (``comfy/ldm/krea2/model.py:333``).
+        hook_name = ("diffusion_model.first" if rt.profile is KREA_PROFILE
+                     else "diffusion_model.img_in")
     if hidden is None:
         # Fallback: the detail map is derived from the post-norm projected image
         # keys instead of the hooked hook's output (see the module docstring).
@@ -1101,16 +1157,509 @@ def _zimage_install_seam(m, dm):
     return _ZSEAM["recorder"]
 
 
+# ---------------------------------------------------------------------------
+# The Krea-2 seam
+# ---------------------------------------------------------------------------
+
+
+def _krea_check_foreign(symbol) -> None:
+    """Refuse to install over another pack's hook on the same bound symbol.
+
+    SPA's Krea-2 target is this very symbol (``src/spa.py:583-589`` returns
+    ``("comfy.ldm.krea2.model", "optimized_attention_masked", True)``) and it
+    marks its wrapper ``_spa_wrapper`` (``src/spa.py:1363``) — the same
+    collision the Z-Image seam refuses (``_zimage_check_foreign``).  Unlike
+    FLUX — where SPA binds ``comfy.ldm.flux.math.optimized_attention``, a
+    *different* symbol — there is ONE symbol here, so the two cannot coexist.
+    AReA never wraps another pack's hook silently: the install raises and the
+    user reorders (plan §0, "foreign-binding collision ValueError").
+    """
+    if getattr(symbol, "_spa_wrapper", False):
+        raise ValueError(
+            f"AReA: {KREA_SEAM_MODULE}.{KREA_SEAM_SYMBOL} is already wrapped by "
+            "SPA (src/spa.py:583-589 patches this same bound symbol for Krea-2, "
+            "while for FLUX SPA binds comfy.ldm.flux.math.optimized_attention "
+            "instead — a different symbol). AReA never wraps another pack's hook "
+            "silently: restore SPA before applying AReA, or run the two on "
+            "separate models. On a shared symbol whichever pack installed last "
+            "would own every step."
+        )
+
+
+def _krea_pristine(bound):
+    """The pristine symbol behind ``bound`` — an AReA wrapper carries its own.
+
+    A re-apply after a patcher clone, or an install whose ref-count bookkeeping
+    was reset underneath it, can find our own wrapper still bound with no
+    recorded original.  The wrapper stows the symbol it wrapped
+    (``_area_orig``), so the pristine is recoverable instead of wrapping our own
+    wrapper.
+    """
+    if not getattr(bound, "_area_wrapper", False):
+        return bound
+    orig = getattr(bound, "_area_orig", None)
+    if orig is None:
+        raise ValueError(
+            f"AReA: {KREA_SEAM_MODULE}.{KREA_SEAM_SYMBOL} is an AReA wrapper "
+            "with no recorded pristine symbol, so the Krea-2 attention seam "
+            "cannot be installed safely. Restart ComfyUI to clear it."
+        )
+    return orig
+
+
+def _krea_delegate(orig, q, k, v, heads, mask, attn_precision, skip_reshape,
+                   skip_output_reshape, kw, cls=None):
+    """Hand the call back to the pristine symbol, UNTOUCHED.
+
+    Nothing is consumed here: the containers reach the pristine symbol exactly
+    as the model built them, so a delegating call is bit-identical to the
+    unpatched model.  (The opposite mistake — taking a container and handing
+    the taken tensor back — is the v2.19.1 crash class, ``src/area.py:589-600``.)
+
+    ``cls`` re-wraps the tensors in FRESH containers: it is used when the
+    engine has already taken the containers and then declined to compute (a
+    missing rope table), so the pristine symbol still receives containers it
+    can consume — a taken container must never be re-wrapped, and a raw tensor
+    would make comfy's ``wrap_attn`` skip the take entirely
+    (``comfy/ldm/modules/attention.py:215-253``).
+    """
+    if cls is not None:
+        q, k, v = cls(q), cls(k), cls(v)
+    return orig(q, k, v, heads, mask=mask, attn_precision=attn_precision,
+                skip_reshape=skip_reshape, skip_output_reshape=skip_output_reshape,
+                **kw)
+
+
+def _make_krea_wrapper(orig):
+    """Wrap the Krea-2 ``optimized_attention_masked`` seam so AReA replaces it.
+
+    The signature mirrors the real call bit-for-bit
+    (``comfy/ldm/krea2/model.py:99-100``) and comfy's own
+    ``(q, k, v, heads, mask=None, attn_precision=None, skip_reshape=False,
+    skip_output_reshape=False, **kwargs)``
+    (``comfy/ldm/modules/attention.py:256``): ``heads`` is the FOURTH POSITIONAL
+    slot and Krea-2 passes ``mask`` / ``skip_reshape`` /
+    ``preferred_attention`` / ``transformer_options`` as keywords.  A wrapper
+    that mis-slots ``heads`` into ``mask`` fails silently, which is what
+    ``tests/test_orig_call_convention.py`` pins.
+
+    The q/k that arrive are **rotated** — the model applies its own rope before
+    the call (``model.py:93``) — and the answer is comfy's flattened
+    ``[b, n, heads*d]`` (``model.py:99-100`` passes no ``skip_output_reshape``,
+    and the model multiplies it by a ``[b, n, dim]`` gate, ``model.py:106``).
+
+    The seam replaces the attention on the steps AReA runs and DELEGATES
+    untouched otherwise: a plain step, an auxiliary text-fusion call (20 heads
+    over a stream that is a PREFIX of the joint one), a foreign stream, or a
+    forward whose rope table was not captured.
+    """
+    def optimized_attention_masked(q, k, v, heads, mask=None, attn_precision=None,
+                                   skip_reshape=False, skip_output_reshape=False, **kw):
+        rt = _KRUNTIME
+        ctx = None if rt is None else rt.ctx
+        if ctx is None or ctx.phase is None:
+            # No forward of ours, or a plain-attention step: delegate untouched.
+            return _krea_delegate(orig, q, k, v, heads, mask, attn_precision,
+                                  skip_reshape, skip_output_reshape, kw)
+        layout = _krea_layout_for(rt, q, heads, kw)
+        if layout is None:
+            # An auxiliary call (20 heads) or a foreign stream: the model gets
+            # its own attention back, untouched and with its containers alive.
+            return _krea_delegate(orig, q, k, v, heads, mask, attn_precision,
+                                  skip_reshape, skip_output_reshape, kw)
+        cls = type(q) if hasattr(q, "take") else None
+        q_t, k_t, v_t = _take(q), _take(k), _take(v)
+        out = _krea_attention(rt, ctx, layout, q_t, k_t, v_t, heads, kw)
+        if out is None:
+            return _krea_delegate(orig, q_t, k_t, v_t, heads, mask, attn_precision,
+                                  skip_reshape, skip_output_reshape, kw, cls)
+        return out
+
+    optimized_attention_masked._area_wrapper = True
+    optimized_attention_masked._area_orig = orig
+    return optimized_attention_masked
+
+
+def _krea_stream_len(q) -> Optional[int]:
+    """The sequence length of a seam argument, without consuming its container."""
+    tensor = q.peek() if hasattr(q, "peek") else q
+    if torch.is_tensor(tensor) and tensor.ndim == 4:
+        return int(tensor.shape[2])
+    return None
+
+
+def _krea_layout_for(rt: Optional[_AreaRuntime], q, heads, kw: dict):
+    """The joint layout of THIS call, or ``None`` when it is not a main block.
+
+    Krea-2's forward reaches the seam four times before the main blocks: the
+    text-fusion adapter's FOUR 20-head calls (``comfy/ldm/krea2/model.py:341``).
+    Their stream length is the PROMPT length — a PREFIX of the joint stream's —
+    so a length check alone cannot tell them apart.  The exact guard is
+    :func:`~src.area_krea.krea_stream_eligible`: the head count (48 for the
+    main blocks, 20 for the auxiliary ones — the GQA repeat is resolved BEFORE
+    the seam, ``model.py:94-97``), the published ``img_slice``
+    (``model.py:369``) and the stream length together.
+
+    An ineligible call is DELEGATED UNCHANGED, and — crucially — it does NOT
+    advance the block counter: the 28 main blocks must be numbered 0..27
+    exactly as the reference numbers its blocks, or every block's random
+    pooling stream would shift (the HAP bug class, ``src/spa.py:1033-1052``).
+    """
+    if rt is None or rt.ctx is None or rt.ctx.phase is None:
+        return None
+    ctx = rt.ctx
+    if ctx.h * ctx.w < 1 or ctx.txt_len < 1:
+        return None
+    n = _krea_stream_len(q)
+    if n is None:
+        return None
+    options = kw.get("transformer_options") or {}
+    dm_heads = int(getattr(rt.dm, "heads", 0) or 0)
+    if not krea_stream_eligible(heads, dm_heads, n, ctx.txt_len, ctx.h, ctx.w,
+                                options.get("img_slice")):
+        return None
+    if rt.joint is not None:
+        return rt.joint if rt.joint.seq_len == n else None
+    try:
+        layout = krea_layout(ctx.txt_len, ctx.h, ctx.w, n)
+    except ValueError as exc:
+        # A stream that does not fit the joint geometry: refuse the pooling
+        # rather than guess, and say so once.
+        _warn_once("krea-layout", "AReA: %s", exc)
+        return None
+    rt.joint = layout
+    return layout
+
+
+def _krea_coarse_ropes(rt: _AreaRuntime, layout, f: int, device):
+    """The two Phase I rope tables, cached per (canvas, factor).
+
+    Krea-2's rope ids ARE FLUX-shaped — the caption at the origin, every image
+    token at ``(0, row, col)`` with axis 0 the FRAME index
+    (``comfy/ldm/krea2/model.py:291-294``, ``:346``) — so the tables are
+    FLUX's own recipe (floor-divided block coordinates) built through the
+    model's OWN embedder, which lets a chained DyPE/SEGA embedder compose.
+
+    They are built LAZILY, here at the seam, and never at forward-resolve time:
+    the model's own table is the FIRST table of the forward (the recorder keeps
+    it and never overwrites it), so a resolve-time build would be captured as
+    the model's table.  The capture is PAUSED around the two embedder calls, so
+    the coarse tables are not mistaken for extra tables of the forward.
+    """
+    embedder = getattr(rt.dm, "pe_embedder", None)
+    _warn_dynamic_embedder(embedder)
+    key = ("kcoarse", layout, f, str(device))
+    cached = rt.ropes.get(key)
+    if cached is not None:
+        return cached
+    try:
+        ropes = coarse_ropes_krea(embedder, layout, f, device, rt.recorder)
+    except ValueError as exc:
+        _warn_once("krea-ropes", "AReA: %s This forward runs plain attention.", exc)
+        return None
+    rt.ropes[key] = ropes
+    return ropes
+
+
+def _krea_caption_rope(rt: _AreaRuntime, ctx: AreaContext, fine: FineLayout,
+                        t: int, device):
+    """The GTCN caption anchor table, built ONCE per step (cached on the context).
+
+    The table depends only on the step's windows, the caption length and the
+    model's own embedder — all of them fixed for the step — so the step's 28
+    attention calls share it instead of rebuilding it per call (the Z-Image
+    pattern, ``src/area.py``'s ``_zimage_caption_rope``).  The cache lives on
+    the STEP's context, so a new step (new windows, new timestep) always
+    rebuilds it.
+
+    The anchor's axis 0 is zero, which is Krea-2's frame index
+    (``comfy/ldm/krea2/model.py:292``) — :func:`~src.area_attn.caption_window_ids`
+    needs no change for it.  The capture is paused around the embedder call, so
+    the anchor table is not recorded as an extra table of the forward.
+    """
+    cached = ctx.data.get("caption_rope")
+    if cached is not None:
+        return cached
+    embedder = getattr(rt.dm, "pe_embedder", None)
+    if embedder is None:
+        return None
+    _warn_dynamic_embedder(embedder)
+    ids = caption_window_ids(fine, t, device)
+    recorder = rt.recorder
+    if recorder is not None:
+        with recorder.paused():
+            table = _head_shared(embedder(ids))
+    else:
+        table = _head_shared(embedder(ids))
+    ctx.data["caption_rope"] = table
+    return table
+
+
+def _krea_attention(rt: _AreaRuntime, ctx: AreaContext, layout, q, k, v, heads, kw):
+    """The AReA computation of one Krea-2 main block, or ``None`` to delegate.
+
+    q/k/v are the taken ``[b, heads, N, d]`` joint tensors, **rotated** — the
+    model applies its own rope before the seam (``model.py:93``) — and the
+    answer is comfy's flattened ``[b, n, heads*d]`` (``model.py:99-100`` passes
+    no ``skip_output_reshape``, and the model's ``out * F.sigmoid(gate)``
+    multiplies a ``[b, n, dim]`` gate, ``model.py:106``).
+
+    Both phases start in the UNROTATED frame, exactly as Z-Image's do:
+
+    * **Phase I** pools *unrotated* keys (pooling rotated keys would mix keys
+      rotated by different angles inside one block, ``src/area_attn.py:364-368``)
+      and rides the coarse tables, whose q side covers the whole joint stream
+      (caption first, then the canvas) and whose kv side the engine's own key
+      order.  The caption block is never pooled.
+    * **Phase II** attends at the model's own full-resolution positions, which
+      IS the table the recorder captured — so the rotated pair passes through
+      untouched (a second rotation would be a float round trip of the same
+      table) and only the bridge's keys are un-rotated and re-roped at their
+      saturated positions.
+    """
+    table = rt.recorder.table if rt.recorder is not None else None
+    if table is None or table.shape[2] != layout.seq_len:
+        _warn_once(
+            "krea-table",
+            "AReA: the captured Krea-2 rope table covers %s tokens but the "
+            "stream is %d, so the seam's rotation cannot be undone. This call "
+            "runs plain attention.",
+            "no" if table is None else int(table.shape[2]), layout.seq_len,
+        )
+        return None
+    block = rt.block
+    rt.block += 1
+    t = ctx.txt_len
+    k_unrot = unrotate1(k, table)
+    if ctx.phase == "coarse":
+        ropes = _krea_coarse_ropes(rt, layout, ctx.size, q.device)
+        if ropes is None:
+            return None
+        rope_q, rope_kv = ropes
+        k_pooled, v_pooled = pool_keys_values(
+            k_unrot, v, t, ctx.h, ctx.w, ctx.size, rt.config.pooling,
+            seed=rt.config.seed, step=ctx.step, block=block,
+        )
+        out = F.scaled_dot_product_attention(
+            apply_rope1(unrotate1(q, table), rope_q),
+            apply_rope1(k_pooled, rope_kv), v_pooled,
+        )
+    else:
+        fine = _area_fine_layout(rt, ctx, k_unrot[:, :, t:],
+                                 hook_name="diffusion_model.first")
+        if fine is None:
+            return None
+        out_txt, out_img = windowed_attention(
+            q[:, :, :t], k[:, :, :t], v[:, :, :t],
+            q[:, :, t:], k[:, :, t:], v[:, :, t:],
+            # the bridge ranks UNROTATED keys (bridge.py:10-24)
+            k_unrot[:, :, t:], fine,
+            rope_embedder=getattr(rt.dm, "pe_embedder", None),
+            cap_len=t,
+            caption_rope=_krea_caption_rope(rt, ctx, fine, t, q.device),
+            # Krea-2's image tokens carry axis 0 = 0 (the frame index)
+            img_axis0=0.0,
+        )
+        out = torch.cat([out_txt, out_img], dim=2)
+    # comfy's own flatten: heads then head-dim, sequence back on axis 1
+    # (ldm/modules/attention.py:309-314).
+    b, n = out.shape[0], out.shape[2]
+    dim = out.shape[3]
+    return out.permute(0, 2, 1, 3).reshape(b, n, heads * dim)
+
+
+def _krea_first_hook(module, args, output):
+    """Capture the image embedding — the Phase II detail map's input.
+
+    ``dm.first`` is Krea-2's image embedder (``comfy/ldm/krea2/model.py:333``):
+    the analogue of FLUX's ``img_in`` hook (``src/area.py:1150-1156``) and of
+    Z-Image's refiner entry (``src/area.py:999-1023``).  Its output is
+    ``[b, h*w, features]`` — the image tokens in the model's own layout, which
+    is the layout :func:`~src.area_attn.detail_map` reads.
+    """
+    rt = _KRUNTIME
+    if rt is None or rt.ctx is None or rt.ctx.phase != "fine":
+        return
+    rt.hidden = output
+
+
+def _krea_latent(x):
+    """The Krea-2 latent of this forward, squeezed to 4-D — or ``None``.
+
+    Krea-2's latent format is ``Wan21`` (``comfy/supported_models.py:2009-2035``),
+    whose ``latent_dimensions == 3`` (``comfy/latent_formats.py:731``) makes
+    comfy unsqueeze the sampler's 4-D latent to ``[B, 16, T, H, W]``
+    (``comfy/sample.py:58-59``) — so the 5-D shape is the NORMAL image case,
+    and AReA's own 4-D guard (``x.ndim != 4``) would make AReA a SILENT NO-OP on
+    every Krea-2 image run.
+
+    A latent with more than one frame is a VIDEO and is REFUSED (a one-time
+    warning): the frames share their positions
+    (``comfy/ldm/krea2/model.py:299-303``) and do not form one rectangular
+    canvas, so AReA's windowed attention — a latent-IMAGE construction —
+    cannot be applied to it.
+    """
+    if not torch.is_tensor(x):
+        return None
+    if x.dim() == 5 and int(x.shape[2]) > 1:
+        _warn_once(
+            "krea-video",
+            "AReA: this Krea-2 forward carries a %d-frame video latent "
+            "[B, C, T, H, W], and AReA's windowed attention is a latent-IMAGE "
+            "construction: the frames share their positions "
+            "(comfy/ldm/krea2/model.py:299-303) and do not form one rectangular "
+            "canvas. This forward runs plain attention — render single images "
+            "for AReA.",
+            int(x.shape[2]),
+        )
+        return None
+    try:
+        return krea_squeeze_latent(x)
+    except ValueError as exc:
+        _warn_once("krea-latent", "AReA: %s", exc)
+        return None
+
+
+def _krea_ref_latents(conds) -> bool:
+    """Does this forward carry REFERENCE latents?
+
+    Krea-2 appends the reference images' tokens to the canvas tokens
+    (``comfy/ldm/krea2/model.py:313-331``), so the image tokens are then NOT one
+    rectangular canvas and pooling them as canvas tokens would corrupt the
+    geometry silently.  The reference latents ride in the cond dict
+    (``comfy/model_base.py:2780-2789``).
+    """
+    refs = conds.get("ref_latents")
+    if refs is None:
+        return False
+    try:
+        return len(refs) > 0
+    except TypeError:
+        return True
+
+
+def _krea_seam_is_live(dm, wrapper) -> bool:
+    """Does the model's own attention class still call OUR seam symbol?
+
+    A quantized / fused attention kernel replaces the class, so its forward
+    resolves no ``optimized_attention_masked`` at all — AReA would then be a
+    SILENT no-op.  The class's forward looks the symbol up in its OWN module's
+    globals (``comfy/ldm/krea2/model.py:21`` binds the name, ``:99-100`` calls
+    it), so the check reads them: the seam is live only when the class resolves
+    the symbol we just rebound (the Nunchaku precedent, ``src/area.py:1411-1420``).
+    """
+    blocks = getattr(dm, "blocks", None)
+    if blocks is None:
+        return False
+    try:
+        attn = blocks[0].attn
+    except (AttributeError, IndexError, KeyError, TypeError):
+        return False
+    forward = getattr(type(attn), "forward", None)
+    namespace = getattr(forward, "__globals__", None)
+    if namespace is None:
+        return False
+    return namespace.get(KREA_SEAM_SYMBOL) is wrapper
+
+
+def _krea_install_seam(m, dm) -> bool:
+    """Patch ``comfy.ldm.krea2.model.optimized_attention_masked`` (ref-counted).
+
+    Returns ``True`` when the seam is live and ``False`` when the model must be
+    returned UNCHANGED — a quantized / fused attention kernel bypasses the seam
+    entirely, so AReA would be a silent no-op there (the Nunchaku precedent).
+
+    The symbol is process-global and shared by every patcher, so the install is
+    a module-global rebind plus a ref-count — the proven in-pack pattern
+    (``src/area.py``'s FLUX seam and ``src/spa.py:1341-1372``): comfy's
+    ``add_object_patch`` is a per-patch record re-applied around model use
+    (``comfy/model_patcher.py:739``), which would double-wrap a shared symbol on
+    every clone/re-apply.  A second AReA apply re-uses the wrapper instead of
+    wrapping our own wrapper, and the symbol is restored on the last release.
+    """
+    import importlib
+
+    if _KSEAM["orig"] is None:
+        try:
+            mod = importlib.import_module(KREA_SEAM_MODULE)
+        except Exception as exc:  # probe: backend module not importable here
+            raise ValueError(
+                f"AReA: cannot import {KREA_SEAM_MODULE} to patch the Krea-2 "
+                f"attention seam ({exc}). AReA supports FLUX, Z-Image (Lumina2) "
+                "and Krea-2; load an unmodified Krea-2 checkpoint on a current "
+                "ComfyUI."
+            ) from exc
+        bound = getattr(mod, KREA_SEAM_SYMBOL, None)
+        if bound is None:
+            raise ValueError(
+                f"AReA: {KREA_SEAM_MODULE}.{KREA_SEAM_SYMBOL} is missing in this "
+                "ComfyUI version, so the Krea-2 attention seam cannot be "
+                "installed. Update ComfyUI (or load an unmodified Krea-2 model)."
+            )
+        _krea_check_foreign(bound)
+        orig = _krea_pristine(bound)
+        wrapper = _make_krea_wrapper(orig)
+        setattr(mod, KREA_SEAM_SYMBOL, wrapper)
+        if not _krea_seam_is_live(dm, wrapper):
+            # A fused / quantized attention class does not resolve the symbol:
+            # put the pristine symbol back and leave the model alone.
+            setattr(mod, KREA_SEAM_SYMBOL, orig)
+            _warn_once(
+                "krea-fused",
+                "AReA: this Krea-2 model's attention class does not call "
+                "optimized_attention_masked (a quantized/fused attention kernel "
+                "bypasses the attention seam), so AReA would be a silent no-op; "
+                "returning the model UNCHANGED. Use a non-quantized Krea-2 loader.",
+            )
+            return False
+        _KSEAM.update(module=mod, attr=KREA_SEAM_SYMBOL, orig=orig)
+        handles = []
+        recorder = None
+        embedder = getattr(dm, "pe_embedder", None)
+        if embedder is not None and hasattr(embedder, "register_forward_hook"):
+            hook, recorder = capture_krea_table(embedder)
+            handles.append(hook.handle)
+        else:
+            _warn_once(
+                "no-krea-rope",
+                "AReA: this Krea-2 model has no diffusion_model.pe_embedder to "
+                "hook, so the seam's rope table cannot be captured. Every forward "
+                "runs plain attention.",
+            )
+        first = getattr(dm, "first", None)
+        if first is not None and hasattr(first, "register_forward_hook"):
+            handles.append(first.register_forward_hook(_krea_first_hook))
+        else:
+            _warn_once(
+                "no-krea-first",
+                "AReA: this Krea-2 model has no diffusion_model.first to hook, so "
+                "the Phase II detail map falls back to the projected image keys of "
+                "the first fine call.",
+            )
+        _KSEAM["recorder"] = recorder
+        _KSEAM["hook"] = tuple(handles)
+    _KSEAM["consumers"] += 1
+    m._area_seam_consumer = True
+    m._area_seam = "krea2"
+    # The capture is process-wide for this install (its hook is registered once,
+    # on the first consumer's embedder), so a later consumer re-uses it rather
+    # than building a second recorder the registered hook never feeds.
+    return True
+
+
 def _area_install_seam(m, dm, profile):
     """Patch the backbone's bound attention seam and hook the model (ref-counted).
 
-    FLUX and Z-Image are different symbols in different modules, so each takes its
-    own install path and its own ref-count — the two never share one.  Returns
-    the Z-Image rope capture (``None`` on the FLUX side), which the caller hands
-    to the runtime it builds.
+    FLUX, Z-Image and Krea-2 are different symbols in different modules, so each
+    takes its own install path and its own ref-count — the three never share one.
+    Returns the Z-Image rope capture (``None`` on the FLUX side), which the
+    caller hands to the runtime it builds, or ``False`` when a Krea-2 model
+    carries a fused attention kernel and must be left UNCHANGED.
     """
     if profile is ZIMAGE_PROFILE:
         return _zimage_install_seam(m, dm)
+    if profile is KREA_PROFILE:
+        return _krea_install_seam(m, dm)
     import importlib
 
     if _SEAM["orig"] is None:
@@ -1210,12 +1759,46 @@ def _area_resolve_forward(rt: _AreaRuntime, params: dict) -> AreaContext:
         rt.recorder.reset()
         rt.recorder.armed = True
         rt.joint = None
+    if rt.profile is KREA_PROFILE:
+        # Per-forward Krea-2 state (the SPA discipline): the rope table is
+        # captured anew every forward, and the arming window opens NOW — the
+        # model's own embedder is called ONCE per forward, after the text
+        # fusion (``comfy/ldm/krea2/model.py:364``).
+        if rt.recorder is None:
+            rt.recorder = _KSEAM["recorder"] or KreaRopeRecorder()
+        rt.recorder.reset()
+        rt.recorder.armed = True
+        rt.joint = None
     x = params.get("input")
     conds = params.get("c") or {}
-    if not torch.is_tensor(x) or x.ndim != 4:
-        return ctx  # nothing pool-able at this shape -> plain attention
-    patch_size = int(getattr(rt.dm, "patch_size", FLUX_PATCH_SIZE) or FLUX_PATCH_SIZE)
-    h, w = _grid_from_latent(x, patch_size)
+    if rt.profile is KREA_PROFILE:
+        # A Krea-2 latent is 4-D or 5-D, and the 5-D one with a single frame is
+        # the NORMAL image case (the Wan21 latent format has three dimensions,
+        # so comfy unsqueezes the sampler's latent).  A video (T > 1) and a
+        # forward carrying reference latents are REFUSED — neither is one
+        # rectangular canvas, and pooling them would corrupt the geometry
+        # silently.
+        x = _krea_latent(x)
+        if x is None:
+            return ctx
+        if _krea_ref_latents(conds):
+            _warn_once(
+                "krea-ref-latents",
+                "AReA: this Krea-2 forward carries reference latents, so the "
+                "image tokens are not one rectangular canvas any more "
+                "(comfy/ldm/krea2/model.py:313-331 appends the reference "
+                "images' tokens to the canvas ones) and AReA cannot pool them "
+                "without corrupting the geometry. This forward runs plain "
+                "attention — render a reference-free image for AReA.",
+            )
+            return ctx
+        patch = int(getattr(rt.dm, "patch", KREA_PATCH) or KREA_PATCH)
+        h, w = krea_latent_grid(x, patch)
+    else:
+        if not torch.is_tensor(x) or x.ndim != 4:
+            return ctx  # nothing pool-able at this shape -> plain attention
+        patch_size = int(getattr(rt.dm, "patch_size", FLUX_PATCH_SIZE) or FLUX_PATCH_SIZE)
+        h, w = _grid_from_latent(x, patch_size)
     cross = conds.get("c_crossattn")
     if torch.is_tensor(cross) and cross.ndim >= 2:
         ctx.txt_len = int(cross.shape[1])
@@ -1229,7 +1812,10 @@ def _area_resolve_forward(rt: _AreaRuntime, params: dict) -> AreaContext:
     # and a latent that agree say it once in total.
     factor, adjusted = resolve_factor(h, w, rt.config.native)
     if adjusted:
-        _warn_grid_adjusted(h, w, w * PATCH_PX, h * PATCH_PX, factor)
+        # The pixel factor is the PROFILE's (16 px per token on every backbone
+        # today), so a Krea-2 canvas is announced in its own units.
+        px = int(rt.profile.px_per_patch) if rt.profile is not None else PATCH_PX
+        _warn_grid_adjusted(h, w, w * px, h * px, factor)
     phase1 = _phase1_count(rt, opts)
     if is_short_schedule(total):
         # The "+2 healing rule" (area-fix2): an Euler step only displaces the
@@ -1285,10 +1871,15 @@ def _area_resolve_forward(rt: _AreaRuntime, params: dict) -> AreaContext:
                     "level.",
                     first, rt.config.phase1_sigma,
                 )
-    if phase == "coarse" and rt.profile is not ZIMAGE_PROFILE:
+    if phase == "coarse" and rt.profile is not ZIMAGE_PROFILE and rt.profile is not KREA_PROFILE:
         # FLUX resolves its coarse tables here; the Z-Image ones need the model's
         # own rope groups, which only exist once the forward has run its embed,
-        # so the seam resolves them lazily (``_zimage_coarse_ropes``).
+        # so the seam resolves them lazily (``_zimage_coarse_ropes``).  The
+        # Krea-2 ones are lazy too — and for a second reason: the model's own
+        # table is the FIRST table of the forward (the recorder keeps it and
+        # never overwrites it), so a resolve-time build through the same
+        # embedder would be captured AS the model's table
+        # (``_krea_coarse_ropes``).
         try:
             ctx.data["rope_q"], ctx.data["rope_kv"] = _area_coarse_ropes(
                 rt, h, w, size, ctx.txt_len, x.device
@@ -1317,19 +1908,24 @@ def _make_area_unet_wrapper(rt: _AreaRuntime, previous_wrapper):
         # the enclosing function does not reach a nested scope, so the assignment
         # would otherwise bind a local of ``wrapper`` and the seam would never
         # see the runtime (the whole patch would silently delegate).
-        global _AREA_RUNTIME, _ZRUNTIME
+        global _AREA_RUNTIME, _ZRUNTIME, _KRUNTIME
 
         # One runtime per forward, and only the backbone this patcher resolved:
-        # the FLUX and Z-Image seams read different globals, so neither can fire
-        # on the other's forward.
-        _AREA_RUNTIME = None if rt.profile is ZIMAGE_PROFILE else rt
-        _ZRUNTIME = rt if rt.profile is ZIMAGE_PROFILE else None
+        # the three seams read three different globals, so none of them can fire
+        # on another's forward.
+        if rt.profile is ZIMAGE_PROFILE:
+            _AREA_RUNTIME, _ZRUNTIME, _KRUNTIME = None, rt, None
+        elif rt.profile is KREA_PROFILE:
+            _AREA_RUNTIME, _ZRUNTIME, _KRUNTIME = None, None, rt
+        else:
+            _AREA_RUNTIME, _ZRUNTIME, _KRUNTIME = rt, None, None
         try:
             _area_resolve_forward(rt, params)
             return _call_through(model_function, params)
         finally:
             _AREA_RUNTIME = None
             _ZRUNTIME = None
+            _KRUNTIME = None
 
     return wrapper
 
@@ -1352,15 +1948,17 @@ def apply_area_to_model(
     phase1_mode: str = "auto",
     phase1_sigma: float = ZIMAGE_SIGMA_STAR,
 ):
-    """Patch a ComfyUI FLUX or Z-Image model with AReA (arXiv 2610.17227).
+    """Patch a ComfyUI FLUX, Z-Image or Krea-2 model with AReA (arXiv 2610.17227).
 
     The backbone is resolved once into an :class:`~src.area_arch._ArchProfile`
     (``src/area_arch.py``) and exactly one attention seam is installed for it —
-    FLUX's bound ``attention`` or Z-Image's bound
-    ``optimized_attention_masked``.  Every other architecture raises an actionable
-    :class:`ValueError` (house rule, ``src/hap.py:876-895``), and Nunchaku (fused
-    kernels bypass the seam) warns and returns the clone UNCHANGED
-    (``src/hap.py:897-903``).  At or below the native 64-patch extent (1024 px)
+    FLUX's bound ``attention``, Z-Image's bound ``optimized_attention_masked``
+    or Krea-2's bound ``optimized_attention_masked``.  Every other architecture
+    raises an actionable :class:`ValueError` (house rule,
+    ``src/hap.py:876-895``), and Nunchaku (fused kernels bypass the seam) warns
+    and returns the clone UNCHANGED (``src/hap.py:897-903``) — as does a
+    Krea-2 model whose attention class does not resolve the seam symbol at all.
+    At or below the native extent (64 patches = 1024 px on FLUX and Z-Image)
     nothing is patched — attention would be replaced by itself.
 
     ``phase1_mode`` / ``phase1_sigma`` are the Phase I -> II switch (Q4):
@@ -1395,9 +1993,6 @@ def apply_area_to_model(
     """
     from .spa import _hrdit_carry_state
 
-    width = _snap_to_multiple(width, PATCH_PX)
-    height = _snap_to_multiple(height, PATCH_PX)
-
     # ``ModelPatcher.clone()`` drops custom attrs: carry the AReA config (and
     # SPA/HAP's, so a chained DyPE/SEGA/HAP node never loses its state) onto the
     # clone right away, before any early return below.
@@ -1418,16 +2013,24 @@ def apply_area_to_model(
         )
         m._area_config = None
         return m
-    if detected_type not in ("flux", "zimage"):
+    if detected_type not in ("flux", "zimage", "krea2"):
         raise ValueError(
-            f"AReA supports FLUX and Z-Image (Lumina2 / NextDiT) — it covered "
-            f"FLUX only in v1 — but the resolved model type is "
-            f"{detected_type!r}. Load an unmodified (non-quantized) FLUX model, "
-            "or use SPA / DyPE / SEGA for this architecture."
+            f"AReA supports FLUX, Z-Image (Lumina2 / NextDiT) and Krea-2 "
+            f"(SingleStreamDiT) — it covered FLUX only in v1 — but the resolved "
+            f"model type is {detected_type!r}. Load an unmodified "
+            "(non-quantized) FLUX, Z-Image or Krea-2 model, or use SPA / DyPE / "
+            "SEGA for this architecture."
         )
     # The arch profile validates the pin against the model's own backbone and
     # refuses the Lumina2 siblings AReA cannot patch (pixel space, Ming-Image).
     profile = resolve_area_arch(dm, model_type)
+    # The pixel multiple and the trained extent are the PROFILE's — they are
+    # per-backbone facts (a 16x VAE would make a Krea-2 token 32 px wide).
+    # FLUX and Z-Image keep 16 px and 64 tokens, so their numbers do not move.
+    px_per_patch = int(profile.px_per_patch)
+    native_tokens = int(profile.native_tokens)
+    width = _snap_to_multiple(width, px_per_patch)
+    height = _snap_to_multiple(height, px_per_patch)
 
     # AReA-Z defaults (.dev/area-debug/area-fix.txt §3-File 3): "auto" resolves per
     # backbone — Z-Image runs the norm-preserving centroid pooling and the
@@ -1451,6 +2054,9 @@ def apply_area_to_model(
         window_hold_steps=max(0, min(8, int(window_hold_steps))),
         delay=max(0, min(int(phase1_steps), int(delay))),
         seed=int(seed),
+        # D4: the trained extent in TOKENS is the profile's — FLUX and Z-Image
+        # keep 64, so their numbers do not move.
+        native=native_tokens,
     )
 
     if not enable_area:
@@ -1465,16 +2071,17 @@ def apply_area_to_model(
             "(and the native extent) still delegate to them.",
         )
 
-    h, w = height // PATCH_PX, width // PATCH_PX
-    if max(h, w) <= NATIVE_PATCHES:
+    h, w = height // px_per_patch, width // px_per_patch
+    if max(h, w) <= native_tokens:
+        native_px = native_tokens * px_per_patch
         _warn_once(
             "native",
             "AReA: %dx%d px builds a %dx%d patch grid, at or below the native "
-            "64-patch (1024 px) extent where AReA is a provable no-op — nothing "
-            "is patched. Raise the resolution past 1024 px on the longer side "
+            "%d-patch (%d px) extent where AReA is a provable no-op — nothing "
+            "is patched. Raise the resolution past %d px on the longer side "
             "(and keep this node's width/height in step with your latent) for "
             "AReA to engage.",
-            width, height, w, h,
+            width, height, w, h, native_tokens, native_px, native_px,
         )
         return m
 
@@ -1486,11 +2093,17 @@ def apply_area_to_model(
     # divisibility constraint) and the last pooling block on a partial axis is
     # a partial block.  The canvas, the latent and the output resolution are
     # untouched; the user is told once.
-    factor, adjusted = resolve_factor(h, w, NATIVE_PATCHES)
+    factor, adjusted = resolve_factor(h, w, native_tokens)
     if adjusted:
         _warn_grid_adjusted(h, w, width, height, factor)
 
-    _area_install_seam(m, dm, profile)
+    installed = _area_install_seam(m, dm, profile)
+    if installed is False:
+        # A quantized / fused attention kernel bypasses the seam: AReA would be
+        # a silent no-op, so the model is returned UNCHANGED (the Nunchaku
+        # precedent above).
+        m._area_config = None
+        return m
 
     previous_wrapper = None
     try:
@@ -1503,7 +2116,9 @@ def apply_area_to_model(
     logger.info(
         "AReA: installed on a %dx%d patch grid (%dx%d px) on the %s seam, "
         "phase1_steps=%d (mode %s), pooling=%s, halo=%d, bridge_ratio=%s, seed=%d",
-        w, h, width, height, "Z-Image" if profile is ZIMAGE_PROFILE else "FLUX",
+        w, h, width, height,
+        {"flux": "FLUX", "zimage": "Z-Image", "krea2": "Krea-2"}.get(
+            profile.model_type, "FLUX"),
         m._area_config.phase1_steps, m._area_config.phase1_mode,
         m._area_config.pooling, m._area_config.halo, m._area_config.bridge_ratio,
         m._area_config.seed,
@@ -1552,13 +2167,19 @@ def restore_area_attention_hook(m) -> None:
 
     The seam symbol and the forward hooks are shared by every patcher, so they
     are restored only when the last consumer leaves — mirroring
-    ``src/spa.py:1485``.  FLUX and Z-Image have separate ref-counts, so the
-    patcher's own seam (``m._area_seam``) is the one released.
+    ``src/spa.py:1485``.  FLUX, Z-Image and Krea-2 have separate ref-counts, so
+    the patcher's own seam (``m._area_seam``) is the one released.
     """
     if not getattr(m, "_area_seam_consumer", False):
         m._area_config = None
         return
     m._area_seam_consumer = False
-    _release_seam(_ZSEAM if getattr(m, "_area_seam", None) == "zimage" else _SEAM)
+    seam = getattr(m, "_area_seam", None)
+    if seam == "zimage":
+        _release_seam(_ZSEAM)
+    elif seam == "krea2":
+        _release_seam(_KSEAM)
+    else:
+        _release_seam(_SEAM)
     m._area_seam = None
     m._area_config = None

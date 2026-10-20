@@ -4,14 +4,14 @@ Node definitions live in ``nodes/``; engines in ``src/`` (pack layout plan
 2026-09-08). This module is importable both inside the ComfyUI-loaded pack
 package (relative ``..src`` imports) and flat from the repo root (tests).
 
-AReA (arXiv 2610.17227) replaces FLUX / Z-Image image self-attention with a
-time-dependent attention graph: the first ``phase1_steps`` (or, in ``sigma``
-mode, the leading steps still above ``phase1_sigma``) steps pool image K/V to
-one token per ``f x f`` block and run cross-scale attention (Phase I), the
-remaining steps run windowed attention whose windows follow the image's
-Haar-DWT detail map, each extended by a randomized Halo ring and a global-KV
-bridge (Phase II).  At or below the native 1024 px extent it is a provable
-no-op.
+AReA (arXiv 2610.17227) replaces FLUX / Z-Image / Krea-2 image self-attention
+with a time-dependent attention graph: the first ``phase1_steps`` (or, in
+``sigma`` mode, the leading steps still above ``phase1_sigma``) steps pool
+image K/V to one token per ``f x f`` block and run cross-scale attention
+(Phase I), the remaining steps run windowed attention whose windows follow the
+image's Haar-DWT detail map, each extended by a randomized Halo ring and a
+global-KV bridge (area-fix3).  At or below the native 1024 px extent it is a
+provable no-op.
 """
 
 import inspect
@@ -55,7 +55,7 @@ def _phase1_switch_kwargs(phase1_mode: str, phase1_sigma: float) -> dict:
 class AReA(io.ComfyNode):
     """
     Applies AReA (arXiv 2610.17227) to a model: a training-free, time-dependent
-    replacement of FLUX / Z-Image image self-attention.
+    replacement of FLUX / Z-Image / Krea-2 image self-attention.
 
     Phase I pools image keys/values to one token per f x f block and runs
     cross-scale attention on a coarse position grid while the queries stay at
@@ -67,17 +67,18 @@ class AReA(io.ComfyNode):
     an automatically a no-op.
 
     ``model_type`` selects the backbone profile (``src.area_arch``): ``auto``
-    reads it off the model, and the two supported backbones — FLUX and Z-Image
-    (Lumina2 / NextDiT) — share the same 16 px patch grid, so one width/height
-    pair serves either.  ``phase1_mode`` and ``pooling`` default to ``auto``,
-    which the engine resolves per backbone: on Z-Image the switch is the
-    schedule-aware ``sigma`` mode (the leading steps still at or above
-    ``phase1_sigma``) and pooling is the norm-preserving ``mean`` mode, while
-    FLUX keeps the reference's ``steps`` constant and ``subsample`` pooling.
-    Three knobs tune short (distilled) schedules only and are
-    ignored on a long one: ``bridge_floor_steps`` exempts the leading fine steps
-    from the cost cap (they keep the paper's full bridge and halo),
-    ``window_start`` / ``window_hold_steps`` reshape the window ramp.
+    reads it off the model, and the three supported backbones — FLUX, Z-Image
+    (Lumina2 / NextDiT) and Krea-2 (SingleStreamDiT) — share the same 16 px
+    patch grid, so one width/height pair serves any of them.  ``phase1_mode``
+    and ``pooling`` default to ``auto``, which the engine resolves per
+    backbone: on Z-Image the switch is the schedule-aware ``sigma`` mode (the
+    leading steps still at or above ``phase1_sigma``) and pooling is the
+    norm-preserving ``mean`` mode, while FLUX keeps the reference's ``steps``
+    constant and ``subsample`` pooling.  Three knobs tune short (distilled)
+    schedules only and are ignored on a long one: ``bridge_floor_steps``
+    exempts the leading fine steps from the cost cap (they keep the paper's
+    full bridge and halo), ``window_start`` / ``window_hold_steps`` reshape the
+    window ramp.
     """
 
     @classmethod
@@ -86,11 +87,11 @@ class AReA(io.ComfyNode):
             node_id="AReA",
             display_name="AReA",
             category="WMNodes/image",
-            description="AReA (arXiv 2610.17227). Replaces FLUX / Z-Image image self-attention with a time-dependent attention graph: coarse cross-scale attention on leading steps, DWT-guided windowed attention (Halo + bridge tokens) on the rest. Training-free; a no-op at or below 1024 px.",
+            description="AReA (arXiv 2610.17227). Replaces FLUX / Z-Image / Krea-2 image self-attention with a time-dependent attention graph: coarse cross-scale attention on leading steps, DWT-guided windowed attention (Halo + bridge tokens) on the rest. Training-free; a no-op at or below 1024 px.",
             inputs=[
                 io.Model.Input(
                     "model",
-                    tooltip="The model to patch with AReA. FLUX and Z-Image (Lumina2) share the same patch grid, so the same width/height serve either.",
+                    tooltip="The model to patch with AReA. FLUX, Z-Image (Lumina2) and Krea-2 share the same 16 px patch grid, so the same width/height serve any of them.",
                 ),
                 io.Int.Input(
                     "width",
@@ -104,9 +105,9 @@ class AReA(io.ComfyNode):
                 ),
                 io.Combo.Input(
                     "model_type",
-                    options=["auto", "flux", "zimage"],
+                    options=["auto", "flux", "zimage", "krea2"],
                     default="auto",
-                    tooltip="Specify the model architecture. 'auto' usually works. FLUX and Z-Image (Lumina2 / NextDiT) share a 16 px patch grid, so the same width/height serve either; Nunchaku's fused kernels bypass the attention seam, so it is reported unchanged.",
+                    tooltip="Specify the model architecture. 'auto' usually works. FLUX and Z-Image (Lumina2 / NextDiT) share a 16 px patch grid, so the same width/height serve either; Krea-2 (SingleStreamDiT) uses the same 16 px token grid (ASSUMED — its VAE downscale is unverified, so a 16x VAE would make its token 32 px) and needs no padding; Nunchaku's fused kernels bypass the attention seam, so it is reported unchanged.",
                 ),
                 io.Boolean.Input(
                     "enable_area",
@@ -124,7 +125,7 @@ class AReA(io.ComfyNode):
                     "phase1_mode",
                     options=["auto", "steps", "sigma", "bootstrap"],
                     default="auto",
-                    tooltip="How the Phase I -> Phase II switch is expressed. 'auto' = resolved per backbone: 'sigma' on Z-Image (the leading steps still at or above phase1_sigma run Phase I, so the switch follows the schedule) and 'steps' on FLUX. 'steps' = the leading phase1_steps steps run Phase I (the reference's mode). 'sigma' = the leading steps whose noise level is still at or above phase1_sigma run Phase I, so the switch follows the schedule rather than a fixed count (8 of 28 sits at a sigma of roughly 0.88 on a shift-3.0 flow). 'bootstrap' = the paper's Appendix F mode: no Phase I at all, windowed Phase II from the first step; the early steps must have composed the canvas in a separate native-resolution pass whose latent was upscaled and re-noised to phase1_sigma (see the README pattern).",
+                    tooltip="How the Phase I -> Phase II switch is expressed. 'auto' = resolved per backbone: 'sigma' on Z-Image (the leading steps still at or above phase1_sigma run Phase I, so the switch follows the schedule) and 'steps' on FLUX and Krea-2. 'steps' = the leading phase1_steps steps run Phase I (the reference's mode). 'sigma' = the leading steps whose noise level is still at or above phase1_sigma run Phase I, so the switch follows the schedule rather than a fixed count (8 of 28 sits at a sigma of roughly 0.88 on a shift-3.0 flow). 'bootstrap' = the paper's Appendix F mode: no Phase I at all, windowed Phase II from the first step; the early steps must have composed the canvas in a separate native-resolution pass whose latent was upscaled and re-noised to phase1_sigma (see the README pattern).",
                 ),
                 io.Float.Input(
                     "phase1_sigma",
