@@ -356,7 +356,7 @@ class TestAReASchema:
                                 "bridge_floor_steps", "window_start",
                                 "window_hold_steps", "seed"]
         assert inputs["model_type"].kwargs["options"] == ["auto", "flux", "zimage",
-                                                          "krea2"]
+                                                          "krea2", "qwen21"]
         assert inputs["phase1_steps"].kwargs["default"] == PHASE1      # backbones/flux.py:16
         assert inputs["pooling"].kwargs["options"] == ["auto", "subsample", "mean",
                                                        "medoid", "random"]
@@ -390,13 +390,14 @@ class TestAReASchema:
     def test_flux_and_zimage_options_are_unchanged(self):
         """The existing options keep their ORDER (a saved workflow's index).
 
-        ``krea2`` is APPENDED, so a graph that stored ``0``/``1``/``2`` still
-        selects auto / FLUX / Z-Image.
+        ``krea2`` and ``qwen21`` are APPENDED, so a graph that stored
+        ``0``/``1``/``2`` still selects auto / FLUX / Z-Image.
         """
         inputs = {i.name: i for i in AReA.define_schema().inputs}
         options = inputs["model_type"].kwargs["options"]
         assert options[:3] == ["auto", "flux", "zimage"]
-        assert options[-1] == "krea2"
+        assert options[3] == "krea2"
+        assert options[-1] == "qwen21"
         assert options.index("flux") < options.index("zimage")
 
     def test_node_execute_forwards_the_model_type(self, monkeypatch):
@@ -485,6 +486,112 @@ class TestAReASchema:
 
 
 # ---------------------------------------------------------------------------
+# S10 — the Qwen-Image-2.1 node schema and the OBSERVABLE effective coarse count
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.unit
+class TestTheQwen21Schema:
+    """The node can select the 2.1 backbone, and its knobs are readable.
+
+    The Qwen-Image-2.1 adaptation added a FOURTH backbone, so the combo has to
+    offer it — a node that cannot select the backbone is a node that cannot run
+    the model.  The canvas rule stays backbone-agnostic: 2.1's token is 16 px
+    too (MEASURED), so a 2.1 canvas is a multiple of 16 px like every other.
+    """
+
+    def test_the_model_type_combo_lists_qwen21(self):
+        """The combo contains ``"qwen21"`` — the backbone is selectable."""
+        inputs = {i.name: i for i in AReA.define_schema().inputs}
+        assert "qwen21" in inputs["model_type"].kwargs["options"]
+
+    def test_the_phase1_steps_tooltip_names_the_cap(self):
+        """The tooltip names the heal cap, so the knob is not a mystery.
+
+        The cap is what can override the knob (a short schedule keeps two
+        fine steps), so the tooltip has to say that it exists.
+        """
+        inputs = {i.name: i for i in AReA.define_schema().inputs}
+        tooltip = inputs["phase1_steps"].kwargs["tooltip"]
+        assert "cap" in tooltip.lower()
+        assert "total_steps - 2" in tooltip
+
+    def test_the_validate_inputs_rejects_a_non_multiple_of_sixteen(self):
+        """The rule holds for a 2.1 canvas too (16 px per token, MEASURED)."""
+        assert AReA.validate_inputs(1024, 1024) is True       # a 2.1 canvas
+        message = AReA.validate_inputs(1024, 1016)
+        assert isinstance(message, str)
+        assert "multiples of 16" in message
+        assert "1024x1016" in message
+
+
+@pytest.mark.unit
+class TestTheEffectiveCoarseCount:
+    """The EFFECTIVE coarse-step count is logged — ONCE per schedule (Q10).
+
+    The user's knob and the schedule the run really follows are two different
+    numbers whenever the heal cap bites, and a silently overridden knob is
+    unreadable (the Krea-2 lesson (v)).  The line names the knob, the cap, the
+    effective coarse count and the effective fine count.
+    """
+
+    STEPS = 8                              # a SHORT schedule -> the cap applies
+    CAP = STEPS - 2                        # 6
+
+    def _line(self, caplog) -> str:
+        lines = [rec.message for rec in caplog.records
+                 if "effective coarse count" in rec.message]
+        assert lines, caplog.text
+        return lines[0]
+
+    def test_the_effective_coarse_count_is_logged(self, flux_layers, caplog):
+        """One line per SCHEDULE, naming the knob, the cap and the counts."""
+        with caplog.at_level(logging.INFO, logger="ComfyUI-DyPE"):
+            m = apply_area_to_model(mock_flux_model(), "flux", WIDTH, HEIGHT,
+                                    phase1_steps=3, seed=7)
+            try:
+                _run_forward(m, step=0, steps=self.STEPS)
+                _run_forward(m, step=1, steps=self.STEPS)
+            finally:
+                restore_area_attention_hook(m)
+        lines = [rec.message for rec in caplog.records
+                 if "effective coarse count" in rec.message]
+        # ONCE per schedule: two steps of the SAME schedule, one line
+        assert len(lines) == 1
+        line = lines[0]
+        assert "phase1_steps knob 3" in line
+        assert f"heal cap {self.CAP}" in line
+        assert f"effective coarse count 3 of {self.STEPS} steps" in line
+        assert f"effective fine count {self.STEPS - 3}" in line
+
+    def test_the_knob_is_authoritative_when_below_the_cap(self, flux_layers, caplog):
+        """Below the cap the EFFECTIVE count IS the knob; above it the cap
+        wins — and the line says WHICH number won (no silent override)."""
+        with caplog.at_level(logging.INFO, logger="ComfyUI-DyPE"):
+            m = apply_area_to_model(mock_flux_model(), "flux", WIDTH, HEIGHT,
+                                    phase1_steps=3, seed=7)
+            try:
+                _run_forward(m, step=0, steps=self.STEPS)
+            finally:
+                restore_area_attention_hook(m)
+        line = self._line(caplog)
+        assert f"effective coarse count 3 of {self.STEPS} steps" in line
+        assert f"heal cap {self.CAP}" in line
+        caplog.clear()
+        with caplog.at_level(logging.INFO, logger="ComfyUI-DyPE"):
+            m = apply_area_to_model(mock_flux_model(), "flux", WIDTH, HEIGHT,
+                                    phase1_steps=7, seed=7)
+            try:
+                _run_forward(m, step=0, steps=self.STEPS)
+            finally:
+                restore_area_attention_hook(m)
+        capped = self._line(caplog)
+        assert f"effective coarse count {self.CAP} of {self.STEPS} steps" in capped
+        assert "phase1_steps knob 7" in capped
+        assert f"heal cap {self.CAP}" in capped
+
+
+# ---------------------------------------------------------------------------
 # The auto defaults, resolved per backbone (AReA-Z, area-fix §3-File 3)
 # ---------------------------------------------------------------------------
 
@@ -554,6 +661,29 @@ class TestAutoDefaults:
 
 @pytest.mark.unit
 class TestApplyGates:
+    def test_a_qwen21_model_without_its_backend_module_raises_actionable_error(self,
+                                                                              flux_layers):
+        """A Qwen-Image-2.1 model on a ComfyUI WITHOUT the 2.1 backend.
+
+        The node supports Qwen-Image-2.1 now, so the old "FLUX only" refusal
+        is gone: the model is RECOGNISED (the class name is the marker) and
+        what is missing is the backend module AReA has to patch.  The message
+        names the offender AND the remedy (house rule).
+        """
+        class MockQwen21(MockFluxDiT):
+            pass
+
+        MockQwen21.__name__ = "QwenImage21Transformer2DModel"
+        m = mock_flux_model()
+        m.model.diffusion_model = MockQwen21()
+        with pytest.raises(ValueError, match="Qwen-Image-2.1"):
+            apply_area_to_model(m, "auto", WIDTH, HEIGHT)
+        # the message names the offender and the remedy (house rule)
+        with pytest.raises(ValueError, match="qwen_image21"):
+            apply_area_to_model(m, "auto", WIDTH, HEIGHT)
+        with pytest.raises(ValueError, match="unmodified Qwen-Image-2.1 checkpoint"):
+            apply_area_to_model(m, "auto", WIDTH, HEIGHT)
+
     def test_nunchaku_warns_and_returns_the_clone_unchanged(self, flux_layers, caplog):
         source = mock_flux_model()
         with caplog.at_level(logging.WARNING, logger="ComfyUI-DyPE"):
@@ -1103,6 +1233,8 @@ class TestBridgeFloorWarning:
         finally:
             area._warned.clear()
 
+
+@pytest.mark.unit
 def test_non_flux_raises_actionable_error(flux_layers):
     """A backbone AReA does not support is a loud, actionable refusal.
 

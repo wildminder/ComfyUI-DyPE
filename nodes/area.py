@@ -4,14 +4,14 @@ Node definitions live in ``nodes/``; engines in ``src/`` (pack layout plan
 2026-09-08). This module is importable both inside the ComfyUI-loaded pack
 package (relative ``..src`` imports) and flat from the repo root (tests).
 
-AReA (arXiv 2610.17227) replaces FLUX / Z-Image / Krea-2 image self-attention
-with a time-dependent attention graph: the first ``phase1_steps`` (or, in
-``sigma`` mode, the leading steps still above ``phase1_sigma``) steps pool
-image K/V to one token per ``f x f`` block and run cross-scale attention
-(Phase I), the remaining steps run windowed attention whose windows follow the
-image's Haar-DWT detail map, each extended by a randomized Halo ring and a
-global-KV bridge (area-fix3).  At or below the native 1024 px extent it is a
-provable no-op.
+AReA (arXiv 2610.17227) replaces FLUX / Z-Image / Krea-2 / Qwen-Image-2.1
+image self-attention with a time-dependent attention graph: the first
+``phase1_steps`` (or, in ``sigma`` mode, the leading steps still above
+``phase1_sigma``) steps pool image K/V to one token per ``f x f`` block and run
+cross-scale attention (Phase I), the remaining steps run windowed attention
+whose windows follow the image's Haar-DWT detail map, each extended by a
+randomized Halo ring and a global-KV bridge (area-fix3).  At or below the
+native 1024 px extent it is a provable no-op.
 """
 
 import inspect
@@ -67,8 +67,9 @@ class AReA(io.ComfyNode):
     an automatically a no-op.
 
     ``model_type`` selects the backbone profile (``src.area_arch``): ``auto``
-    reads it off the model, and the three supported backbones — FLUX, Z-Image
-    (Lumina2 / NextDiT) and Krea-2 (SingleStreamDiT) — share the same 16 px
+    reads it off the model, and the four supported backbones — FLUX, Z-Image
+    (Lumina2 / NextDiT), Krea-2 (SingleStreamDiT) and Qwen-Image-2.1
+    (QwenImage21Transformer2DModel) — share the same 16 px
     patch grid, so one width/height pair serves any of them.  ``phase1_mode``
     and ``pooling`` default to ``auto``, which the engine resolves per
     backbone: on Z-Image the switch is the schedule-aware ``sigma`` mode (the
@@ -78,7 +79,9 @@ class AReA(io.ComfyNode):
     schedules only and are ignored on a long one: ``bridge_floor_steps``
     exempts the leading fine steps from the cost cap (they keep the paper's
     full bridge and halo), ``window_start`` / ``window_hold_steps`` reshape the
-    window ramp.
+    window ramp.  ``phase1_steps`` is authoritative below the short schedule's
+    heal cap (``total_steps - 2``); the forward-time log prints the knob, the
+    cap and the EFFECTIVE coarse count once per schedule.
     """
 
     @classmethod
@@ -87,11 +90,11 @@ class AReA(io.ComfyNode):
             node_id="AReA",
             display_name="AReA",
             category="WMNodes/image",
-            description="AReA (arXiv 2610.17227). Replaces FLUX / Z-Image / Krea-2 image self-attention with a time-dependent attention graph: coarse cross-scale attention on leading steps, DWT-guided windowed attention (Halo + bridge tokens) on the rest. Training-free; a no-op at or below 1024 px.",
+            description="AReA (arXiv 2610.17227). Replaces FLUX / Z-Image / Krea-2 / Qwen-Image-2.1 image self-attention with a time-dependent attention graph: coarse cross-scale attention on leading steps, DWT-guided windowed attention (Halo + bridge tokens) on the rest. Training-free; a no-op at or below 1024 px.",
             inputs=[
                 io.Model.Input(
                     "model",
-                    tooltip="The model to patch with AReA. FLUX, Z-Image (Lumina2) and Krea-2 share the same 16 px patch grid, so the same width/height serve any of them.",
+                    tooltip="The model to patch with AReA. FLUX, Z-Image (Lumina2), Krea-2 and Qwen-Image-2.1 share the same 16 px patch grid, so the same width/height serve any of them.",
                 ),
                 io.Int.Input(
                     "width",
@@ -105,9 +108,9 @@ class AReA(io.ComfyNode):
                 ),
                 io.Combo.Input(
                     "model_type",
-                    options=["auto", "flux", "zimage", "krea2"],
+                    options=["auto", "flux", "zimage", "krea2", "qwen21"],
                     default="auto",
-                    tooltip="Specify the model architecture. 'auto' usually works. FLUX and Z-Image (Lumina2 / NextDiT) share a 16 px patch grid, so the same width/height serve either; Krea-2 (SingleStreamDiT) uses the same 16 px token grid (ASSUMED — its VAE downscale is unverified, so a 16x VAE would make its token 32 px) and needs no padding; Nunchaku's fused kernels bypass the attention seam, so it is reported unchanged.",
+                    tooltip="Specify the model architecture. 'auto' usually works. FLUX and Z-Image (Lumina2 / NextDiT) share a 16 px patch grid, so the same width/height serve either; Krea-2 (SingleStreamDiT) uses the same 16 px token grid (ASSUMED — its VAE downscale is unverified, so a 16x VAE would make its token 32 px) and needs no padding; Qwen-Image-2.1 (QwenImage21Transformer2DModel) uses the same 16 px token grid (MEASURED — its latent format downsamples 16x and 2.1 does not patchify) and pads nothing, and AReA switches its prefix K/V cache off on its own clone (the cached path is indistinguishable from the image segment, so with the cache on AReA would engage on no call at all); Nunchaku's fused kernels bypass the attention seam, so it is reported unchanged.",
                 ),
                 io.Boolean.Input(
                     "enable_area",
@@ -119,7 +122,7 @@ class AReA(io.ComfyNode):
                 io.Int.Input(
                     "phase1_steps",
                     default=PHASE1_STEPS, min=0, max=100, step=1,
-                    tooltip="Number of leading denoising steps that run Phase I (coarse cross-scale attention), clamped to the total step count. 8 = the reference's FLUX constant (of 28). 0 = all Phase II (windowed attention from the first step). Only read when phase1_mode is 'steps'. Z-Image Turbo runs short (8-step) schedules: use 1-3 there (or sigma mode) — 8 of an 8-step run pools every step, which the distilled sampler cannot re-detail.",
+                    tooltip="Number of leading denoising steps that run Phase I (coarse cross-scale attention), clamped to the total step count. 8 = the reference's FLUX constant (of 28). 0 = all Phase II (windowed attention from the first step). Only read when phase1_mode is 'steps'. Z-Image Turbo runs short (8-step) schedules: use 1-3 there (or sigma mode) — 8 of an 8-step run pools every step, which the distilled sampler cannot re-detail. On a SHORT schedule the effective coarse steps are capped at total_steps - 2 (two fine steps must remain, or the pooling footprint never heals): the forward-time log prints the knob, the cap and the effective count once per schedule, so a capped run is readable and the knob stays authoritative below the cap.",
                 ),
                 io.Combo.Input(
                     "phase1_mode",

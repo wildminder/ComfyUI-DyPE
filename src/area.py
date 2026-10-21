@@ -545,6 +545,34 @@ def _area_schedule(rt: _AreaRuntime, h: int, w: int, total: int, phase1: int,
     return schedule
 
 
+def _announce_effective_coarse(rt: _AreaRuntime, key: tuple, total: int,
+                               cap: Optional[int], effective: int) -> None:
+    """The EFFECTIVE coarse-step count of a schedule — ONCE per schedule (Q10).
+
+    The user's knob and the schedule the run really follows are two different
+    numbers whenever the heal cap bites (a short schedule keeps at least two
+    fine steps, or the pooling footprint never heals), and a SILENTLY
+    overridden knob is unreadable — the Krea-2 lesson (v).  The line names all
+    of them: the knob, the schedule total, the cap, the effective coarse count
+    and the effective fine count.
+
+    The cap is reported as ``n/a`` on a long schedule, where the heal rule
+    does not apply at all.  The line is emitted when the schedule is first
+    resolved and never again for the same one (the key is the schedule's own
+    cache key), so a 28-step run logs one line, not twenty-eight.
+    """
+    if key in rt.announced:
+        return
+    rt.announced.add(key)
+    logger.info(
+        "AReA: effective coarse count %d of %d steps (phase1_steps knob %d, "
+        "heal cap %s, effective fine count %d)",
+        int(effective), int(total), int(rt.config.phase1_steps),
+        "n/a" if cap is None else str(int(cap)),
+        max(0, int(total) - int(effective)),
+    )
+
+
 def _phase1_count(rt: _AreaRuntime, opts: dict) -> int:
     """How many leading steps of this run are Phase I — the node's switch.
 
@@ -2653,6 +2681,7 @@ def _area_resolve_forward(rt: _AreaRuntime, params: dict) -> AreaContext:
         px = int(rt.profile.px_per_patch) if rt.profile is not None else PATCH_PX
         _warn_grid_adjusted(h, w, w * px, h * px, factor)
     phase1 = _phase1_count(rt, opts)
+    cap = None
     if is_short_schedule(total):
         # The "+2 healing rule" (area-fix2): an Euler step only displaces the
         # latent by 15-25% of its trajectory, so fewer than two fine steps
@@ -2669,8 +2698,13 @@ def _area_resolve_forward(rt: _AreaRuntime, params: dict) -> AreaContext:
                 phase1, max_allowed_phase1, total,
             )
             phase1 = max_allowed_phase1
+        cap = max_allowed_phase1
     cfg = rt.config
     schedule = _area_schedule(rt, h, w, total, phase1, ctx.txt_len)
+    # The EFFECTIVE coarse-step count, announced once per schedule (Q10): the
+    # knob, the cap and what the run really does, so a capped run is readable.
+    _announce_effective_coarse(rt, _schedule_key(rt, h, w, total, phase1, ctx.txt_len),
+                               total, cap, phase1)
     phase, size = schedule.at(step)
     ctx.phase, ctx.size, ctx.step, ctx.h, ctx.w = phase, size, step, h, w
     # The schedule length rides on the context so the layout builder can tell a
