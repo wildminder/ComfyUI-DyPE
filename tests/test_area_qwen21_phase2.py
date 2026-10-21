@@ -383,6 +383,79 @@ def _lumina_seam():
 
 
 @pytest.mark.mock_integration
+def test_the_flux_zimage_and_krea_goldens_do_not_move():
+    """The five golden hashes are RE-DERIVED here — an explicit gate.
+
+    S7's ``text_keys_only`` keyword touches the SHARED code path, so any
+    change to the FLUX / Z-Image numerics has to fail HERE, in the 2.1
+    batch — not only in the other backbones' own files.  The recipe and the
+    harnesses are the repo's own (``tests/test_area_flux_identity.py`` does
+    the same derivation).
+    """
+    for tag, side, step in (("flux80_coarse", 1280, 0),
+                            ("flux80_fine", 1280, 27),
+                            ("flux160_coarse", 2560, 0)):
+        with _flux_seam():
+            m = apply_area_to_model(flux.mock_flux_model(), "flux", side, side,
+                                    phase1_steps=8, seed=7)
+            try:
+                sim, _out = flux._run_forward(m, step=step, side=side)
+            finally:
+                restore_area_attention_hook(m)
+            assert _hash(sim.calls[0]) == fallback.GOLDENS[tag], tag
+    for tag, step in (("zimage65_coarse", 0), ("zimage65_fine", 27)):
+        with _lumina_seam():
+            m = apply_area_to_model(zimage.mock_zimage_model(), "zimage",
+                                    zimage.WIDTH, zimage.HEIGHT,
+                                    phase1_steps=zimage.PHASE1, seed=3)
+            try:
+                _sim, out = zimage._run_forward(m, step=step)
+            finally:
+                restore_area_attention_hook(m)
+            assert _hash(out) == fallback.GOLDENS[tag], tag
+
+
+@pytest.mark.mock_integration
+def test_the_krea_goldens_do_not_move():
+    """The Krea-2 goldens: the shape-aware bridge count and the CONTINUOUS
+    block positions (the 32 px ripple fix).
+
+    2.1 reuses both (its profile is shape-aware too, and its pooled keys sit
+    on their block's centroid), so they are re-asserted here as well.
+    """
+    grid_h, grid_w, f, txt = 125, 32, 2, 32
+    # the shape-aware bridge count: a quarter of the window's own content
+    assert bridge_registers(64, 0.5) == 1024                    # the square one
+    assert bridge_registers(64, 0.5, grid_h, grid_w) == 512      # the window's shape
+    assert KREA_PROFILE.bridge_shape_aware is True
+    assert FLUX_PROFILE.bridge_shape_aware is False
+    assert ZIMAGE_PROFILE.bridge_shape_aware is False
+    # the continuous block positions: the queries keep row/f (NOT row//f) and
+    # the pooled key sits on its block's centroid
+    class _Spy(torch.nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.calls = []
+
+        def forward(self, ids):
+            self.calls.append(ids)
+            return torch.full((1, 1, ids.shape[1], 3, 2, 2), float(len(self.calls)))
+
+    layout = krea_layout(txt_len=txt, h=grid_h, w=grid_w,
+                         stream_len=txt + grid_h * grid_w)
+    spy = _Spy()
+    coarse_ropes_krea(spy, layout, f, torch.device("cpu"))
+    q_ids, kv_ids = spy.calls
+    q_rows = q_ids[0, txt:, 1].reshape(grid_h, grid_w)
+    assert torch.allclose(q_rows[:, 0], torch.arange(grid_h, dtype=torch.float32) / f)
+    kv_rows = kv_ids[0, txt:, 1]
+    nh, nw = coarse_grid(grid_h, grid_w, f)
+    for block in range(nh * nw):
+        r, c = divmod(block, nw)
+        cells = q_rows[r * f:(r + 1) * f, c * f:(c + 1) * f]
+        assert abs(float(kv_rows[block]) - float(cells.mean())) < 1e-6
+
+
 def test_a_missing_img_in_disables_phase2_only(seam):
     """N9 — without ``img_in`` there is no detail map: Phase II is off."""
     assert test_a_missing_img_in_delegates_phase2 is not None

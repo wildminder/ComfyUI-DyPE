@@ -77,6 +77,22 @@ class TestTheQwen21Profile:
         with pytest.raises(ValueError, match="qwen21"):
             resolve_area_arch(_Flux(), "qwen21")
 
+    def test_the_auto_dispatch_picks_qwen21(self):
+        """``model_type="auto"`` on a 2.1 model resolves the 2.1 profile.
+
+        The dispatch table keys on the backbone's CLASS NAME
+        (``src/model_detect.py:49-51``), so the auto probe has to answer
+        "qwen21" for a 2.1 model — and NOT flux / zimage / krea2, whose
+        geometry would pool the wrong tokens.
+        """
+        model = QwenImage21Transformer2DModel()
+        assert resolve_model_type(model, "auto") == "qwen21"
+        assert resolve_area_arch(model, "auto") is QWEN21_PROFILE
+        # ... and it is the 2.1 profile, not one of the other three
+        assert resolve_area_arch(model, "auto") not in (
+            FLUX_PROFILE, ZIMAGE_PROFILE, KREA_PROFILE)
+
+
 class TestTheOtherProfiles:
     def test_flux_still_resolves(self):
         assert resolve_area_arch(_Flux(), "auto") is FLUX_PROFILE

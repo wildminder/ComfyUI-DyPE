@@ -346,6 +346,85 @@ E2E_PHASE1 = 2
 
 
 @pytest.mark.mock_integration
+def test_a_full_mock_forward_runs_and_keeps_the_text_segment_pristine():
+    """A WHOLE Qwen-Image-2.1 forward through the patched seam.
+
+    32 blocks x 2 segments = 64 seam calls: the 32 IMAGE-segment calls went
+    through AReA (the pooled, coarse attention) and the 32 caption-segment
+    calls are the model's own, bit for bit.
+    """
+    with qwen21_backend_module() as backend:
+        pristine = backend.optimized_attention
+        dm = QwenImage21Transformer2DModel(layers=E2E_LAYERS, seed=5)
+        source = ModelPatcher()
+        source.model.diffusion_model = dm
+        source.model.model_sampling = types.SimpleNamespace()
+        patched = area.apply_area_to_model(
+            source, "auto", E2E_W * 16, E2E_H * 16,
+            phase1_steps=E2E_PHASE1, seed=7)
+        # The spy goes IN FRONT of AReA's wrapper, so it records the calls the
+        # MODEL made — the image segment's AReA'd answer included.
+        recorder, restore = install_recorder()
+        outputs = []
+
+        def spy(*args, **kwargs):
+            out = recorder(*args, **kwargs)
+            outputs.append(out)
+            return out
+
+        backend.optimized_attention = spy
+        try:
+            sigmas = torch.linspace(1.0, 0.0, E2E_STEPS + 1)
+            gen = torch.Generator().manual_seed(7)
+            latent = torch.randn(1, dm.channels, E2E_H, E2E_W, generator=gen)
+            context = torch.randn(1, E2E_TXT, dm.txt_in.in_features, generator=gen)
+
+            def model_function(x, timestep, **c):
+                return dm(x, timestep, context=c["context"],
+                          transformer_options=c.get("transformer_options") or {})
+
+            wrapper = _unet_wrapper(patched)
+            assert wrapper is not None
+            params = {
+                "input": latent,
+                "timestep": torch.tensor([float(sigmas[0])]),
+                "c": {"context": context, "c_crossattn": context,
+                      "transformer_options": {"sample_sigmas": sigmas,
+                                              "sigmas": sigmas[0]}},
+            }
+            out = wrapper(model_function, params)
+        finally:
+            restore()
+            area.restore_area_attention_hook(patched)
+
+    # the forward produced the model's own answer
+    assert out.shape == (1, dm.channels, E2E_H, E2E_W)
+    # 32 blocks x 2 segments
+    assert len(recorder.calls) == 2 * E2E_LAYERS
+    assert len(outputs) == len(recorder.calls)
+    image_calls = recorder.image_calls()
+    caption_calls = recorder.caption_calls()
+    assert len(image_calls) == E2E_LAYERS
+    assert len(caption_calls) == E2E_LAYERS
+    # the caption segment is the model's own, bit for bit; the image segment
+    # is AReA's, NOT the model's dense attention
+    for index, (call, answer) in enumerate(zip(recorder.calls, outputs)):
+        dense = pristine(call.q, call.k, call.v, call.heads, mask=call.mask)
+        if call.mask is None:                       # the image segment
+            # AReA's pooled answer is NOT the model's dense attention.  The
+            # mock's weights are scaled by 0.05, so the answers collapse with
+            # depth (1e-7 in the first block, 1e-32 in the last): the check
+            # is EXACT for every block (a delegate would hand back the
+            # pristine's bit-identical answer) and RELATIVE for the first
+            # one, where the numbers are still readable.
+            assert not torch.equal(answer, dense)
+            if index < 2:
+                assert not torch.allclose(answer, dense, rtol=1e-2, atol=0.0)
+            assert answer.shape == (1, E2E_H * E2E_W, dm.heads * dm.head_dim)
+        else:                                      # the caption segment
+            assert torch.equal(answer, dense)
+
+
 def test_the_phase1_output_shape_matches_the_pristine(seam):
     """The answer keeps comfy's own layout: ``[b, n, heads*dim]``."""
     backend, calls, pristine = seam
