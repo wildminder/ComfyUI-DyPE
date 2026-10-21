@@ -554,21 +554,6 @@ class TestAutoDefaults:
 
 @pytest.mark.unit
 class TestApplyGates:
-    def test_non_flux_raises_actionable_error(self, flux_layers):
-        class MockQwen21(MockFluxDiT):
-            pass
-
-        MockQwen21.__name__ = "QwenImage21Transformer2DModel"
-        m = mock_flux_model()
-        m.model.diffusion_model = MockQwen21()
-        with pytest.raises(ValueError, match="FLUX only"):
-            apply_area_to_model(m, "auto", WIDTH, HEIGHT)
-        # the message names the offender and the remedy (house rule)
-        with pytest.raises(ValueError, match="qwen21"):
-            apply_area_to_model(m, "auto", WIDTH, HEIGHT)
-        with pytest.raises(ValueError, match="SPA / DyPE / SEGA"):
-            apply_area_to_model(m, "auto", WIDTH, HEIGHT)
-
     def test_nunchaku_warns_and_returns_the_clone_unchanged(self, flux_layers, caplog):
         source = mock_flux_model()
         with caplog.at_level(logging.WARNING, logger="ComfyUI-DyPE"):
@@ -1117,3 +1102,15 @@ class TestBridgeFloorWarning:
             assert not self._warned()
         finally:
             area._warned.clear()
+
+def test_non_flux_raises_actionable_error(flux_layers):
+    """A backbone AReA does not support is a loud, actionable refusal.
+
+    Qwen-Image 1.0 is the case: the node supports 2.1, not 1.0, so the
+    refusal names the offender AND the remedy (house rule).
+    """
+    m = mock_flux_model()
+    with pytest.raises(ValueError, match="AReA supports FLUX"):
+        apply_area_to_model(m, "qwen", WIDTH, HEIGHT)
+    with pytest.raises(ValueError, match="SPA / DyPE / SEGA"):
+        apply_area_to_model(m, "qwen", WIDTH, HEIGHT)

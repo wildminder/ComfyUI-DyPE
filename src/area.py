@@ -7,8 +7,9 @@ and :mod:`src.area_attn` instead of dense attention.  The node
 (``nodes/area.py``) is a thin schema/execute shell over
 :func:`apply_area_to_model`.
 
-**Three seams, one engine.**  FLUX, Z-Image (Lumina2) and Krea-2 are different
-backbones with different seams, so :func:`apply_area_to_model` resolves an
+**Four seams, one engine.**  FLUX, Z-Image (Lumina2), Krea-2 and
+Qwen-Image-2.1 are different backbones with different seams, so
+:func:`apply_area_to_model` resolves an
 :class:`~src.area_arch._ArchProfile` once and installs exactly one of them:
 
 * FLUX — the bound ``attention`` of ``comfy.ldm.flux.layers`` (below);
@@ -39,6 +40,20 @@ backbones with different seams, so :func:`apply_area_to_model` resolves an
   quantized/fused attention kernel bypasses the seam altogether, so the install proves
   the model's own attention class still resolves the symbol and leaves the model
   UNCHANGED when it does not.
+* Qwen-Image-2.1 — the bound ``optimized_attention`` of
+  ``comfy.ldm.qwen_image21.model`` (``comfy/ldm/qwen_image21/model.py:15`` binds
+  the name, ``:211`` calls it), a single-stream MMDiT with a BLOCK-CAUSAL
+  stream: the caption is a segment of its own and the image another, and the
+  image segment's queries are the ``h*w`` image rows while its keys are the
+  JOINT set — the caption AND the image (``model.py:206-208``), so the
+  eligible call has NO text queries at all.  The seam's input is 3-D
+  (``[b, n, heads*dim]``, read head-major) and the ``mask`` KEYWORD's
+  presence separates the plain path from the length-indistinguishable
+  prefix-cache path (``model.py:222``), so the wrapper's ``mask`` default is
+  the ``QWEN21_NO_MASK`` sentinel.  The qwen-2.1 adapter
+  (:mod:`src.area_qwen21`) owns the geometry, the ids and the rope capture;
+  this module owns the ref-counted install, the per-forward state and the
+  Phase I computation (``_qwen21_attention``).
 
 Phase I ("coarse") pools image K/V to one token per ``f x f`` block and runs
 cross-scale attention on a coarse rope grid while the queries stay at full
@@ -144,6 +159,7 @@ from .area_attn import (
 from .area_arch import (
     FLUX_PROFILE,
     KREA_PROFILE,
+    QWEN21_PROFILE,
     ZIMAGE_PROFILE,
     _ArchProfile,
     resolve_area_arch,
@@ -159,6 +175,22 @@ from .area_krea import (
     krea_layout,
     krea_squeeze_latent,
     krea_stream_eligible,
+)
+from .area_qwen21 import (
+    QWEN21_HEADS,
+    QWEN21_NO_MASK,
+    QWEN21_SEAM_MODULE,
+    QWEN21_SEAM_SYMBOL,
+    Qwen21RopeRecorder,
+    capture_qwen21_table,
+    coarse_ropes_qwen21,
+    qwen21_head_geometry,
+    qwen21_layout,
+    qwen21_latent_grid,
+    qwen21_peek,
+    qwen21_segment_eligible,
+    qwen21_slice_table,
+    qwen21_to_heads,
 )
 from .area_rope import flux_style_ids
 from .area_schedule import (
@@ -328,7 +360,7 @@ class _AreaRuntime:
     """
 
     __slots__ = ("config", "dm", "profile", "ctx", "hidden", "ropes", "schedules",
-                 "block", "recorder", "joint")
+                 "block", "recorder", "joint", "img_in_calls", "announced")
 
     def __init__(self, config: AreaConfig, dm, profile: Optional[_ArchProfile] = None):
         self.config = config
@@ -341,6 +373,15 @@ class _AreaRuntime:
         self.block = 0
         self.recorder: Optional[ZImageRopeRecorder] = None
         self.joint = None
+        #: How many times the backbone's image embedder fired in this forward.
+        #: Qwen-Image-2.1's ``img_in`` is called ONCE PER IMAGE (the target
+        #: last, ``comfy/ldm/qwen_image21/model.py:319``), so a count above one
+        #: means the forward carries reference latents (D6).
+        self.img_in_calls = 0
+        #: The schedules whose EFFECTIVE coarse-step count was already
+        #: announced — the log line is emitted ONCE per schedule, not once per
+        #: step (:func:`_announce_effective_coarse`).
+        self.announced = set()
 
 
 #: The runtime of the FLUX forward currently running, read by the FLUX attention
@@ -357,6 +398,12 @@ _ZRUNTIME: Optional[_AreaRuntime] = None
 #: its runtime never reaches FLUX's or Z-Image's wrapper.  The unet wrapper
 #: assigns exactly one of the three per forward.
 _KRUNTIME: Optional[_AreaRuntime] = None
+
+#: The same for Qwen-Image-2.1 — a FOURTH seam, a fourth module and a fourth
+#: symbol (``comfy.ldm.qwen_image21.model``'s own bound ``optimized_attention``),
+#: so its runtime never reaches FLUX's, Z-Image's or Krea-2's wrapper.  The
+#: unet wrapper assigns exactly one of the four per forward.
+_QRUNTIME: Optional[_AreaRuntime] = None
 
 # Seam install bookkeeping: the patched module, the original symbol, the
 # ``img_in`` hook handle and the number of patchers consuming them.  A second
@@ -382,6 +429,15 @@ _ZSEAM = {"module": None, "attr": None, "orig": None, "hook": None, "recorder": 
 # ``pe_embedder`` and the image-embedder hook on ``first``), and ``recorder``
 # is the capture :func:`src.area_krea.capture_krea_table` built for it.
 _KSEAM = {"module": None, "attr": None, "orig": None, "hook": None, "recorder": None,
+          "consumers": 0}
+
+#: The Qwen-Image-2.1 twin — a FOURTH module and symbol
+#: (``comfy.ldm.qwen_image21.model``'s own bound ``optimized_attention``), so a
+#: FOURTH ref-count: the four installs never share one.  ``hook`` holds every
+#: handle this install registered on the first consumer's diffusion model (the
+#: rope capture on ``pe_embedder``), and ``recorder`` is the capture
+#: :func:`src.area_qwen21.capture_qwen21_table` built for it.
+_QSEAM = {"module": None, "attr": None, "orig": None, "hook": None, "recorder": None,
           "consumers": 0}
 
 
@@ -445,6 +501,20 @@ def _area_locate(sigmas, current) -> tuple[Optional[int], Optional[int]]:
         return None, None
 
 
+def _schedule_key(rt: _AreaRuntime, h: int, w: int, total: int, phase1: int,
+                   txt_len: int) -> tuple:
+    """The cache key of ONE schedule — the reference's key plus the A4 knobs.
+
+    Shared by :func:`_area_schedule` (the cache) and
+    :func:`_announce_effective_coarse` (the once-per-schedule log line), so
+    the line is emitted exactly once per cached schedule and never twice for
+    the same one.
+    """
+    cfg = rt.config
+    return (h, w, int(total), max(0, int(phase1)), int(txt_len), cfg.window_start,
+            cfg.window_hold_steps, cfg.delay)
+
+
 def _area_schedule(rt: _AreaRuntime, h: int, w: int, total: int, phase1: int,
                    txt_len: int) -> AreaSchedule:
     """The schedule of one canvas, cached per ``(h, w, total, phase1, txt_len)``.
@@ -461,13 +531,12 @@ def _area_schedule(rt: _AreaRuntime, h: int, w: int, total: int, phase1: int,
     key — the floor is applied per step by the layout builder, so it never
     changes the schedule (the resolution that produced it is irrelevant to it).
     """
-    cfg = rt.config
-    phase1 = max(0, int(phase1))
-    key = (h, w, total, phase1, txt_len, cfg.window_start, cfg.window_hold_steps,
-           cfg.delay)
+    key = _schedule_key(rt, h, w, total, phase1, txt_len)
     schedule = rt.schedules.get(key)
     if schedule is None:
-        schedule = build_schedule(h, w, total, phase1, cfg.native, txt_len=txt_len,
+        cfg = rt.config
+        schedule = build_schedule(h, w, total, max(0, int(phase1)), cfg.native,
+                                  txt_len=txt_len,
                                   window_start=cfg.window_start,
                                   window_hold_steps=cfg.window_hold_steps,
                                   delay=cfg.delay)
@@ -563,8 +632,16 @@ def _area_coarse_ropes(rt: _AreaRuntime, h: int, w: int, f: int, txt_len: int,
 
 
 def _area_fine_layout(rt: _AreaRuntime, ctx: AreaContext, k_img: torch.Tensor,
-                      hook_name: Optional[str] = None) -> Optional[FineLayout]:
-    """Build (once per step) the Phase II layout — the reference's ``_after_embedding``."""
+                      hook_name: Optional[str] = None,
+                      energy=None) -> Optional[FineLayout]:
+    """Build (once per step) the Phase II layout — the reference's ``_after_embedding``.
+
+    ``energy`` is the detail map, when the caller has already built it (the
+    Qwen-Image-2.1 path: the adapter owns 2.1's grid, so the map is built by
+    :func:`~src.area_qwen21.qwen21_detail_map` and handed over).  Without one
+    the map is derived here from the hooked hook's output — or, when that hook
+    never fired, from the projected image keys (the fallback below).
+    """
     layout = ctx.data.get("layout")
     if layout is not None:
         return layout
@@ -577,19 +654,20 @@ def _area_fine_layout(rt: _AreaRuntime, ctx: AreaContext, k_img: torch.Tensor,
         # ``first`` (``comfy/ldm/krea2/model.py:333``).
         hook_name = ("diffusion_model.first" if rt.profile is KREA_PROFILE
                      else "diffusion_model.img_in")
-    if hidden is None:
-        # Fallback: the detail map is derived from the post-norm projected image
-        # keys instead of the hooked hook's output (see the module docstring).
-        _warn_once(
-            "no-img-in",
-            "AReA: %s could not be hooked, so the Phase II detail map is derived "
-            "from the projected image keys of the first fine call. Results differ "
-            "slightly from a hooked model.",
-            hook_name,
-        )
-        # [b, heads, n, d] -> [b, n, heads*d], the img_in output's layout
-        hidden = k_img.transpose(1, 2).reshape(*k_img.shape[:1], k_img.shape[2], -1)
-    energy = detail_map(hidden, h, w)
+    if energy is None:
+        if hidden is None:
+            # Fallback: the detail map is derived from the post-norm projected image
+            # keys instead of the hooked hook's output (see the module docstring).
+            _warn_once(
+                "no-img-in",
+                "AReA: %s could not be hooked, so the Phase II detail map is derived "
+                "from the projected image keys of the first fine call. Results differ "
+                "slightly from a hooked model.",
+                hook_name,
+            )
+            # [b, heads, n, d] -> [b, n, heads*d], the img_in output's layout
+            hidden = k_img.transpose(1, 2).reshape(*k_img.shape[:1], k_img.shape[2], -1)
+        energy = detail_map(hidden, h, w)
     w_min = min(cfg.native, max(h, w))
     # Window integrity on short (distilled) schedules (area-fix2 mechanism 3):
     # an 8-step model has not composed anything yet at sigma ~ 0.8, so the DWT
@@ -1654,6 +1732,416 @@ def _krea_install_seam(m, dm) -> bool:
     return True
 
 
+# ---------------------------------------------------------------------------
+# The Qwen-Image-2.1 seam
+# ---------------------------------------------------------------------------
+
+
+def _qwen21_pristine(bound):
+    """The pristine symbol behind ``bound`` — an AReA wrapper carries its own.
+
+    A re-apply after a patcher clone, or an install whose ref-count bookkeeping
+    was reset underneath it, can find our own wrapper still bound with no
+    recorded original.  The wrapper stows the symbol it wrapped
+    (``_area_orig``), so the pristine is recoverable instead of wrapping our
+    own wrapper (the ``_krea_pristine`` pattern).
+    """
+    if not getattr(bound, "_area_wrapper", False):
+        return bound
+    orig = getattr(bound, "_area_orig", None)
+    if orig is None:
+        raise ValueError(
+            f"AReA: {QWEN21_SEAM_MODULE}.{QWEN21_SEAM_SYMBOL} is an AReA wrapper "
+            "with no recorded pristine symbol, so the Qwen-Image-2.1 attention "
+            "seam cannot be installed safely. Restart ComfyUI to clear it."
+        )
+    return orig
+
+
+def _qwen21_delegate(orig, q, k, v, heads, mask, attn_precision, skip_reshape,
+                     skip_output_reshape, kw, cls=None):
+    """Hand the call back to the pristine symbol, UNTOUCHED.
+
+    Nothing is consumed here: the containers reach the pristine symbol exactly
+    as the model built them, so a delegating call is bit-identical to the
+    unpatched model.  (The opposite mistake — taking a container and handing
+    the taken tensor back — is the v2.19.1 crash class, ``src/area.py:652-660``.)
+
+    ``cls`` re-wraps the tensors in FRESH containers: it is used when the
+    engine has already taken the containers and then declined to compute (a
+    missing rope table), so the pristine symbol still receives containers it
+    can consume — a taken container must never be re-wrapped, and a raw tensor
+    would make comfy's ``wrap_attn`` skip the take entirely
+    (``comfy/ldm/modules/attention.py:215-253``).
+
+    The ``mask`` SENTINEL (``QWEN21_NO_MASK``) is the prefix-cache path's
+    "no keyword at all"; the pristine's own default for ``mask`` is ``None``
+    (``comfy/ldm/modules/attention.py:256``), so the call is the same one.
+    """
+    if cls is not None:
+        q, k, v = cls(q), cls(k), cls(v)
+    if mask is QWEN21_NO_MASK:
+        mask = None
+    return orig(q, k, v, heads, mask=mask, attn_precision=attn_precision,
+                skip_reshape=skip_reshape, skip_output_reshape=skip_output_reshape,
+                **kw)
+
+
+def _make_qwen21_wrapper(orig):
+    """Wrap the Qwen-Image-2.1 ``optimized_attention`` seam so AReA replaces it.
+
+    The signature mirrors comfy's own
+    ``(q, k, v, heads, mask=None, attn_precision=None, skip_reshape=False,
+    skip_output_reshape=False, **kwargs)``
+    (``comfy/ldm/modules/attention.py:255``) and the model's own call
+    (``comfy/ldm/qwen_image21/model.py:211``): ``heads`` is the FOURTH
+    POSITIONAL slot and 2.1 passes ``mask`` / ``transformer_options`` /
+    ``preferred_attention`` as keywords.
+
+    **``mask`` carries a SENTINEL default** (``QWEN21_NO_MASK``): the plain
+    path ALWAYS passes the keyword and the prefix-cache path NEVER does
+    (``model.py:222``), and the two are length-indistinguishable — the cached
+    key is ``txt_len + h*w`` over ``h*w`` queries, exactly the plain image
+    segment's signature.  Only the keyword's PRESENCE tells them apart, so
+    the absent case needs a value of its own (``None`` is a legal mask).
+
+    The seam's q/k/v are **3-D** ``[b, n, heads*dim]`` (2.1 flattens
+    ``(B, n, H, D)`` itself, ``model.py:206-208``) and arrive **rotated** (the
+    model applies its own rope before the call, ``model.py:99-100``); the
+    answer is the FLATTENED ``[b, n, heads*dim]`` (``model.py:212``
+    concatenates the per-segment answers on dim 1).
+    """
+    def optimized_attention(q, k, v, heads, mask=QWEN21_NO_MASK, attn_precision=None,
+                            skip_reshape=False, skip_output_reshape=False, **kw):
+        rt = _QRUNTIME
+        ctx = None if rt is None else rt.ctx
+        if ctx is None or ctx.phase is None:
+            # No forward of ours, or a plain-attention step: delegate untouched.
+            return _qwen21_delegate(orig, q, k, v, heads, mask, attn_precision,
+                                    skip_reshape, skip_output_reshape, kw)
+        layout = _qwen21_layout_for(rt, q, k, heads, mask)
+        if layout is None:
+            # The caption segment (a causal mask), the prefix-cache path (NO
+            # mask keyword) or a foreign stream: the model gets its own
+            # attention back, untouched and with its containers alive.
+            return _qwen21_delegate(orig, q, k, v, heads, mask, attn_precision,
+                                    skip_reshape, skip_output_reshape, kw)
+        cls = type(q) if hasattr(q, "take") else None
+        q_t, k_t, v_t = _take(q), _take(k), _take(v)
+        out = _qwen21_attention(rt, ctx, layout, q_t, k_t, v_t, heads)
+        if out is None:
+            # The engine took the containers and then declined to compute: the
+            # pristine symbol gets FRESH containers around the same tensors.
+            return _qwen21_delegate(orig, q_t, k_t, v_t, heads, mask,
+                                    attn_precision, skip_reshape,
+                                    skip_output_reshape, kw, cls)
+        return out
+
+    optimized_attention._area_wrapper = True
+    optimized_attention._area_orig = orig
+    return optimized_attention
+
+
+def _qwen21_stream_len(x) -> Optional[int]:
+    """The sequence length of a seam argument, without consuming its container.
+
+    2.1's seam input is 3-D ``[b, n, heads*dim]`` (``model.py:206-208``), so
+    the sequence is axis 1 — unlike every other AReA seam, which sees 4-D.
+    """
+    tensor = qwen21_peek(x)
+    if torch.is_tensor(tensor) and tensor.ndim == 3:
+        return int(tensor.shape[1])
+    return None
+
+
+def _qwen21_to_heads(q, k, v, heads):
+    """The three seam tensors in the engine's layout, or ``None``.
+
+    A flat width that does not split into the seam's heads is a FOREIGN call
+    (N13): it is reported as ``None`` and the seam DELEGATES it, so a sampling
+    run is never aborted by an unknown variant of the backbone.
+    """
+    try:
+        return (qwen21_to_heads(q, heads), qwen21_to_heads(k, heads),
+                qwen21_to_heads(v, heads))
+    except ValueError as exc:
+        _warn_once("qwen21-heads", "AReA: %s", exc)
+        return None
+
+
+def _qwen21_model_geometry(dm) -> tuple[Optional[int], Optional[int]]:
+    """The backbone's own ``(head count, head dim)``, or ``(None, None)``.
+
+    2.1's constructor keeps neither ``num_attention_heads`` nor
+    ``attention_head_dim`` on the model (``model.py:236-251`` — only
+    ``inner_dim`` survives), but every attention block carries its head count
+    (``model.py:73`` — ``self.heads = heads``) and the head dim follows from
+    ``inner_dim // heads``.  The mock harness keeps the head count on the model
+    itself (``tests/_qwen21_seam_fixtures.py``).
+
+    The pair is the N13 discriminator: a seam call whose head count (or head
+    width) is not the model's own belongs to an UNKNOWN VARIANT, and such a
+    call is DELEGATED — never engaged with, and never a reason to abort a
+    sampling run.
+    """
+    heads = getattr(dm, "heads", None)
+    if not (isinstance(heads, int) and heads > 0):
+        heads = None
+        blocks = getattr(dm, "transformer_blocks", None)
+        if blocks:
+            attn = getattr(blocks[0], "attn", None)
+            value = getattr(attn, "heads", None)
+            if isinstance(value, int) and value > 0:
+                heads = value
+    if heads is None:
+        return None, None
+    inner = getattr(dm, "inner_dim", None)
+    head_dim = None
+    if isinstance(inner, int) and inner > 0 and inner % heads == 0:
+        head_dim = inner // heads
+    return heads, head_dim
+
+
+def _qwen21_layout_for(rt: Optional[_AreaRuntime], q, k, heads, mask):
+    """The image segment's layout of THIS call, or ``None`` when it is not it.
+
+    2.1's forward reaches the seam three ways (the design's H2): the PLAIN
+    path (the caption segment with a causal mask, then the image segment with
+    ``mask=None``), the PREFIX pass (the caption segments only, also masked)
+    and the PREFIX-CACHE path (NO ``mask`` keyword at all, ``model.py:222``).
+    The cached path is LENGTH-INDISTINGUISHABLE from the plain image segment
+    (its key is ``txt_len + h*w`` over ``h*w`` queries), so only the keyword's
+    presence separates them — which is why the wrapper's ``mask`` default is
+    the ``QWEN21_NO_MASK`` sentinel.
+
+    An ineligible call is DELEGATED UNCHANGED, and — crucially — it does NOT
+    advance the block counter: the 32 blocks must be numbered 0..31 exactly as
+    the reference numbers its blocks, or every block's random pooling stream
+    would shift (the HAP bug class, ``src/spa.py:1033-1052``).
+    """
+    if rt is None or rt.ctx is None or rt.ctx.phase is None:
+        return None
+    ctx = rt.ctx
+    if ctx.h * ctx.w < 1 or ctx.txt_len < 1:
+        return None
+    q_len = _qwen21_stream_len(q)
+    k_len = _qwen21_stream_len(k)
+    if q_len is None or k_len is None:
+        return None
+    # N13 — the head geometry must be the MODEL's own.  A flat width that does
+    # not split into the seam's heads, or a head count the model does not
+    # declare, is an UNKNOWN VARIANT: the call is DELEGATED here, BEFORE the
+    # containers are taken, so the pristine symbol still gets them alive and
+    # a sampling run is never aborted by a foreign call.
+    head_dim = qwen21_head_geometry(qwen21_peek(k), heads)
+    if head_dim is None:
+        return None
+    dm_heads, dm_head_dim = _qwen21_model_geometry(rt.dm)
+    if dm_head_dim is not None and head_dim != dm_head_dim:
+        return None
+    # The forward's whole sequence: the model's own rope table covers exactly
+    # the joint stream, so its length IS the total (``model.py:338``).
+    table = rt.recorder.table if rt.recorder is not None else None
+    total_len = int(table.shape[2]) if table is not None else None
+    if not qwen21_segment_eligible(mask, q_len, k_len, total_len, ctx.txt_len,
+                                    ctx.h, ctx.w, heads, dm_heads):
+        return None
+    try:
+        layout = qwen21_layout(ctx.txt_len, ctx.h, ctx.w, q_len, k_len)
+    except ValueError as exc:
+        # A stream that does not fit the segment geometry: refuse the pooling
+        # rather than guess, and say so once.
+        _warn_once("qwen21-layout", "AReA: %s", exc)
+        return None
+    return layout
+
+
+def _qwen21_coarse_ropes(rt: _AreaRuntime, layout, f: int, device):
+    """The two Phase I rope tables, cached per (canvas, factor).
+
+    2.1's own ids are neither FLUX- nor Z-Image-shaped: the caption rides a
+    DIAGONAL at the model's own running counter and the image's spatial axes
+    are CENTRED on the canvas (``comfy/ldm/qwen_image21/model.py:323``,
+    ``:330-332``), so the tables are built by the adapter through the model's
+    OWN embedder — a chained DyPE/SEGA embedder composes.
+
+    They are built LAZILY, here at the seam, and never at forward-resolve
+    time: the model's own table is the FIRST table of the forward (the
+    recorder keeps it and never overwrites it), so a resolve-time build would
+    be captured as the model's table.  The capture is PAUSED around the two
+    embedder calls, so the coarse tables are not mistaken for extra tables of
+    the forward.
+    """
+    embedder = getattr(rt.dm, "pe_embedder", None)
+    _warn_dynamic_embedder(embedder)
+    key = ("qcoarse", layout, f, str(device))
+    cached = rt.ropes.get(key)
+    if cached is not None:
+        return cached
+    try:
+        ropes = coarse_ropes_qwen21(embedder, layout, f, device, rt.recorder)
+    except ValueError as exc:
+        _warn_once("qwen21-ropes", "AReA: %s This forward runs plain attention.", exc)
+        return None
+    rt.ropes[key] = ropes
+    return ropes
+
+
+def _qwen21_attention(rt: _AreaRuntime, ctx: AreaContext, layout, q, k, v, heads):
+    """The AReA computation of one Qwen-Image-2.1 image segment, or ``None``.
+
+    q/k/v are the taken ``[b, n, heads*dim]`` tensors, read HEAD-MAJOR (2.1
+    flattens ``(B, n, H, D)`` itself, ``model.py:206-208``), and the model's
+    q/k arrive **rotated** (it applies its own rope before the call,
+    ``model.py:99-100``), so both phases start in the UNROTATED frame.
+
+    **Phase I** pools *unrotated* keys (pooling rotated keys would mix keys
+    rotated by different angles inside one block, ``src/area_attn.py:364-368``)
+    and rides the coarse tables, whose two sides have DIFFERENT lengths on 2.1
+    (the design's H5): ``rope_q`` covers the ``h*w`` IMAGE QUERIES only — the
+    eligible call has NO text queries — and ``rope_kv`` covers
+    ``txt_len + nh*nw`` rows, the caption at the model's own diagonal ids and
+    the pooled keys at their block's continuous centroid.  The caption's keys
+    are never pooled, so the prompt stays visible to the image queries.
+    """
+    table = rt.recorder.table if rt.recorder is not None else None
+    if table is None or table.shape[2] != layout.k_len:
+        _warn_once(
+            "qwen21-table",
+            "AReA: the captured Qwen-Image-2.1 rope table covers %s tokens but "
+            "the joint stream is %d, so the seam's rotation cannot be undone. "
+            "This call runs plain attention.",
+            "no" if table is None else int(table.shape[2]), layout.k_len,
+        )
+        return None
+    block = rt.block
+    rt.block += 1
+    t = layout.txt_len
+    heads_t = _qwen21_to_heads(q, k, v, heads)
+    if heads_t is None:
+        return None
+    q_h, k_h, v_h = heads_t
+    # The model rotated the WHOLE joint stream and sliced afterwards, so the
+    # image queries were rotated with the table's TRAILING rows and the joint
+    # key with its leading ones — the model's own table, sliced, is the exact
+    # inverse of that rotation.
+    q_unrot = unrotate1(q_h, qwen21_slice_table(table, t, layout.k_len))
+    k_unrot = unrotate1(k_h, qwen21_slice_table(table, 0, layout.k_len))
+    ropes = _qwen21_coarse_ropes(rt, layout, ctx.size, q.device)
+    if ropes is None:
+        return None
+    rope_q, rope_kv = ropes
+    k_pooled, v_pooled = pool_keys_values(
+        k_unrot, v_h, t, layout.h, layout.w, ctx.size, rt.config.pooling,
+        seed=rt.config.seed, step=ctx.step, block=block,
+    )
+    out = F.scaled_dot_product_attention(
+        apply_rope1(q_unrot, rope_q), apply_rope1(k_pooled, rope_kv), v_pooled
+    )
+    # comfy's own flatten: heads then head-dim, sequence back on axis 1
+    # (comfy/ldm/modules/attention.py:309-314).
+    b, n = out.shape[0], out.shape[2]
+    dim = out.shape[3]
+    return out.permute(0, 2, 1, 3).reshape(b, n, heads * dim)
+
+
+def _qwen21_seam_is_live(dm, wrapper) -> bool:
+    """Does the model's own backend module still call OUR seam symbol?
+
+    2.1 calls the seam from the MODULE-LEVEL ``block_causal_attention``
+    (``comfy/ldm/qwen_image21/model.py:197-213``) and
+    ``prefix_cached_attention`` (``:216-223``), which resolve the bound name
+    in the BACKEND MODULE's globals — so the check reads those globals: the
+    seam is live only when they resolve the symbol we just rebound (the
+    Nunchaku precedent, the ``_krea_seam_is_live`` pattern).  A quantized /
+    fused attention kernel replaces the call, so AReA would then be a SILENT
+    no-op.
+    """
+    import importlib
+
+    try:
+        mod = importlib.import_module(QWEN21_SEAM_MODULE)
+    except Exception:  # probe: the backend module is not importable here
+        return False
+    for name in ("block_causal_attention", "prefix_cached_attention"):
+        function = getattr(mod, name, None)
+        namespace = getattr(function, "__globals__", None)
+        if namespace is None:
+            continue
+        if namespace.get(QWEN21_SEAM_SYMBOL) is wrapper:
+            return True
+    return False
+
+
+def _qwen21_install_seam(m, dm):
+    """Patch ``comfy.ldm.qwen_image21.model.optimized_attention`` (ref-counted).
+
+    Returns ``True`` when the seam is live and ``False`` when the model must be
+    returned UNCHANGED — a quantized / fused attention kernel bypasses the seam
+    entirely, so AReA would be a silent no-op there (the Nunchaku precedent,
+    the ``_krea_install_seam`` pattern).
+
+    The symbol is process-global and shared by every patcher, so the install is
+    a module-global rebind plus a ref-count — the proven in-pack pattern
+    (``src/area.py``'s FLUX seam and ``src/spa.py:1341-1372``): comfy's
+    ``add_object_patch`` is a per-patch record re-applied around model use
+    (``comfy/model_patcher.py:739``), which would double-wrap a shared symbol on
+    every clone/re-apply.  A second AReA apply re-uses the wrapper instead of
+    wrapping our own wrapper, and the symbol is restored on the last release.
+    """
+    import importlib
+
+    if _QSEAM["orig"] is None:
+        try:
+            mod = importlib.import_module(QWEN21_SEAM_MODULE)
+        except Exception as exc:  # probe: backend module not importable here
+            raise ValueError(
+                f"AReA: cannot import {QWEN21_SEAM_MODULE} to patch the "
+                f"Qwen-Image-2.1 attention seam ({exc}). AReA supports FLUX, "
+                "Z-Image (Lumina2), Krea-2 and Qwen-Image-2.1; load an "
+                "unmodified Qwen-Image-2.1 checkpoint on a current ComfyUI."
+            ) from exc
+        bound = getattr(mod, QWEN21_SEAM_SYMBOL, None)
+        if bound is None:
+            raise ValueError(
+                f"AReA: {QWEN21_SEAM_MODULE}.{QWEN21_SEAM_SYMBOL} is missing in "
+                "this ComfyUI version, so the Qwen-Image-2.1 attention seam "
+                "cannot be installed. Update ComfyUI (or load an unmodified "
+                "Qwen-Image-2.1 model)."
+            )
+        orig = _qwen21_pristine(bound)
+        embedder = getattr(dm, "pe_embedder", None)
+        wrapper = _make_qwen21_wrapper(orig)
+        setattr(mod, QWEN21_SEAM_SYMBOL, wrapper)
+        if not _qwen21_seam_is_live(dm, wrapper):
+            # A fused / quantized attention class does not resolve the symbol:
+            # put the pristine symbol back and leave the model alone.
+            setattr(mod, QWEN21_SEAM_SYMBOL, orig)
+            _warn_once(
+                "qwen21-fused",
+                "AReA: this Qwen-Image-2.1 model's backend module does not call "
+                "optimized_attention (a quantized/fused attention kernel "
+                "bypasses the attention seam), so AReA would be a silent no-op; "
+                "returning the model UNCHANGED. Use a non-quantized "
+                "Qwen-Image-2.1 loader.",
+            )
+            return False
+        _QSEAM.update(module=mod, attr=QWEN21_SEAM_SYMBOL, orig=orig)
+        handles = []
+        hook, recorder = capture_qwen21_table(embedder)
+        handles.append(hook.handle)
+        # The Phase II detail map's source is not hooked yet.
+        _QSEAM["recorder"] = recorder
+        _QSEAM["hook"] = tuple(handles)
+    _QSEAM["consumers"] += 1
+    m._area_seam_consumer = True
+    m._area_seam = "qwen21"
+    # The capture is process-wide for this install (its hook is registered once,
+    # on the first consumer's embedder), so a later consumer re-uses it rather
+    # than building a second recorder the registered hook never feeds.
+    return True
+
+
 def _area_install_seam(m, dm, profile):
     """Patch the backbone's bound attention seam and hook the model (ref-counted).
 
@@ -1667,6 +2155,8 @@ def _area_install_seam(m, dm, profile):
         return _zimage_install_seam(m, dm)
     if profile is KREA_PROFILE:
         return _krea_install_seam(m, dm)
+    if profile is QWEN21_PROFILE:
+        return _qwen21_install_seam(m, dm)
     import importlib
 
     if _SEAM["orig"] is None:
@@ -1776,6 +2266,20 @@ def _area_resolve_forward(rt: _AreaRuntime, params: dict) -> AreaContext:
         rt.recorder.reset()
         rt.recorder.armed = True
         rt.joint = None
+    if rt.profile is QWEN21_PROFILE:
+        # Per-forward Qwen-Image-2.1 state (the SPA discipline): the rope table
+        # is captured anew every forward, and the arming window opens NOW — the
+        # model's own embedder is called ONCE per forward, over the whole
+        # joint stream (``comfy/ldm/qwen_image21/model.py:338``).
+        if rt.recorder is None:
+            rt.recorder = _QSEAM["recorder"] or Qwen21RopeRecorder()
+        rt.recorder.reset()
+        rt.recorder.armed = True
+        rt.joint = None
+        # The image embedder fires ONCE PER IMAGE (2.1 embeds every reference
+        # latent and then the target, ``model.py:319``), so the count starts
+        # at zero for every forward (D6).
+        rt.img_in_calls = 0
     x = params.get("input")
     conds = params.get("c") or {}
     if rt.profile is KREA_PROFILE:
@@ -1801,6 +2305,31 @@ def _area_resolve_forward(rt: _AreaRuntime, params: dict) -> AreaContext:
             return ctx
         patch = int(getattr(rt.dm, "patch", KREA_PATCH) or KREA_PATCH)
         h, w = krea_latent_grid(x, patch)
+    elif rt.profile is QWEN21_PROFILE:
+        # A Qwen-Image-2.1 latent is 4-D [B, C, H, W] and its token grid IS
+        # the latent's own (H, W): 2.1 does not patchify (``img_in`` is a plain
+        # Linear, ``comfy/ldm/qwen_image21/model.py:260``, and the model reads
+        # the grid off the latent's own shape, ``model.py:327``).  A 5-D latent
+        # is a VIDEO latent and is REFUSED LOUDLY (N4): 2.1's format is 2-D
+        # (``latent_formats.py:959``), and a silent no-op would leave the user
+        # with an unpatched run and no explanation (the Krea-2 lesson).  The
+        # latent is known only HERE — never at install time — so this is the
+        # earliest point the refusal can happen, and it happens BEFORE the
+        # seam sees a single tensor.
+        if torch.is_tensor(x) and x.dim() != 4:
+            raise ValueError(
+                "AReA does not support video / 5-D latents for Qwen-Image-2.1: "
+                f"the latent is {x.dim()}-D with shape {tuple(x.shape)}, but "
+                "2.1's latent format is 4-D [B, C, H, W] (comfy/latent_formats."
+                "py:957-960 — latent_dimensions = 2). AReA's windowed attention "
+                "is a latent-IMAGE construction: render a still image for AReA, "
+                "or leave AReA off for the video run."
+            )
+        try:
+            h, w = qwen21_latent_grid(x)
+        except ValueError as exc:
+            _warn_once("qwen21-latent", "AReA: %s", exc)
+            return ctx
     else:
         if not torch.is_tensor(x) or x.ndim != 4:
             return ctx  # nothing pool-able at this shape -> plain attention
@@ -1878,7 +2407,8 @@ def _area_resolve_forward(rt: _AreaRuntime, params: dict) -> AreaContext:
                     "level.",
                     first, rt.config.phase1_sigma,
                 )
-    if phase == "coarse" and rt.profile is not ZIMAGE_PROFILE and rt.profile is not KREA_PROFILE:
+    if (phase == "coarse" and rt.profile is not ZIMAGE_PROFILE
+            and rt.profile is not KREA_PROFILE and rt.profile is not QWEN21_PROFILE):
         # FLUX resolves its coarse tables here; the Z-Image ones need the model's
         # own rope groups, which only exist once the forward has run its embed,
         # so the seam resolves them lazily (``_zimage_coarse_ropes``).  The
@@ -1915,17 +2445,19 @@ def _make_area_unet_wrapper(rt: _AreaRuntime, previous_wrapper):
         # the enclosing function does not reach a nested scope, so the assignment
         # would otherwise bind a local of ``wrapper`` and the seam would never
         # see the runtime (the whole patch would silently delegate).
-        global _AREA_RUNTIME, _ZRUNTIME, _KRUNTIME
+        global _AREA_RUNTIME, _ZRUNTIME, _KRUNTIME, _QRUNTIME
 
         # One runtime per forward, and only the backbone this patcher resolved:
-        # the three seams read three different globals, so none of them can fire
+        # the four seams read four different globals, so none of them can fire
         # on another's forward.
         if rt.profile is ZIMAGE_PROFILE:
-            _AREA_RUNTIME, _ZRUNTIME, _KRUNTIME = None, rt, None
+            _AREA_RUNTIME, _ZRUNTIME, _KRUNTIME, _QRUNTIME = None, rt, None, None
         elif rt.profile is KREA_PROFILE:
-            _AREA_RUNTIME, _ZRUNTIME, _KRUNTIME = None, None, rt
+            _AREA_RUNTIME, _ZRUNTIME, _KRUNTIME, _QRUNTIME = None, None, rt, None
+        elif rt.profile is QWEN21_PROFILE:
+            _AREA_RUNTIME, _ZRUNTIME, _KRUNTIME, _QRUNTIME = None, None, None, rt
         else:
-            _AREA_RUNTIME, _ZRUNTIME, _KRUNTIME = rt, None, None
+            _AREA_RUNTIME, _ZRUNTIME, _KRUNTIME, _QRUNTIME = rt, None, None, None
         try:
             _area_resolve_forward(rt, params)
             return _call_through(model_function, params)
@@ -1933,6 +2465,7 @@ def _make_area_unet_wrapper(rt: _AreaRuntime, previous_wrapper):
             _AREA_RUNTIME = None
             _ZRUNTIME = None
             _KRUNTIME = None
+            _QRUNTIME = None
 
     return wrapper
 
@@ -2026,13 +2559,14 @@ def apply_area_to_model(
         )
         m._area_config = None
         return m
-    if detected_type not in ("flux", "zimage", "krea2"):
+    if detected_type not in ("flux", "zimage", "krea2", "qwen21"):
         raise ValueError(
-            f"AReA supports FLUX, Z-Image (Lumina2 / NextDiT) and Krea-2 "
-            f"(SingleStreamDiT) — it covered FLUX only in v1 — but the resolved "
-            f"model type is {detected_type!r}. Load an unmodified "
-            "(non-quantized) FLUX, Z-Image or Krea-2 model, or use SPA / DyPE / "
-            "SEGA for this architecture."
+            f"AReA supports FLUX, Z-Image (Lumina2 / NextDiT), Krea-2 "
+            f"(SingleStreamDiT) and Qwen-Image-2.1 "
+            f"(QwenImage21Transformer2DModel) — it covered FLUX only in v1 — but "
+            f"the resolved model type is {detected_type!r}. Load an unmodified "
+            "(non-quantized) FLUX, Z-Image, Krea-2 or Qwen-Image-2.1 model, or "
+            "use SPA / DyPE / SEGA for this architecture."
         )
     # The arch profile validates the pin against the model's own backbone and
     # refuses the Lumina2 siblings AReA cannot patch (pixel space, Ming-Image).
@@ -2139,7 +2673,8 @@ def apply_area_to_model(
         "AReA: installed on a %dx%d patch grid (%dx%d px) on the %s seam, "
         "phase1_steps=%d (mode %s), pooling=%s, halo=%d, bridge_ratio=%s, seed=%d",
         w, h, width, height,
-        {"flux": "FLUX", "zimage": "Z-Image", "krea2": "Krea-2"}.get(
+        {"flux": "FLUX", "zimage": "Z-Image", "krea2": "Krea-2",
+         "qwen21": "Qwen-Image-2.1"}.get(
             profile.model_type, "FLUX"),
         m._area_config.phase1_steps, m._area_config.phase1_mode,
         m._area_config.pooling, m._area_config.halo, m._area_config.bridge_ratio,
@@ -2201,6 +2736,8 @@ def restore_area_attention_hook(m) -> None:
         _release_seam(_ZSEAM)
     elif seam == "krea2":
         _release_seam(_KSEAM)
+    elif seam == "qwen21":
+        _release_seam(_QSEAM)
     else:
         _release_seam(_SEAM)
     m._area_seam = None

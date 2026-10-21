@@ -96,6 +96,7 @@ __all__ = [
     "Qwen21Layout",
     "Qwen21RopeRecorder",
     "capture_qwen21_table",
+    "coarse_ropes_qwen21",
     "qwen21_centred_axis",
     "qwen21_coarse_key_ids",
     "qwen21_coarse_query_ids",
@@ -803,3 +804,87 @@ def capture_qwen21_table(pe_embedder) -> tuple:
     return hook, recorder
 
 
+# ---------------------------------------------------------------------------
+# The coarse tables — the model's own embedder, 2.1's own ids
+# ---------------------------------------------------------------------------
+
+
+def coarse_ropes_qwen21(embedder, layout: Qwen21Layout, f: int, device,
+                        recorder: Optional[Qwen21RopeRecorder] = None,
+                        target_h: Optional[int] = None,
+                        target_w: Optional[int] = None) -> tuple[torch.Tensor, torch.Tensor]:
+    """The two Phase I rope tables — CONTINUOUS block positions, 2.1's own ids.
+
+    **The two tables have DIFFERENT lengths on 2.1** (the asymmetry the plan
+    leaves under-specified): the eligible call has no text queries, so
+
+    * ``rope_q`` covers the ``h*w`` IMAGE QUERIES only, at their own
+      compressed centred positions;
+    * ``rope_kv`` covers ``txt_len + nh*nw`` rows — the caption at the model's
+      own diagonal ids (the caption never moves) and the pooled keys at their
+      block's CONTINUOUS centroid in the centred frame (the Krea-2 ripple fix;
+      the reference's floor division collapses every ``f x f`` block onto one
+      rope position and injects a one-radian square wave into the velocity
+      field at every block boundary — the pack's measured Z-Image ripple).
+
+    The block positions are CONTINUOUS (AReA-Z mechanism 1): every query keeps
+    its own position scaled by ``1/f`` and the pooled key sits at its block's
+    GEOMETRIC CENTROID — the mean of the block's query positions — so the
+    phase step across a boundary equals the one inside the block and the
+    staircase is gone; ``f == 1`` degenerates exactly.
+
+    The axis-0 value stays the model's own counter (``txt_len``), so 2.1 needs
+    no ``img_axis0`` keyword.
+
+    The tables come from the model's OWN embedder, so a chained DyPE/SEGA
+    embedder composes — and the capture is PAUSED around the two calls, so the
+    coarse tables are not mistaken for extra tables of the forward (the pause
+    guard; see :meth:`Qwen21RopeRecorder.paused`).
+
+    Args:
+        embedder: the model's own ``pe_embedder``.
+        layout: the image segment's layout of this forward.
+        f: the pooling factor of this step.
+        device: the device the ids are built on.
+        recorder: the rope recorder to pause.  Optional — the recorder that
+            :func:`capture_qwen21_table` registered for this embedder is found
+            automatically — but passing it explicitly is clearer.
+    """
+    if embedder is None:
+        raise ValueError(
+            "AReA: this model has no diffusion_model.pe_embedder, so the "
+            "Phase I coarse rope tables cannot be built. Use an unmodified "
+            "Qwen-Image-2.1 loader."
+        )
+    f = int(f)
+    if f < 1:
+        raise ValueError(
+            f"AReA: the pooling factor {f} is not a valid pooling block size, "
+            "so the coarse rope grid cannot be built. This forward runs plain "
+            "attention."
+        )
+    if recorder is None:
+        recorder = _RECORDERS.get(id(embedder))
+    nh, nw = coarse_grid(layout.h, layout.w, f)
+
+    q_ids = qwen21_coarse_query_ids(
+        layout.txt_len, layout.h, layout.w, f, target_h, target_w, device, torch.float32
+    )
+    kv_ids = qwen21_coarse_key_ids(
+        layout.txt_len, layout.txt_len, layout.h, layout.w, f,
+        target_h, target_w, device, torch.float32,
+    )
+
+    if recorder is not None:
+        # The pause guard: the coarse tables go through the model's OWN
+        # embedder, and the capture hook would otherwise record them as extra
+        # tables of this forward.
+        with recorder.paused():
+            rope_q = embedder(q_ids)
+            rope_kv = embedder(kv_ids)
+    else:
+        rope_q = embedder(q_ids)
+        rope_kv = embedder(kv_ids)
+    # Head-shared either way, so a chained embedder that returns another
+    # layout is handled too.
+    return head_shared(rope_q), head_shared(rope_kv)

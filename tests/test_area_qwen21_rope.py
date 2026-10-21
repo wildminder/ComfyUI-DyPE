@@ -14,10 +14,11 @@ pooled keys at their block's CONTINUOUS centroid in the centred frame.
 import pytest
 import torch
 
-from _qwen21_seam_fixtures import QwenImage21Transformer2DModel
+from _qwen21_seam_fixtures import MockEmbedND, QwenImage21Transformer2DModel
 from src.area_qwen21 import (
     Qwen21RopeRecorder,
     capture_qwen21_table,
+    coarse_ropes_qwen21,
     qwen21_coarse_key_ids,
     qwen21_coarse_query_ids,
     qwen21_layout,
@@ -99,6 +100,57 @@ class TestTheCapture:
         finally:
             if hook.handle is not None:
                 hook.handle.remove()
+
+
+class TestTheCoarseTables:
+    def test_the_two_tables_have_different_lengths(self):
+        """The asymmetry: no text queries, so the q side is the image only."""
+        embedder = MockEmbedND(axes_dim=(4, 6, 6))
+        layout = qwen21_layout(4, 4, 4, 16, 20)
+        rope_q, rope_kv = coarse_ropes_qwen21(embedder, layout, 2, torch.device("cpu"))
+        assert rope_q.shape[2] == 16          # h*w image queries
+        assert rope_kv.shape[2] == 4 + 4      # the caption + 2x2 pooled blocks
+
+    def test_the_caption_keeps_the_models_own_diagonal_ids(self):
+        """``qwen21_coarse_key_ids`` — the caption never moves."""
+        ids = qwen21_coarse_key_ids(4, 4, 4, 4, 2)
+        assert torch.equal(ids[0, :4], qwen21_text_ids(0, 4)[0])
+
+    def test_the_pooled_keys_sit_at_their_blocks_continuous_centroid(self):
+        """The ripple fix — the key is the MEAN of its block's query positions.
+
+        The reference floor-divides, so every token of a block shares ONE rope
+        position and the phase jumps a whole unit at every block boundary — the
+        pack's measured Z-Image square wave.
+        """
+        h = w = 4
+        f = 2
+        q_ids = qwen21_coarse_query_ids(4, h, w, f)[0]
+        kv_ids = qwen21_coarse_key_ids(4, 4, h, w, f)[0]
+        nw = 2
+        for block in range(4):
+            br, bc = divmod(block, nw)
+            members = [r * w + c
+                       for r in range(br * f, (br + 1) * f)
+                       for c in range(bc * f, (bc + 1) * f)]
+            assert kv_ids[4 + block, 1] == pytest.approx(
+                float(sum(q_ids[m, 1] for m in members)) / len(members))
+            assert kv_ids[4 + block, 2] == pytest.approx(
+                float(sum(q_ids[m, 2] for m in members)) / len(members))
+
+    def test_the_pooled_key_is_not_the_floor_divided_position(self):
+        """The floor division would put the block's key at its FIRST token."""
+        q_ids = qwen21_coarse_query_ids(4, 4, 4, 2)[0]
+        kv_ids = qwen21_coarse_key_ids(4, 4, 4, 4, 2)[0]
+        # the first block's key row is the MEAN of its two query rows, not the
+        # first one
+        assert kv_ids[4, 1] == pytest.approx(float((q_ids[0, 1] + q_ids[4, 1]) / 2))
+        assert kv_ids[4, 1] != pytest.approx(float(q_ids[0, 1]))
+
+    def test_the_axis_zero_value_is_the_models_own_counter(self):
+        """The image tokens do not move along axis 0, so no ``img_axis0``."""
+        kv_ids = qwen21_coarse_key_ids(6, 4, 4, 4, 2)[0]
+        assert torch.equal(kv_ids[4:, 0], torch.full((4,), 6.0))
 
 
 def test_the_captured_table_has_the_models_layout():
