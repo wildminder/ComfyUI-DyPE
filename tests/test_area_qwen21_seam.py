@@ -20,8 +20,8 @@ be pinned WITHOUT a checkpoint and WITHOUT a GPU:
 import pytest
 import torch
 
+from src.area_qwen21 import QWEN21_NO_MASK
 from _qwen21_seam_fixtures import (
-    QWEN21_NO_MASK,
     AttentionTensorContainer,
     _apply_rope_bnd,
     QwenImage21Transformer2DModel,

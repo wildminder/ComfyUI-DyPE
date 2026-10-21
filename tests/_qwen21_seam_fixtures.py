@@ -44,14 +44,7 @@ from contextlib import contextmanager
 
 import torch
 
-class _NoMask:
-    """The ABSENT-mask sentinel — 2.1 passes no ``mask`` on the cached path."""
-
-    def __repr__(self) -> str:  # pragma: no cover - a debugging aid
-        return "<qwen21-no-mask>"
-
-
-QWEN21_NO_MASK = _NoMask()
+from src.area_qwen21 import QWEN21_NO_MASK
 
 #: The seam's identity — the module that BINDS the symbol and the symbol
 #: itself (``comfy/ldm/qwen_image21/model.py:15`` and ``:211``).
