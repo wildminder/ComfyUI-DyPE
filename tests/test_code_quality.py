@@ -2,6 +2,8 @@
 import ast
 import pathlib
 import re
+import subprocess
+import sys
 
 import pytest
 
@@ -20,6 +22,56 @@ TESTS_DIR = PROJECT_ROOT / "tests"
 #: this project has already been bitten by, which is why the guard below
 #: exists.
 CI_MARKERS = ("unit", "mock_integration")
+
+#: The Qwen-Image-2.1 test files the CI subset must SELECT.  The 2.1
+#: adaptation (S1–S11) added eight of them; a file that carries NEITHER CI
+#: marker is silently DESELECTED by the CI's ``-m "unit or mock_integration"``
+#: — a test that stops running without a single failure.  Every one of them is
+#: named here so that the hazard is checked EXPLICITLY, not only through the
+#: ``test_area_*`` glob.
+NEW_QWEN21_FILES = (
+    "test_area_qwen21_seam.py",          # S1  the seam-verification harness
+    "test_area_qwen21_geometry.py",      # S2  the geometry constants
+    "test_area_qwen21_adapter.py",       # S3  the 3-D <-> 4-D adapter
+    "test_area_qwen21_rope.py",          # S4  the rope recorder
+    "test_area_qwen21_phase1.py",        # S6/S11  the Phase I seam
+    "test_area_qwen21_phase2.py",        # S8/S11  the Phase II seam
+    "test_area_qwen21_rejections.py",    # S9   the rejection contract
+    "test_area_attn_text_keys_only.py",  # S7   the engine keyword
+)
+
+#: The byte-identity goldens of the pre-2.1 baseline — the five seam answers
+#: that must not move while the 2.1 seam is added.  They live in
+#: ``tests/test_area_grid_fallback.py``'s ``GOLDENS`` and, as a SECOND copy,
+#: in ``tests/test_area_flux_identity.py``; the values are repeated HERE so
+#: that an edit of EITHER copy cannot silently bless a regression.  The recipe
+#: is the sha256 of a tensor's contiguous float32 bytes, truncated to 32 hex
+#: characters.  The BEHAVIOURAL re-derivation lives in the two files named
+#: above — this is the fast, structural pin.
+BASELINE_GOLDENS = {
+    "flux80_coarse": "dca3a04b5655b81b6a40049a010c0d94",
+    "flux80_fine": "1c5d27e285761eef13ec76dc10638022",
+    "flux160_coarse": "52ed0106c10bd149ea66b16728efd973",
+    "zimage65_coarse": "394b3e8a2529bb35436fbaea4618d808",
+    "zimage65_fine": "b16a038f4050d776d9c77a4a91192d0a",
+}
+
+
+def module_literal(path: pathlib.Path, name: str):
+    """A module-level constant of a Python file, read from its AST.
+
+    ``ast.literal_eval`` — the constants are plain literals, so reading them
+    needs neither an import nor torch.  A missing constant is a FAILURE, not
+    a ``None``: a renamed table must not pass for an empty one.
+    """
+    tree = ast.parse(path.read_text(encoding="utf-8"))
+    for node in tree.body:
+        if not isinstance(node, ast.Assign):
+            continue
+        for target in node.targets:
+            if isinstance(target, ast.Name) and target.id == name:
+                return ast.literal_eval(node.value)
+    raise AssertionError(f"{name} is not a module-level constant of {path.name}")
 
 
 def ci_markers_in(path: pathlib.Path) -> set:
@@ -216,3 +268,106 @@ class TestCiMarkerGuard:
                      "test_area_krea_seam_probe.py", "test_area_rope.py",
                      "test_area_flux_identity.py"):
             assert name in covered, f"{name} is not covered by the marker guard"
+
+
+@pytest.mark.unit
+class TestTheQwen21CiMarkerGuard:
+    """The Qwen-Image-2.1 files must be SELECTED by the CI's marker subset.
+
+    The Krea-2 precedent, in the same shape: the static checks below prove
+    the marker is APPLIED, the dynamic one runs the CI's OWN command over
+    the new files and proves the tests are actually COLLECTED — a marker on
+    the wrong node, or a file pytest does not collect at all, would slip past
+    the static check.
+    """
+
+    def test_the_guard_covers_the_new_qwen21_files(self):
+        """Every 2.1 test file is inside the guard's scope."""
+        covered = {path.name for path in TESTS_DIR.glob("test_area_*.py")}
+        for name in NEW_QWEN21_FILES:
+            assert name in covered, f"{name} is not covered by the marker guard"
+
+    def test_every_new_qwen21_file_carries_a_ci_marker(self):
+        """Each 2.1 test file carries one of the CI markers.
+
+        The existing guard (``test_every_area_test_file_carries_a_ci_marker``)
+        covers the same ground through the ``test_area_*`` glob; this spells
+        the eight names out, so a file that is RENAMED out of the glob (or
+        added without being listed above) fails HERE, by name.
+        """
+        for name in NEW_QWEN21_FILES:
+            path = TESTS_DIR / name
+            assert path.exists(), f"{name} is missing from {TESTS_DIR}"
+            assert ci_markers_in(path), (
+                f"{name} carries no @pytest.mark.unit / "
+                "@pytest.mark.mock_integration marker and is silently "
+                "deselected by the CI subset"
+            )
+
+    def test_the_marker_subset_selects_every_new_test(self):
+        """The CI's OWN selection picks every new test up.
+
+        The static checks above prove the marker TEXT is there; this runs the
+        CI's own command (``-m "unit or mock_integration"``) over the new
+        files and proves the tests are actually COLLECTED.
+        """
+        command = [sys.executable, "-m", "pytest", "--collect-only", "-q",
+                   "-p", "no:cacheprovider",
+                   # the project's addopts carry ``-v`` (pyproject.toml), which
+                   # would turn the node-id list into a tree; only the import
+                   # mode matters for the collection
+                   "-o", "addopts=--import-mode=importlib",
+                   "-m", "unit or mock_integration",
+                   *[f"tests/{name}" for name in NEW_QWEN21_FILES]]
+        result = subprocess.run(command, cwd=PROJECT_ROOT, capture_output=True,
+                                text=True)
+        output = result.stdout + result.stderr
+        assert result.returncode == 0, output
+        assert "deselected" not in output, output
+        for name in NEW_QWEN21_FILES:
+            assert f"tests/{name}::" in output, (
+                f"{name} was not selected by the CI marker subset:\n{output}"
+            )
+
+
+@pytest.mark.unit
+class TestTheFinalGoldensGate:
+    """The pre-2.1 byte-identity goldens are still the baseline ones.
+
+    The 2.1 work touched the SHARED engine (``windowed_attention``'s
+    ``text_keys_only`` keyword) and added a THIRD seam, so the FLUX / Z-Image
+    answers are the canary.  Their BEHAVIOURAL re-derivation lives in
+    ``tests/test_area_flux_identity.py`` and in
+    ``tests/test_area_qwen21_phase2.py``; the checks below are the fast,
+    structural pin: the golden table and its second copy must still carry the
+    documented values, so an edit of either one cannot silently bless a
+    regression.
+    """
+
+    def test_the_golden_table_still_carries_the_baseline_hashes(self):
+        """``tests/test_area_grid_fallback.py``'s GOLDENS is the baseline."""
+        goldens = module_literal(TESTS_DIR / "test_area_grid_fallback.py",
+                                 "GOLDENS")
+        for tag, digest in BASELINE_GOLDENS.items():
+            assert goldens.get(tag) == digest, (
+                f"the {tag} golden moved: {goldens.get(tag)} != {digest}"
+            )
+
+    def test_the_two_golden_copies_agree(self):
+        """The golden table and the identity file's copy do not drift.
+
+        ``tests/test_area_flux_identity.py`` keeps its OWN copy of the five
+        hashes, so that editing the table cannot bless a regression; the two
+        copies must hold the same values.
+        """
+        table = module_literal(TESTS_DIR / "test_area_grid_fallback.py",
+                               "GOLDENS")
+        identity = dict(module_literal(TESTS_DIR / "test_area_flux_identity.py",
+                                       "FLUX_GOLDENS"))
+        identity.update(module_literal(TESTS_DIR / "test_area_flux_identity.py",
+                                       "ZIMAGE_GOLDENS"))
+        for tag in BASELINE_GOLDENS:
+            assert identity.get(tag) == table.get(tag), (
+                f"the two golden copies disagree on {tag}: "
+                f"{identity.get(tag)} != {table.get(tag)}"
+            )
