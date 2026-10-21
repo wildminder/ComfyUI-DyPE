@@ -93,7 +93,20 @@ __all__ = [
     "QWEN21_SEAM_SYMBOL",
     "QWEN21_TRAINED_RESOLUTION_PX",
     "QWEN21_VAE_DOWNSCALE",
+    "Qwen21Layout",
+    "qwen21_centred_axis",
+    "qwen21_coarse_key_ids",
+    "qwen21_coarse_query_ids",
+    "qwen21_from_heads",
+    "qwen21_head_geometry",
+    "qwen21_image_ids",
     "qwen21_latent_grid",
+    "qwen21_layout",
+    "qwen21_segment_eligible",
+    "qwen21_sequence_ids",
+    "qwen21_slice_table",
+    "qwen21_text_ids",
+    "qwen21_to_heads",
 ]
 
 #: One-time warnings (module scoped, like ``src/area_zimage.py``'s).
@@ -261,5 +274,383 @@ def qwen21_latent_grid(latent: torch.Tensor) -> tuple[int, int]:
             "forward runs plain attention."
         )
     return int(latent.shape[-2]), int(latent.shape[-1])
+
+
+# ---------------------------------------------------------------------------
+# The ids — the model's own positions
+# ---------------------------------------------------------------------------
+
+
+def qwen21_centred_axis(size: int, target_size: Optional[int] = None,
+                        device=None, dtype=torch.float32) -> torch.Tensor:
+    """The model's own CENTRED coordinate of every row/column index.
+
+    ``comfy/ldm/qwen_image21/model.py:330-331``::
+
+        hh = arange(h) - (h - h // 2) + 0.5 * (h % 2 - target_h % 2)
+        ww = arange(w) - (w - w // 2) + 0.5 * (w % 2 - target_w % 2)
+
+    The spatial axes are centred on the canvas, and the half-token parity term
+    centres a REFERENCE grid on the target.  For the target itself
+    (``size == target_size``) the parity term vanishes, so the axis is the
+    plain centred ramp — but the builder keeps the term, because the ids must
+    mirror the model exactly rather than its single-image special case.
+
+    Args:
+        size: the grid's own size on this axis (``h`` or ``w``).
+        target_size: the TARGET's size on this axis — the parity term's other
+            half.  ``None`` means "the target is this grid", which zeroes the
+            term.
+    """
+    size = int(size)
+    target = size if target_size is None else int(target_size)
+    index = torch.arange(size, device=device, dtype=dtype)
+    return index - float(size - size // 2) + 0.5 * float(size % 2 - target % 2)
+
+
+def qwen21_text_ids(pos: int, n: int, device=None,
+                    dtype=torch.float32) -> torch.Tensor:
+    """``[1, n, 3]`` — the caption's own rope ids, the DIAGONAL ``(pos+j)*3``.
+
+    ``comfy/ldm/qwen_image21/model.py:323``::
+
+        ids.append(torch.arange(pos, pos + n, ...).unsqueeze(1).expand(n, 3))
+
+    ``pos`` is the model's running counter — 0 for the first text segment, and
+    ``txt_len`` after it (``model.py:325``).  The caption is therefore NOT at
+    the origin (FLUX's shape) and NOT on a single axis (Z-Image's shape): it
+    rides a diagonal, and "the caption never moves" means this exact table.
+    """
+    n = int(n)
+    j = torch.arange(n, device=device, dtype=dtype) + float(pos)
+    return torch.stack([j, j, j], dim=-1).unsqueeze(0)
+
+
+def qwen21_image_ids(pos: int, h: int, w: int, target_h: Optional[int] = None,
+                     target_w: Optional[int] = None, device=None,
+                     dtype=torch.float32) -> torch.Tensor:
+    """``[1, h*w, 3]`` — the image tokens' own rope ids ``(pos, hh(r), ww(c))``.
+
+    ``comfy/ldm/qwen_image21/model.py:330-332`` — the axis-0 value is the
+    running counter (the caption's length in the reference-free case) and the
+    two spatial axes are the centred ones of :func:`qwen21_centred_axis`.
+    """
+    h, w = int(h), int(w)
+    hh = qwen21_centred_axis(h, target_h, device, dtype)
+    ww = qwen21_centred_axis(w, target_w, device, dtype)
+    axis0 = torch.full((h, w), float(pos), device=device, dtype=dtype)
+    return torch.stack(
+        [axis0, hh[:, None].expand(h, w), ww[None, :].expand(h, w)], dim=-1
+    ).reshape(1, h * w, 3)
+
+
+def qwen21_sequence_ids(txt_len: int, h: int, w: int, target_h: Optional[int] = None,
+                        target_w: Optional[int] = None, device=None,
+                        dtype=torch.float32) -> torch.Tensor:
+    """``[1, txt_len + h*w, 3]`` — the model's own ids for ONE image and a caption.
+
+    This is ``build_sequence``'s id table for the reference-free case
+    (``comfy/ldm/qwen_image21/model.py:317-332``): the caption's diagonal ids
+    with the counter at 0, then the image's ids with the counter at ``txt_len``.
+    The image's grid is the TARGET's grid, so the parity term is zero unless
+    the caller says otherwise.
+    """
+    txt_len = int(txt_len)
+    text = qwen21_text_ids(0, txt_len, device, dtype)
+    image = qwen21_image_ids(txt_len, h, w, target_h, target_w, device, dtype)
+    return torch.cat([text, image], dim=1)
+
+
+def qwen21_coarse_query_ids(pos: int, h: int, w: int, f: int,
+                            target_h: Optional[int] = None,
+                            target_w: Optional[int] = None, device=None,
+                            dtype=torch.float32) -> torch.Tensor:
+    """``[1, h*w, 3]`` — the image queries' COMPRESSED ids.
+
+    Phase I keeps the queries at full resolution but rides them on the coarse
+    grid, so their positions are the model's own CENTRED positions scaled by
+    ``1/f`` — the continuous step (AReA-Z mechanism 1) that the reference's
+    floor division breaks.  The axis-0 value stays the model's own counter: the
+    image tokens do not move along that axis, so no ``img_axis0`` keyword is
+    needed for 2.1.
+    """
+    h, w, f = int(h), int(w), int(f)
+    hh = qwen21_centred_axis(h, target_h, device, dtype) / float(f)
+    ww = qwen21_centred_axis(w, target_w, device, dtype) / float(f)
+    axis0 = torch.full((h, w), float(pos), device=device, dtype=dtype)
+    return torch.stack(
+        [axis0, hh[:, None].expand(h, w), ww[None, :].expand(h, w)], dim=-1
+    ).reshape(1, h * w, 3)
+
+
+def qwen21_coarse_key_ids(img_pos: int, txt_len: int, h: int, w: int, f: int,
+                          target_h: Optional[int] = None,
+                          target_w: Optional[int] = None, device=None,
+                          dtype=torch.float32) -> torch.Tensor:
+    """``[1, txt_len + nh*nw, 3]`` — the pooled keys' ids.
+
+    Two halves, and they are NOT the same length (the Phase-I tables are
+    ASYMMETRIC on 2.1, because the eligible call has no text queries at all):
+
+    * the caption's ``txt_len`` rows keep the model's own DIAGONAL ids — the
+      caption never moves (``src/area_krea.py:592``);
+    * the ``nh*nw`` pooled blocks sit at their block's CONTINUOUS centroid in
+      the CENTRED frame — the mean of the block's query positions, which is the
+      Krea-2 ripple fix (``src/area_krea.py:497-623``; the floor-division
+      square wave is the measured Z-Image ripple).  A PARTIAL block (the last
+      one on an axis the grid does not tile) owns fewer members, so its
+      centroid is the mean of *its* members (``block_offsets``).
+
+    The axis-0 value of the image rows is the model's own counter
+    (``img_pos``); the caption's rows carry the caption's own diagonal.
+    """
+    txt_len, h, w, f = int(txt_len), int(h), int(w), int(f)
+    text = qwen21_text_ids(0, txt_len, device, dtype)
+    nh, nw = coarse_grid(h, w, f)
+    uniform = (float(f) - 1.0) / (2.0 * float(f))
+    row_off = block_offsets(nh, h, f, uniform, device)
+    col_off = block_offsets(nw, w, f, uniform, device)
+    blocks = torch.arange(nh * nw, device=device)
+    block_rows = blocks // nw
+    block_cols = blocks % nw
+    # the block's mean ROW INDEX, then the model's own centred coordinate of it
+    mean_rows = (block_rows.to(dtype) * f + row_off[block_rows].to(dtype) * f)
+    mean_cols = (block_cols.to(dtype) * f + col_off[block_cols].to(dtype) * f)
+    centred_rows = mean_rows - float(h - h // 2) + 0.5 * float(h % 2 - (h if target_h is None else int(target_h)) % 2)
+    centred_cols = mean_cols - float(w - w // 2) + 0.5 * float(w % 2 - (w if target_w is None else int(target_w)) % 2)
+    axis0 = torch.full((nh * nw,), float(img_pos), device=device, dtype=dtype)
+    image = torch.stack([axis0, centred_rows / float(f), centred_cols / float(f)], dim=-1)
+    return torch.cat([text, image.unsqueeze(0)], dim=1)
+
+
+# ---------------------------------------------------------------------------
+# The layout — the joint key set of the image segment
+# ---------------------------------------------------------------------------
+
+
+@dataclass(frozen=True)
+class Qwen21Layout:
+    """The geometry of one Qwen-Image-2.1 image segment.
+
+    2.1's eligible call has NO text queries: the image segment's queries are
+    the ``h*w`` image rows and its keys are the JOINT set — the caption AND the
+    image (``comfy/ldm/qwen_image21/model.py:206-208``, ``k[:, :end]``).  The
+    engine's own convention ("text first, image last",
+    ``src/area_attn.py:380``) therefore applies verbatim: the caption's rows
+    are the first ``txt_len`` rows of the key and the image's rows are the
+    trailing ``h*w``.
+
+    ``txt_len``  the caption's length (``context.shape[1]``).
+    ``h``, ``w``  the token grid of the canvas (the latent's own ``(H, W)``).
+    ``q_len``  the queries of THIS call (``h*w`` — the image rows only).
+    ``k_len``  the keys of THIS call (``txt_len + h*w`` — the joint set).
+    """
+
+    txt_len: int
+    h: int
+    w: int
+    q_len: int
+    k_len: int
+
+    # --- the spans ----------------------------------------------------------
+
+    @property
+    def img_start(self) -> int:
+        """``txt_len`` under its slicing name: the first image token of the KEY."""
+        return self.txt_len
+
+    @property
+    def img_end(self) -> int:
+        """One past the last image token of the KEY."""
+        return self.txt_len + self.h * self.w
+
+    @property
+    def img_tokens(self) -> int:
+        """``h * w`` — how many image tokens the canvas owns."""
+        return self.h * self.w
+
+
+def qwen21_layout(txt_len: int, h: int, w: int, q_len: int,
+                  k_len: int) -> Qwen21Layout:
+    """Resolve — and check — the geometry of one 2.1 image segment.
+
+    Raises:
+        ValueError: when the call does not fit the segment geometry — an empty
+            grid, or a query/key length that is not ``h*w`` /
+            ``txt_len + h*w``.  The message names the offender and the remedy
+            (house rule, ``src/hap.py:876-895``), so a foreign call is refused
+            instead of silently pooling the wrong tokens.
+    """
+    txt_len, h, w = int(txt_len), int(h), int(w)
+    q_len, k_len = int(q_len), int(k_len)
+    if min(h, w) < 1:
+        raise ValueError(
+            f"AReA: a Qwen-Image-2.1 image segment needs a non-empty token "
+            f"grid, but got {h}x{w}. This forward runs plain attention."
+        )
+    if txt_len < 0:
+        raise ValueError(
+            f"AReA: a Qwen-Image-2.1 image segment cannot have a negative "
+            f"caption length ({txt_len}). This forward runs plain attention."
+        )
+    if q_len != h * w:
+        raise ValueError(
+            f"AReA: the Qwen-Image-2.1 image segment carries {q_len} queries, "
+            f"but a {h}x{w} token grid owns {h * w} (comfy/ldm/qwen_image21/"
+            "model.py:206). The prompt and the latent do not belong to one "
+            "forward, so the image tokens cannot be located. This forward runs "
+            "plain attention."
+        )
+    if k_len != txt_len + h * w:
+        raise ValueError(
+            f"AReA: the Qwen-Image-2.1 image segment's key is {k_len} rows "
+            f"long, but a {txt_len}-token caption behind a {h}x{w} canvas needs "
+            f"{txt_len + h * w} (comfy/ldm/qwen_image21/model.py:207 — "
+            "k[:, :end]). This forward runs plain attention."
+        )
+    return Qwen21Layout(txt_len, h, w, q_len, k_len)
+
+
+# ---------------------------------------------------------------------------
+# The eligibility guard — the image segment of the plain path, and nothing else
+# ---------------------------------------------------------------------------
+
+
+def qwen21_segment_eligible(mask, q_len, k_len, total_len, txt_len, h, w,
+                            heads=None, dm_heads=None) -> bool:
+    """Is this seam call 2.1's IMAGE segment of the PLAIN path? (plan Q2)
+
+    Five conditions, all necessary:
+
+    * **the ``mask`` keyword was PRESENT** — the prefix-cache path calls the
+      seam with no ``mask`` at all (``comfy/ldm/qwen_image21/model.py:222``),
+      and that path is length-indistinguishable from this one (its key is
+      ``txt_len + h*w`` long over ``h*w`` queries), so the keyword's presence
+      is the ONLY discriminator.  :data:`QWEN21_NO_MASK` marks the absent case.
+    * **the mask is ``None``** — the caption segment carries a causal bool
+      mask (``model.py:324``) and the image segment carries ``None``
+      (``model.py:333``).  The caption is DELEGATED untouched.
+    * **the lengths fit** — ``q_len == h*w`` and ``k_len == txt_len + h*w``.
+      A reference-latent forward makes the joint stream longer than that, so
+      it is refused here as well (the forward refuses it too).
+    * **the key is the WHOLE stream** — ``k_len == total_len`` when the
+      caller knows the forward's sequence length (the captured rope table's
+      length is exactly that).  A reference chunk's key stops short of it.
+    * **the head count is the model's own** — ``heads == dm_heads`` (N13).
+      An unknown variant of the backbone is DELEGATED, never engaged with.
+
+    Returns ``False`` — never raises — so a call that fails any of the five
+    is simply DELEGATED UNCHANGED by the seam.
+    """
+    try:
+        if mask is QWEN21_NO_MASK:
+            # the prefix-cache path: no mask keyword at all.
+            return False
+        if mask is not None:
+            # the caption segment: a causal bool mask.
+            return False
+        if heads is not None and dm_heads is not None and int(heads) != int(dm_heads):
+            # N13 — an unknown head count is an unknown variant: delegate.
+            return False
+        q_len = int(q_len)
+        k_len = int(k_len)
+        txt_len = int(txt_len)
+        h = int(h)
+        w = int(w)
+        if h < 1 or w < 1:
+            return False
+        if q_len != h * w:
+            return False
+        if k_len != txt_len + h * w:
+            return False
+        if total_len is not None and k_len != int(total_len):
+            return False
+    except (TypeError, ValueError):
+        return False
+    return True
+
+
+def qwen21_head_geometry(x, heads) -> Optional[int]:
+    """The per-head width of a 3-D seam tensor, or ``None`` when it is foreign.
+
+    2.1's seam input is ``[b, n, heads*dim]`` (``model.py:206-208``), so the
+    flat width must split into the seam's ``heads`` — and the head width is
+    what the geometry is checked against.  A width that does NOT split is a
+    FOREIGN call (an unknown variant of the backbone), and it is reported as
+    ``None`` instead of raising: the seam then DELEGATES the call, which keeps
+    a sampling run alive instead of aborting it (N13).
+    """
+    if not torch.is_tensor(x) or x.dim() != 3:
+        return None
+    try:
+        heads = int(heads)
+    except (TypeError, ValueError):
+        return None
+    inner = int(x.shape[-1])
+    if heads < 1 or inner % heads:
+        return None
+    return inner // heads
+
+
+# ---------------------------------------------------------------------------
+# The seam's layout — 3-D in, 3-D out
+# ---------------------------------------------------------------------------
+
+
+def qwen21_to_heads(x: torch.Tensor, heads: int) -> torch.Tensor:
+    """``[b, n, heads*dim]`` -> ``[b, heads, n, dim]`` — the engine's layout.
+
+    The seam's input is 3-D: ``model.py:206-208`` flattens ``(B, n, H, D)`` to
+    ``(B, n, H*D)`` and calls the seam without ``skip_reshape``, and comfy
+    reads that head-major (``comfy/ldm/modules/attention.py:147-158`` — the
+    flat index ``j`` of a row is ``head * dim_head + d``).  Every other AReA
+    seam sees the 4-D layout, so the conversion is here — and it is the exact
+    inverse of :func:`qwen21_from_heads`.
+    """
+    b, n, inner = x.shape
+    heads = int(heads)
+    if heads < 1 or inner % heads:
+        raise ValueError(
+            f"AReA: a Qwen-Image-2.1 seam input of shape {tuple(x.shape)} does "
+            f"not split into {heads} heads, so it cannot be read head-major. "
+            "This call runs plain attention."
+        )
+    return x.reshape(b, n, heads, inner // heads).transpose(1, 2)
+
+
+def qwen21_from_heads(x: torch.Tensor) -> torch.Tensor:
+    """``[b, heads, n, dim]`` -> ``[b, n, heads*dim]`` — comfy's seam output.
+
+    The inverse of :func:`qwen21_to_heads`, and the layout the model expects
+    back: ``block_causal_attention`` concatenates the per-segment answers on
+    dim 1 (``model.py:212``) and the block multiplies the answer by a
+    ``[b, n, dim]`` gate (``model.py:146``).
+    """
+    b, heads, n, dim = x.shape
+    return x.transpose(1, 2).reshape(b, n, heads * dim)
+
+
+def qwen21_peek(x):
+    """The tensor inside a seam argument, WITHOUT consuming its container.
+
+    ``AttentionTensorContainer`` is single-owner: ``take()`` consumes it once
+    and a second take raises (``comfy/ldm/modules/attention.py:196-209``).  The
+    seam therefore INSPECTS with ``peek()`` and takes exactly once — on the
+    AReA path only.
+    """
+    return x.peek() if hasattr(x, "peek") else x
+
+
+def qwen21_slice_table(table: torch.Tensor, start: int, end: int) -> torch.Tensor:
+    """``table[:, :, start:end]`` — the model's own table for a span of tokens.
+
+    The model rotates the WHOLE joint stream with the whole table and slices
+    afterwards (``comfy/ldm/qwen_image21/model.py:99-100``, ``:206-208``), so
+    the image segment's QUERIES were rotated with the table's TRAILING rows
+    (the image's own) and the joint KEY with its leading ones.  Slicing the
+    model's own table is therefore the exact inverse of that rotation — the
+    same rows, in the same order, with the same phases.
+    """
+    return table[:, :, int(start):int(end)]
 
 
