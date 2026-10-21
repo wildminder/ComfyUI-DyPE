@@ -639,7 +639,7 @@ def windowed_attention(q_txt: torch.Tensor, k_txt: torch.Tensor, v_txt: torch.Te
                        q_img: torch.Tensor, k_img: torch.Tensor, v_img: torch.Tensor,
                        k_img_unrotated: torch.Tensor, layout: FineLayout,
                        rope_embedder=None, cap_len: int = 32, caption_rope=None,
-                       img_axis0: Optional[float] = None
+                       img_axis0: Optional[float] = None, text_keys_only: bool = False
                        ) -> tuple[torch.Tensor, torch.Tensor]:
     """Attention inside each window, its keys extended by the Halo ring and the bridge tokens.
 
@@ -676,11 +676,35 @@ def windowed_attention(q_txt: torch.Tensor, k_txt: torch.Tensor, v_txt: torch.Te
     (Krea-2's image tokens carry axis 0 = 0,
     ``comfy/ldm/krea2/model.py:291-294``).  The default reproduces today's
     behaviour byte for byte, so the Z-Image golden cannot move.
+
+    ``text_keys_only`` splits the ONE length this function used to couple the
+    text queries and the text keys by (``t = q_txt.shape[2]``) into the two
+    lengths they really have: ``t_q`` (the text QUERIES) and ``t_k`` (the text
+    KEYS).  A call that carries the caption's KEYS and NO text queries at all —
+    Qwen-Image-2.1's image segment, where the queries are the ``h*w`` image
+    rows and the keys are the JOINT set (``comfy/ldm/qwen_image21/model.py:
+    206-211``) — needs the caption to stay VISIBLE to the image queries while
+    producing no text answer of its own.  With the flag on, the query cat is
+    ``t_q + n`` rows, the key/value cat is ``t_k + n + extra`` rows and the
+    answer is split at ``t_q`` (``merged = out[:, :, :, t_q:]``); with the flag
+    OFF (the default) the two lengths are asserted equal and every line is the
+    line that is there today — the FLUX / Z-Image / Krea-2 goldens are the
+    proof.
     """
     b, heads, n_img, dim = q_img.shape
-    t = q_txt.shape[2]
+    # The text QUERIES and the text KEYS are two lengths, not one: a call with
+    # text keys and no text queries passes an EMPTY q_txt (``text_keys_only``).
+    t_q = q_txt.shape[2]
+    t_k = k_txt.shape[2]
+    if t_q != t_k and not text_keys_only:
+        raise ValueError(
+            f"AReA: the windowed attention received {t_q} text queries and {t_k} "
+            "text keys, but the default path couples them into one length. Pass "
+            "text_keys_only=True for a call that carries text keys and no text "
+            "queries (Qwen-Image-2.1's image segment)."
+        )
     out_img = torch.zeros(b, heads, n_img, dim, dtype=q_img.dtype, device=q_img.device)
-    out_txt = torch.zeros(b, heads, t, dim, dtype=q_img.dtype, device=q_img.device)
+    out_txt = torch.zeros(b, heads, t_q, dim, dtype=q_img.dtype, device=q_img.device)
     score = token_importance(k_img_unrotated) if layout.registers > 0 else None
 
     # GTCN Phase II (area-fix3): the caption's anchor table, ONE call for the
@@ -697,7 +721,7 @@ def windowed_attention(q_txt: torch.Tensor, k_txt: torch.Tensor, v_txt: torch.Te
             # FLUX path never imports it at all.
             from .area_zimage import _head_shared
             caption_rope = _head_shared(
-                rope_embedder(caption_window_ids(layout, t, q_img.device)))
+                rope_embedder(caption_window_ids(layout, t_k, q_img.device)))
         cap_rope = caption_rope
 
     for group in layout.groups:
@@ -709,12 +733,12 @@ def windowed_attention(q_txt: torch.Tensor, k_txt: torch.Tensor, v_txt: torch.Te
             win_ids = torch.tensor(_group_window_ids(group, layout),
                                    device=q_img.device, dtype=torch.long)
             rope = cap_rope.index_select(0, win_ids)
-            q_txt_g = _rope_per_group(q_txt, rope, b, heads, g, t, dim)
-            k_txt_g = _rope_per_group(k_txt, rope, b, heads, g, t, dim)
+            q_txt_g = _rope_per_group(q_txt, rope, b, heads, g, t_q, dim)
+            k_txt_g = _rope_per_group(k_txt, rope, b, heads, g, t_k, dim)
         else:
-            q_txt_g = q_txt.unsqueeze(2).expand(b, heads, g, t, dim)
-            k_txt_g = k_txt.unsqueeze(2).expand(b, heads, g, t, dim)
-        v_txt_g = v_txt.unsqueeze(2).expand(b, heads, g, t, dim)
+            q_txt_g = q_txt.unsqueeze(2).expand(b, heads, g, t_q, dim)
+            k_txt_g = k_txt.unsqueeze(2).expand(b, heads, g, t_k, dim)
+        v_txt_g = v_txt.unsqueeze(2).expand(b, heads, g, t_k, dim)
 
         extra_k, extra_v = [], []
         if score is not None:
@@ -763,18 +787,18 @@ def windowed_attention(q_txt: torch.Tensor, k_txt: torch.Tensor, v_txt: torch.Te
             extra_k.append(k_img[:, :, ring].reshape(b, heads, g, -1, dim))
             extra_v.append(v_img[:, :, ring].reshape(b, heads, g, -1, dim))
 
-        # the group runs as one SDPA call on [b*g, heads, t+n, d]; comfy keeps heads on axis 1, so
+        # the group runs as one SDPA call on [b*g, heads, t_q+n, d]; comfy keeps heads on axis 1, so
         # the group axis has to travel past the head axis to reach a shape SDPA accepts
         local = q_img[:, :, flat].reshape(b, heads, g, n, dim)
-        q = torch.cat([q_txt_g, local], dim=3).permute(0, 2, 1, 3, 4).reshape(b * g, heads, t + n, dim)
+        q = torch.cat([q_txt_g, local], dim=3).permute(0, 2, 1, 3, 4).reshape(b * g, heads, t_q + n, dim)
         k = torch.cat([k_txt_g, k_img[:, :, flat].reshape(b, heads, g, n, dim)] + extra_k,
                       dim=3).permute(0, 2, 1, 3, 4).reshape(b * g, heads, -1, dim)
         v = torch.cat([v_txt_g, v_img[:, :, flat].reshape(b, heads, g, n, dim)] + extra_v,
                       dim=3).permute(0, 2, 1, 3, 4).reshape(b * g, heads, -1, dim)
-        out = F.scaled_dot_product_attention(q, k, v).reshape(b, g, heads, t + n, dim)
+        out = F.scaled_dot_product_attention(q, k, v).reshape(b, g, heads, t_q + n, dim)
 
-        out_txt += out[:, :, :, :t].sum(dim=1)
-        merged = out[:, :, :, t:].permute(0, 2, 1, 3, 4).reshape(b, heads, g * n, dim)
+        out_txt += out[:, :, :, :t_q].sum(dim=1)
+        merged = out[:, :, :, t_q:].permute(0, 2, 1, 3, 4).reshape(b, heads, g * n, dim)
         out_img.index_add_(2, flat, merged * group.weights.view(1, 1, -1, 1))
 
     out_img = out_img / layout.coverage.clamp(min=1.0).view(1, 1, n_img, 1)
