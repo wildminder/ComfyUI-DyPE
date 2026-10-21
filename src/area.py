@@ -1738,6 +1738,30 @@ def _krea_install_seam(m, dm) -> bool:
 # ---------------------------------------------------------------------------
 
 
+def _qwen21_check_foreign(symbol) -> None:
+    """Refuse to install over another pack's hook on the same bound symbol.
+
+    SPA's Qwen-Image-2.1 target is this very symbol (``src/spa.py:575-582``
+    returns ``("comfy.ldm.qwen_image21.model", "optimized_attention", False)``)
+    and it marks its wrapper ``_spa_wrapper`` (``src/spa.py:1363``) — the same
+    collision the Krea-2 seam refuses (``_krea_check_foreign``).  Unlike FLUX —
+    where SPA binds ``comfy.ldm.flux.math.optimized_attention``, a *different*
+    symbol — there is ONE symbol here, so the two cannot coexist.  AReA never
+    wraps another pack's hook silently: the install raises and the user
+    reorders (plan §0, "foreign-binding collision ValueError").
+    """
+    if getattr(symbol, "_spa_wrapper", False):
+        raise ValueError(
+            f"AReA: {QWEN21_SEAM_MODULE}.{QWEN21_SEAM_SYMBOL} is already wrapped "
+            "by SPA (src/spa.py:575-582 patches this same bound symbol for "
+            "Qwen-Image-2.1, while for FLUX SPA binds comfy.ldm.flux.math."
+            "optimized_attention instead — a different symbol). AReA never "
+            "wraps another pack's hook silently: restore SPA before applying "
+            "AReA, or run the two on separate models. On a shared symbol "
+            "whichever pack installed last would own every step."
+        )
+
+
 def _qwen21_pristine(bound):
     """The pristine symbol behind ``bound`` — an AReA wrapper carries its own.
 
@@ -1757,6 +1781,77 @@ def _qwen21_pristine(bound):
             "seam cannot be installed safely. Restart ComfyUI to clear it."
         )
     return orig
+
+
+def _qwen21_current_attention():
+    """The CURRENT ``comfy.ldm.modules.attention.optimized_attention``.
+
+    ``optimized_attention`` is REASSIGNED at import across the backends
+    (sage / flash / xformers / pytorch / split / sub_quad /
+    comfy_kitchen_int8 — ``comfy/ldm/modules/attention.py:923-948``), so the
+    check follows the CURRENT binding and never a hardcoded
+    ``attention_basic`` (D4) — which would refuse every non-basic backend.
+    ``None`` when comfy's attention module is not importable here.
+    """
+    import importlib
+
+    try:
+        module = importlib.import_module("comfy.ldm.modules.attention")
+    except Exception:  # probe: comfy's attention module is not importable here
+        return None
+    return getattr(module, "optimized_attention", None)
+
+
+def _qwen21_check_fused(bound, backend) -> None:
+    """N5 — the seam symbol must be comfy's CURRENT attention implementation.
+
+    A quantized / fused attention kernel replaces the symbol the backend
+    module calls, and AReA would then patch a function the model never calls
+    — a SILENT no-op.  The check compares the backend module's own binding
+    against the CURRENT ``comfy.ldm.modules.attention.optimized_attention``
+    (D4), so a backend that imported a different variant is refused too.
+
+    The mock harness (``tests/_qwen21_seam_fixtures.py``) registers ITS OWN
+    module under comfy's name — that is the whole point of the harness: the
+    rebind must reach the model's globals — and its symbol is not comfy's, so
+    the check is about comfy's own backend and does not apply there.
+    """
+    if getattr(backend, "__name__", "") != QWEN21_SEAM_MODULE:
+        return
+    current = _qwen21_current_attention()
+    if current is None or bound is current:
+        return
+    raise ValueError(
+        f"AReA: {QWEN21_SEAM_MODULE}.{QWEN21_SEAM_SYMBOL} is not comfy's "
+        "current attention implementation (comfy/ldm/modules/attention.py:"
+        "923-948 reassigns optimized_attention per backend), so it is a "
+        "fused or quantized kernel and AReA would patch a function the model "
+        "never calls. Use a non-quantized Qwen-Image-2.1 loader."
+    )
+
+
+def _qwen21_disable_prefix_cache(m) -> None:
+    """Switch 2.1's prefix K/V cache OFF on AReA's own clone (N12).
+
+    The cache is ON by default (``comfy/model_base.py:2723-2724``) and the
+    cached path is LENGTH-INDISTINGUISHABLE from the plain image segment
+    (``model.py:222`` passes no ``mask`` keyword at all), so with the cache
+    on AReA would engage on NO call: every seam call would be either the
+    caption (masked) or the cached path.  The switch is the pack's
+    established mechanism (``src/prefix_cache.py:26-49``) and it is a HARD
+    PRECONDITION of the adaptation, not an optimisation.
+
+    The option is REPLACED, not mutated in place: the clone's
+    ``model_options`` is a fresh dict, so the caller's own transformer
+    options keep their own cache setting.
+    """
+    try:
+        model_options = m.model_options
+    except AttributeError:  # probe: a mock patcher without model_options
+        return
+    options = dict(model_options.get("transformer_options") or {})
+    options["qwen_image21_cache"] = {"device": "off"}
+    model_options["transformer_options"] = options
 
 
 def _qwen21_delegate(orig, q, k, v, heads, mask, attn_precision, skip_reshape,
@@ -2174,6 +2269,25 @@ def _qwen21_img_in_hook(module, args, output):
     rt.hidden = output
 
 
+def _qwen21_hooked(opts: dict) -> bool:
+    """Does this forward carry a model patch that rewrites 2.1's rope or states?
+
+    ``comfy/ldm/qwen_image21/model.py:356-359`` runs the ``post_input`` patches
+    over the built stream — and they may REPLACE the rope table ``pe`` — and
+    ``model.py:88-98`` runs the ``attn1_patch`` patches over q/k/v.  Either one
+    makes AReA's captured table (the model's own ``pe_embedder`` output) the
+    wrong table for the tensors the seam receives, so the forward must run
+    plain attention (N11).  The patches are per-FORWARD transformer options,
+    so this is a forward-time refusal — the install cannot know them.
+    """
+    patches = opts.get("patches") or {}
+    for name in ("post_input", "single_block", "attn1_patch"):
+        if patches.get(name):
+            return True
+    replace = opts.get("patches_replace") or {}
+    return bool(replace.get("dit"))
+
+
 def _qwen21_seam_is_live(dm, wrapper) -> bool:
     """Does the model's own backend module still call OUR seam symbol?
 
@@ -2220,6 +2334,23 @@ def _qwen21_install_seam(m, dm):
     """
     import importlib
 
+    # N11 — a model that carries an attention or post-input patch OF ITS OWN
+    # would have its rope table (or its hidden states) REPLACED behind AReA's
+    # back (``model.py:88-98``, ``:356-359``), so the captured table would not
+    # describe the rotation the seam receives.  Refuse BEFORE the rebind, so a
+    # refused install leaves the module pristine.  (A patch that arrives per
+    # FORWARD, through ``transformer_options``, is refused at forward time
+    # instead — the install cannot know it.)
+    for name in ("attn1_patch", "post_input"):
+        if getattr(dm, name, None) is not None:
+            raise ValueError(
+                f"AReA: this Qwen-Image-2.1 model carries a {name!r} patch, "
+                "which may replace the rope table or the hidden states "
+                "(comfy/ldm/qwen_image21/model.py:88-98, :356-359), so AReA's "
+                "captured rope table would not match the tensors the seam "
+                "receives. Use an unmodified Qwen-Image-2.1 loader."
+            )
+
     if _QSEAM["orig"] is None:
         try:
             mod = importlib.import_module(QWEN21_SEAM_MODULE)
@@ -2238,8 +2369,22 @@ def _qwen21_install_seam(m, dm):
                 "cannot be installed. Update ComfyUI (or load an unmodified "
                 "Qwen-Image-2.1 model)."
             )
+        _qwen21_check_foreign(bound)
         orig = _qwen21_pristine(bound)
+        _qwen21_check_fused(orig, mod)
         embedder = getattr(dm, "pe_embedder", None)
+        if embedder is None or not hasattr(embedder, "register_forward_hook"):
+            # N8 — without the model's own embedder there is no rope table to
+            # capture, so the seam's rotation cannot be undone and Phase I
+            # would pool rotated keys.  Refuse BEFORE the rebind, so the
+            # module is left pristine.
+            raise ValueError(
+                "AReA: this Qwen-Image-2.1 model has no diffusion_model."
+                "pe_embedder to hook, so AReA cannot capture the model's own "
+                "rope table and cannot undo the rotation the seam receives "
+                "(comfy/ldm/qwen_image21/model.py:99-100). Use an unmodified "
+                "Qwen-Image-2.1 loader."
+            )
         wrapper = _make_qwen21_wrapper(orig)
         setattr(mod, QWEN21_SEAM_SYMBOL, wrapper)
         if not _qwen21_seam_is_live(dm, wrapper):
@@ -2479,6 +2624,21 @@ def _area_resolve_forward(rt: _AreaRuntime, params: dict) -> AreaContext:
     if torch.is_tensor(cross) and cross.ndim >= 2:
         ctx.txt_len = int(cross.shape[1])
     opts = conds.get("transformer_options") or {}
+    if rt.profile is QWEN21_PROFILE and _qwen21_hooked(opts):
+        # N11 — a patched forward rewrites the rope table or the hidden
+        # states, so AReA's captured table would not match the seam's
+        # tensors.  The patches are per-FORWARD options, so this is a
+        # forward-time refusal: plain attention, once, loudly.
+        _warn_once(
+            "qwen21-patches",
+            "AReA: this Qwen-Image-2.1 forward carries model patches "
+            "(transformer_options['patches'] or 'patches_replace'), which "
+            "rewrite the rope table or the hidden states (comfy/ldm/"
+            "qwen_image21/model.py:88-98, :356-359), so AReA's captured rope "
+            "table would not match the tensors the seam receives. This "
+            "forward runs plain attention.",
+        )
+        return ctx
     step, total = _area_locate(opts.get("sample_sigmas"), opts.get("sigmas"))
     if step is None or max(h, w) <= rt.config.native:
         return ctx  # at/below the native extent AReA is a provable no-op
@@ -2711,6 +2871,12 @@ def apply_area_to_model(
     # The arch profile validates the pin against the model's own backbone and
     # refuses the Lumina2 siblings AReA cannot patch (pixel space, Ming-Image).
     profile = resolve_area_arch(dm, model_type)
+    if profile is QWEN21_PROFILE:
+        # N12 — 2.1's prefix K/V cache is ON by default, and the cached path
+        # is length-indistinguishable from the plain image segment, so with
+        # the cache on AReA would engage on no call at all.  The switch is a
+        # HARD PRECONDITION of this adaptation (the design's H2).
+        _qwen21_disable_prefix_cache(m)
     # The pixel multiple and the trained extent are the PROFILE's — they are
     # per-backbone facts (a 16x VAE would make a Krea-2 token 32 px wide).
     # FLUX and Z-Image keep 16 px and 64 tokens, so their numbers do not move.

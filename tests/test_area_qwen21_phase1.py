@@ -314,6 +314,16 @@ def test_the_seam_is_live_for_the_backend_module(seam):
     assert area._qwen21_seam_is_live(dm, wrapper)
 
 
+def test_a_foreign_wrapper_is_refused():
+    """SPA's marker on the bound symbol is a refusal, not a silent wrap."""
+    def foreign(q, k, v, heads, **kw):  # pragma: no cover - never called
+        return None
+
+    foreign._spa_wrapper = True
+    with pytest.raises(ValueError, match="SPA"):
+        area._qwen21_check_foreign(foreign)
+
+
 def test_the_sentinel_is_not_a_mask():
     """``None`` is a legal mask, so the absent keyword needs its own value."""
     assert QWEN21_NO_MASK is not None
