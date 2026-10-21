@@ -1,4 +1,4 @@
-"""Z-Image adapter tensors — ropes, capture, pad policy (plan 2026-10-16, §4/§7-t3).
+"""Z-Image adapter tensors — ropes, capture, pad policy (plan §4/§7-t3).
 
 The engine (``src/area_attn.py``, ``src/area_schedule.py``) is backbone-agnostic
 and imports no comfy module; everything Z-Image-specific about *tensors* lives
@@ -21,7 +21,7 @@ so FLUX's all-zero text ids (``src/area.py:264-277``) are NOT copied.
 The three helpers that undo the rotation — :func:`unrotate_table`,
 :func:`unrotate1` and :func:`_head_shared` — are shared with the Krea-2
 adapter and live in ``src/area_rope.py``; the names here are re-exports of the
-very same objects (plan 2026-10-20, §5.1/S3).
+very same objects (plan §5.1/S3).
 
 **Capture — the model's own tables, in call order.**  lumina calls
 ``rope_embedder`` once per token GROUP (caption, then image — ``embed_all``,
@@ -170,7 +170,7 @@ def sigma_prefix_count(sigmas, sigma_star: float) -> int:
 # ``unrotate_table``, ``unrotate1`` and ``_head_shared`` live in
 # ``src/area_rope.py`` — they are backbone-agnostic (Krea-2's seam is rotated
 # the same way, ``comfy/ldm/krea2/model.py:93``), so they are shared rather than
-# duplicated (plan 2026-10-20, §5.1/S3).  The names below are RE-EXPORTS of the
+# duplicated (plan §5.1/S3).  The names below are RE-EXPORTS of the
 # very same objects, so ``src/area.py`` and the existing tests keep importing
 # them from here unchanged.
 

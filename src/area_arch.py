@@ -18,7 +18,7 @@ cap AND image tokens to a multiple of 32
 FLUX pads to nothing.
 
 **Krea-2** (``SingleStreamDiT``, ``comfy/ldm/krea2/model.py:234``) joins them
-in S4 (plan 2026-10-20, §7/S4).  Its token size is the same **16 px**
+in S4 (plan §7/S4).  Its token size is the same **16 px**
 (``KREA_PX_PER_PATCH`` — an 8x VAE and a 2x2 patch, ASSUMED: the VAE family is
 the checkpoint's, not the source's) and it pads nothing at all
 (``seq_pad_multiple == 0``, ``comfy/ldm/krea2/model.py:355``), so its profile
@@ -62,7 +62,7 @@ latents, the four auxiliary 20-head calls — belong to the forward-time
 resolution (``src/area.py``), not to the profile.
 
 **Qwen-Image-2.1** (``QwenImage21Transformer2DModel``,
-``comfy/ldm/qwen_image21/model.py:234``) joins them in S5 (plan 2026-10-21,
+``comfy/ldm/qwen_image21/model.py:234``) joins them in S5 (plan,
 §7/S5).  Its token size is **16 px** — MEASURED, unlike Krea-2's: the latent
 format downsamples 16x and 2.1 does not patchify on top of it
 (``comfy/latent_formats.py:957-960``, ``model.py:260``) — and it pads nothing

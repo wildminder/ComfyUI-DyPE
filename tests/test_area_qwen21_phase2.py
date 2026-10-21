@@ -1,4 +1,4 @@
-"""Qwen-Image-2.1 Phase II — the segment-aware windowed attention (plan 2026-10-21, §7/S8).
+"""Qwen-Image-2.1 Phase II — the segment-aware windowed attention (plan §7/S8).
 
 Phase II on 2.1 is unlike every other backbone: the eligible call carries the
 IMAGE queries only and the JOINT key set (``comfy/ldm/qwen_image21/model.py:

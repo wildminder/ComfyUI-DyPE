@@ -1,4 +1,4 @@
-"""AReA × Z-Image — the seam wiring (plan 2026-10-16, §4/§7-t4).
+"""AReA × Z-Image — the seam wiring (plan §4/§7-t4).
 
 Everything here is mock-based and GPU-free, per project convention.  The mock
 mirrors the real call convention exactly as the rest of the suite does:

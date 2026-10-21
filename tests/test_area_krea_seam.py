@@ -1,5 +1,5 @@
 """AReA × Krea-2 — the seam install and the forward-time resolution
-(plan 2026-10-20, §7/S6 and §7/S7).
+(plan §7/S6 and §7/S7).
 
 Krea-2 binds its OWN copy of the attention symbol
 (``from comfy.ldm.modules.attention import ... optimized_attention_masked``,

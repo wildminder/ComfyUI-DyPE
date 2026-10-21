@@ -1,5 +1,5 @@
 """Qwen-Image-2.1 Phase I — the seam install and the coarse pooled attention
-(plan 2026-10-21, §7/S6).
+(plan §7/S6).
 
 The Qwen-Image-2.1 seam is a FOURTH binding: 2.1 imports the *unmasked*
 ``optimized_attention`` into its OWN module (``comfy/ldm/qwen_image21/model.py:

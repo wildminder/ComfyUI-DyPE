@@ -1,4 +1,4 @@
-"""AReA — the shared rope helpers (plan 2026-10-20, §7/S3).
+"""AReA — the shared rope helpers (plan §7/S3).
 
 The rope maths moved out of the Z-Image adapter into ``src/area_rope.py``,
 because Krea-2's seam is rotated the same way (``comfy/ldm/krea2/model.py:93``)

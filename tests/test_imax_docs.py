@@ -1,4 +1,4 @@
-"""README documentation pins for I-Max Z-Image support (plan 2026-10-06, P5).
+"""README documentation pins for I-Max Z-Image support (plan P5).
 
 v2.19.0 widened I-Max from FLUX-only to FLUX + Z-Image (nodes/imax.py gate,
 per-group NTK clip, ``optimized_attention_override`` seam). These tests pin

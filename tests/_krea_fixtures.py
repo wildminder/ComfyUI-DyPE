@@ -1,4 +1,4 @@
-"""A comfy-faithful Krea-2 mock harness for the AReA seam (plan 2026-10-20, §7/S1).
+"""A comfy-faithful Krea-2 mock harness for the AReA seam (plan §7/S1).
 
 Everything here is mock-based and GPU-free, per project convention.  The mock
 mirrors ``comfy/ldm/krea2/model.py`` (393 lines) closely enough that the seam

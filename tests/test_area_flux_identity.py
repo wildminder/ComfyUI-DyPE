@@ -1,5 +1,5 @@
 """AReA × Krea-2 — the FLUX/Z-Image byte-identity guard and the CI-marker guard
-(plan 2026-10-20, §7/S10).
+(plan §7/S10).
 
 The Krea-2 adaptation added a THIRD attention seam, a THIRD arch profile and
 one additive keyword to the engine (``windowed_attention(..., img_axis0=None)``

@@ -623,7 +623,7 @@ def _phase1_count(rt: _AreaRuntime, opts: dict) -> int:
 #: The builder is shared with the Krea-2 adapter (whose ids have the same FLUX
 #: shape) and lives in ``src/area_rope.py`` — this is a thin ALIAS of
 #: :func:`src.area_rope.flux_style_ids`, not a copy, so the two can never drift
-#: apart (plan 2026-10-20, §5.1/S3).
+#: apart (plan §5.1/S3).
 _area_rope_ids = flux_style_ids
 
 
@@ -2735,7 +2735,7 @@ def _area_resolve_forward(rt: _AreaRuntime, params: dict) -> AreaContext:
                     "AReA: bootstrap mode runs Phase II from the first step, "
                     "but this sampler enters at sigma %.2f while phase1_sigma "
                     "is %.2f — the native-resolution pre-pass must hand the "
-                    "latent over re-noised to sigma_star (plan 2026-10-18-area-"
+                    "latent over re-noised to sigma_star (plan-area-"
                     "zimage-bootstrap, step B2), or this run starts windowed "
                     "attention on a canvas composed for a different noise "
                     "level.",

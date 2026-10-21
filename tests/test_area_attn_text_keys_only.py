@@ -1,4 +1,4 @@
-"""The additive ``text_keys_only`` keyword of the AReA engine (plan 2026-10-21, §7/S7).
+"""The additive ``text_keys_only`` keyword of the AReA engine (plan §7/S7).
 
 The engine's :func:`~src.area_attn.windowed_attention` used to couple the text
 queries and the text keys through ONE length (``t = q_txt.shape[2]``) — the

@@ -1,6 +1,6 @@
 """Tests for src/imax.py — I-Max core engine (Tier 1: pure unit tests).
 
-Phases 1-3 of plan 2026-10-05:
+Phases 1-3 of plan:
 - Haar low-pass projection P (D7) — the pywt-oracle test is the fidelity
   tripwire against a real Haar wavedec2/waverec2 round trip;
 - flow sigma schedules, cosine decay factor, x0-space Projected Flow (D6)

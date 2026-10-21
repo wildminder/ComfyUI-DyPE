@@ -1,5 +1,5 @@
 """
-I-Max ComfyUI node layer — inference toolkit + node (plan 2026-10-05, P4-P6).
+I-Max ComfyUI node layer — inference toolkit + node (plan P4-P6).
 
 The inference-time compensations of I-Max (arXiv 2410.07536 §2.3) as ComfyUI
 transformer patches, the per-pass ``model_options`` builder that installs them
@@ -35,7 +35,7 @@ Toolkit items and their decisions:
   a ``clip_mode="per_group"`` serves the lumina ``NextDiT`` wiring
   (Z-Image), which calls its embedder once per token group: the image
   group clips against its own group length, the caption group takes the
-  paper's model-wide NTK scaling with no floor (plan 2026-10-06 D4').
+  paper's model-wide NTK scaling with no floor (plan D4').
 - D8 — proportional self-attention. The reference overrides the SDPA scale
   with ``sqrt(log(N_joint, 4608) / head_dim)`` (attention_processor.py:1773-
   1777 AND :1889-1893 — log BASE 4608, not the natural log of the ratio a
@@ -51,7 +51,7 @@ Toolkit items and their decisions:
   model.py:179-182) — with the anchor the z-image native sequence length
   (native image grid + padded caption) and the call forwarded through the
   lumina ``optimized_attention_masked`` symbol so chained SPA rebindings
-  compose (plan 2026-10-06).
+  compose (plan).
 - D9 — text duplication via ``post_input``. The reference tiles the text
   stream ``nh*nw`` times (transformer_flux.py:364-375), offsetting each
   copy's position grid by ``(i*64, j*64)`` so every text copy shares a RoPE
@@ -64,7 +64,7 @@ Toolkit items and their decisions:
   patch is FLUX-only — the paper applies text duplication to MMDiT Flux
   (Lumina-Next uses cross-attention) and lumina blocks have no
   ``post_input`` seam — so the z-image wiring warns and installs nothing
-  (plan 2026-10-06 D5).
+  (plan D5).
 - D5 — per-pass model options. :func:`build_pass_model_options` nested-clones
   ``model.model_options`` (comfy's own ``create_model_options_clone`` when
   importable, a local mirror otherwise) and APPENDS the toolkit patches —
@@ -107,7 +107,7 @@ logger = logging.getLogger("ComfyUI-DyPE")
 # these two constants.
 _TRAIN_SEQ_LEN = 4608
 _NATIVE_GRID = 64
-# D4' clip-floor variants (plan 2026-10-06): "joint" — the FLUX reference
+# D4' clip-floor variants (plan): "joint" — the FLUX reference
 # port (N is the whole stream, text_tokens subtracted); "per_group" — the
 # lumina NextDiT wiring (one token group per call, no subtraction).
 _CLIP_MODES = ("joint", "per_group")
@@ -150,7 +150,7 @@ def ntk_rope_omega(
     ``N <= text_tokens`` (512); here the clip is skipped in that degenerate
     regime instead (documented deviation, plan §1.1 defect policy).
 
-    ``clip_mode`` selects the floor's ratio (plan 2026-10-06 D4'):
+    ``clip_mode`` selects the floor's ratio (plan D4'):
 
     - ``"joint"`` (default, FLUX): ``N`` is the JOINT stream length and the
       ratio subtracts ``text_tokens`` — the literal port above.
@@ -235,7 +235,7 @@ class IMaxNTKEmbedder(torch.nn.Module):
     to ``apply_rope``. The wrapper (P6) swaps this in for the duration of a
     forward pass and restores ``inner`` afterwards.
 
-    ``clip_mode`` (plan 2026-10-06 D4'): ``"joint"`` — the FLUX wiring, one
+    ``clip_mode`` (plan D4'): ``"joint"`` — the FLUX wiring, one
     call with the whole stream, the clip floor subtracts ``text_tokens``
     (default ``train_seq_len - native_grid**2`` = 512, bitwise-neutral;
     :meth:`set_text_tokens` re-records it). ``"per_group"`` — the lumina
@@ -449,7 +449,7 @@ def make_attention_scale_override(
     passes. Clamped to exactly 1.0 at/below the anchor — an exact no-op
     pass-through. APPROXIMATION: the override sees the per-call N only — an
     image-only sub-stream call (no caption rows) is scaled against the JOINT
-    anchor, a <=1% ratio error (plan 2026-10-06 §5).
+    anchor, a <=1% ratio error (plan §5).
 
     Dispatch after the scale deliberately does NOT call ``func``: ``func``
     is wrap_attn's raw backend and calling it would bypass a chained SPA
@@ -588,7 +588,7 @@ def build_pass_model_options(
     ``m.model_options`` is never touched. Pass A builds with ``enabled=False``
     and gets a clone with no I-Max patches; pass B builds with ``True``.
 
-    ``arch_profile`` selects the D8 seam (plan 2026-10-06): ``"flux"`` keeps
+    ``arch_profile`` selects the D8 seam (plan): ``"flux"`` keeps
     the ``attn1_patch`` q pre-scale; ``"zimage"`` installs
     :func:`make_attention_scale_override` on the GLOBAL
     ``transformer_options["optimized_attention_override"]`` instead — lumina
@@ -862,7 +862,7 @@ def _make_imax_unet_wrapper(
       patch/unpatch window, nothing to leak (D4).
 
     ``clip_mode`` feeds the embedder's constructor (``"per_group"`` serves the
-    lumina per-token-group wiring, plan 2026-10-06 D4'); ``text_tokens``
+    lumina per-token-group wiring, plan D4'); ``text_tokens``
     records the D8 padded caption length on the constructed embedder
     (``None`` — the default — keeps the embedder's flux default, D7).
     ``previous_wrapper`` (a chained DyPE wrapper found on the cloned
@@ -1103,7 +1103,7 @@ def _wrap_final_x0_call(
 
 
 # ---------------------------------------------------------------------------
-# D8 cap-token accounting (plan 2026-10-06 — the z-image caption padding)
+# D8 cap-token accounting (plan — the z-image caption padding)
 # ---------------------------------------------------------------------------
 
 # Z-Image's caption pad multiple: comfy sets pad_tokens_multiple=32 exactly
@@ -1315,7 +1315,7 @@ class IMaxNode(io.ComfyNode):
         _, latent_dimensions = _require_flux_flow_model(model)
         warn_if_stale_leak(model, "I-Max")
 
-        # ---- Arch profile branch (plan 2026-10-06 D5/D6/D8/D10). ----------
+        # ---- Arch profile branch (plan D5/D6/D8/D10). ----------
         # The gate just accepted this model, so re-resolving the profile is
         # pure (the same MRO/attr reads — no guard can fire twice).
         diffusion_model = _resolve_diffusion_model(model)

@@ -1,4 +1,4 @@
-"""A comfy-faithful Qwen-Image-2.1 mock harness for the AReA seam (plan 2026-10-21, §7/S1).
+"""A comfy-faithful Qwen-Image-2.1 mock harness for the AReA seam (plan §7/S1).
 
 Everything here is mock-based and GPU-free, per project convention.  The mock
 mirrors ``comfy/ldm/qwen_image21/model.py`` (418 lines) closely enough that the

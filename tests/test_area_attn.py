@@ -750,7 +750,7 @@ class TestNoGlobalRngReads:
 
 
 # ---------------------------------------------------------------------------
-# The ONE additive engine keyword: ``img_axis0`` (plan 2026-10-20, §7/S8)
+# The ONE additive engine keyword: ``img_axis0`` (plan §7/S8)
 # ---------------------------------------------------------------------------
 
 

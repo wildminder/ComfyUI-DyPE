@@ -1,4 +1,4 @@
-"""Qwen-Image-2.1 — the install-time rejection contract (plan 2026-10-21, §6, §7/S9).
+"""Qwen-Image-2.1 — the install-time rejection contract (plan §6, §7/S9).
 
 Every negative path of the Qwen-Image-2.1 adaptation, in one place:
 

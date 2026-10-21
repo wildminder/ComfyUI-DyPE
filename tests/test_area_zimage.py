@@ -1,4 +1,4 @@
-"""Z-Image support — arch profile and node inputs (plan 2026-10-16, Phase 1).
+"""Z-Image support — arch profile and node inputs (plan Phase 1).
 
 ``docs/2026-10-16-area-zimage.md`` §4/§7-t2.  Everything here is mock-based and
 GPU-free, per project convention.  What this file pins:
@@ -844,7 +844,7 @@ class TestPhaseRegimeAdvisory:
 
 
 # ---------------------------------------------------------------------------
-# Bootstrap mode — the paper's Appendix F switch (plan 2026-10-18, step B1)
+# Bootstrap mode — the paper's Appendix F switch (plan step B1)
 # ---------------------------------------------------------------------------
 
 

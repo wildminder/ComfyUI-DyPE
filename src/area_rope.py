@@ -1,4 +1,4 @@
-"""Shared rope helpers for the AReA adapters (plan 2026-10-20, §5.1/S3).
+"""Shared rope helpers for the AReA adapters (plan §5.1/S3).
 
 The backbones that need them disagree about the LAYOUT of a rope table, not
 about the maths, so the maths lives here once:

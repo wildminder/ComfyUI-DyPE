@@ -1,4 +1,4 @@
-"""AReA × Krea-2 — the geometry, the arch profile and the adapter (plan 2026-10-20, §7/S2/S4/S5).
+"""AReA × Krea-2 — the geometry, the arch profile and the adapter (plan §7/S2/S4/S5).
 
 Krea-2's latent arrives 5-D — its latent format is ``Wan21``
 (``comfy/supported_models.py:2009-2035``), whose ``latent_dimensions == 3``

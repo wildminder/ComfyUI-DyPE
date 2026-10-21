@@ -1,6 +1,6 @@
 """Tests for nodes/imax.py — I-Max inference toolkit (Tier 2).
 
-Phases 4-5 of plan 2026-10-05:
+Phases 4-5 of plan:
 - the NTK-aware RoPE embedder (D4) and its omega formula, pinned against a
   local mirror of comfy's EmbedND rope (ldm/flux/math.py:20-31 +
   ldm/flux/layers.py:15-30) and the reference omega
@@ -10,7 +10,7 @@ Phases 4-5 of plan 2026-10-05:
 - the text-duplication post_input patch (D9, transformer_flux.py:364-375);
 - the per-pass model_options builder (D5).
 
-v2.19.0 (plan 2026-10-06): the per-group clip mode for the lumina NextDiT
+v2.19.0 (plan): the per-group clip mode for the lumina NextDiT
 rope_embedder (D4') — image group clips against its own group length, cap
 group takes pure NTK.
 
@@ -262,7 +262,7 @@ class TestIMaxNTKEmbedder:
 
 
 # ---------------------------------------------------------------------------
-# NTK RoPE embedder, per-group clip mode (v2.19.0 D4', plan 2026-10-06)
+# NTK RoPE embedder, per-group clip mode (v2.19.0 D4', plan)
 # ---------------------------------------------------------------------------
 
 def _ntk_rope_reference(pos: torch.Tensor, dim: int, theta,
@@ -601,7 +601,7 @@ class TestProportionalAttentionPatch:
 
 
 # ---------------------------------------------------------------------------
-# Proportional attention override (v2.19.0 D8, z-image — plan 2026-10-06)
+# Proportional attention override (v2.19.0 D8, z-image — plan)
 # ---------------------------------------------------------------------------
 
 def _raw_attn_stub(q, k, v, heads, *args, **kwargs):
@@ -2024,7 +2024,7 @@ class TestIMaxNodeExecute:
 
 
 # ---------------------------------------------------------------------------
-# Z-Image node wiring (v2.19.0 Phase 4, plan 2026-10-06 D5/D6/D8/D10)
+# Z-Image node wiring (v2.19.0 Phase 4, plan D5/D6/D8/D10)
 # ---------------------------------------------------------------------------
 
 @pytest.mark.unit

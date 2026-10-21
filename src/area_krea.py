@@ -1,4 +1,4 @@
-"""Krea-2 adapter — the geometry (plan 2026-10-20, §5.2/S2).
+"""Krea-2 adapter — the geometry (plan §5.2/S2).
 
 Krea-2 is a single-stream MMDiT (``comfy/ldm/krea2/model.py``): 28
 ``SingleStreamBlock``s, 48 query heads over 12 KV heads, a 12-layer Qwen3-VL

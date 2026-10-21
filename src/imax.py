@@ -14,7 +14,7 @@ ZERO ComfyUI imports, ``@torch.no_grad()`` everywhere, dependency-injected
 — the node layer owns the VAE round trip of the guidance latent, the
 model-space latent-format conversions and the per-pass model options.
 
-Design decisions implemented here (plan 2026-10-05, D6/D7/D10/D14):
+Design decisions implemented here (plan D6/D7/D10/D14):
 
 - D6 — Projected Flow runs in x0 space. ``sampling_function`` returns the
   denoised x̂₁, and with a linear low-pass ``P`` the reference's

@@ -1,4 +1,4 @@
-"""AReA × Krea-2 — the SEAM PROBE (plan 2026-10-20, §7/S1).
+"""AReA × Krea-2 — the SEAM PROBE (plan §7/S1).
 
 This step writes NO AReA code: it produces the harness and the proof every
 later step depends on — that the seam is REACHED, WITH WHICH CONVENTION, and
