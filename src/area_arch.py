@@ -3,9 +3,9 @@
 AReA is a *model-side* attention replacement, so apply time starts with one
 question: which diffusion backbone is this?  The engine (``src/area_attn.py``,
 ``src/area_schedule.py``) is backbone-agnostic — it pools keys, builds windows
-and reads rope tables — and every FLUX/Z-Image/Krea-2 difference lives in the
-adapter that feeds it.  :class:`_ArchProfile` is that difference in six fields,
-resolved once (plan §4, Q7/Q9).
+and reads rope tables — and every FLUX/Z-Image/Krea-2/Qwen-Image-2.1 difference
+lives in the adapter that feeds it.  :class:`_ArchProfile` is that difference in
+six fields, resolved once (plan §4, Q7/Q9).
 
 **Three backbones, one node.** FLUX (``Flux``, ``comfy/ldm/flux/model.py``) and
 Z-Image (``NextDiT``, ``comfy/ldm/lumina/model.py:442``, bound by
@@ -61,6 +61,17 @@ raise (plan Q15).  Krea-2's *runtime* rejections — video latents, reference
 latents, the four auxiliary 20-head calls — belong to the forward-time
 resolution (``src/area.py``), not to the profile.
 
+**Qwen-Image-2.1** (``QwenImage21Transformer2DModel``,
+``comfy/ldm/qwen_image21/model.py:234``) joins them in S5 (plan 2026-10-21,
+§7/S5).  Its token size is **16 px** — MEASURED, unlike Krea-2's: the latent
+format downsamples 16x and 2.1 does not patchify on top of it
+(``comfy/latent_formats.py:957-960``, ``model.py:260``) — and it pads nothing
+at all (``seq_pad_multiple == 0``, ``model.py:311-339``), so its profile
+differs from FLUX's only in the backbone name, the pixel factor's provenance,
+the trained extent in tokens and the shape-aware bridge.  Its *runtime*
+rejections — the prefix-cache path, the reference latents — belong to the
+forward-time resolution (``src/area.py``), not to the profile.
+
 Nunchaku (quantized, fused kernels) is neither: fused attention bypasses the
 seam entirely, so it is warned about and returned **unchanged** by the caller
 (``src/area.py:605-614``, the HAP precedent at ``src/hap.py:897-903``) instead
@@ -73,6 +84,7 @@ from dataclasses import dataclass
 from typing import Optional
 
 from .area_krea import KREA_BACKBONE, KREA_NATIVE_TOKENS, KREA_PX_PER_PATCH
+from .area_qwen21 import QWEN21_BACKBONE, QWEN21_NATIVE_TOKENS, QWEN21_PX_PER_PATCH
 from .model_detect import resolve_model_type
 
 __all__ = [
@@ -82,6 +94,8 @@ __all__ = [
     "KREA_REQUESTS",
     "NEXT_DIT_BACKBONE",
     "PIXEL_SPACE_BACKBONE",
+    "QWEN21_PROFILE",
+    "QWEN21_REQUESTS",
     "ZIMAGE_PROFILE",
     "_ArchProfile",
     "resolve_area_arch",
@@ -172,6 +186,34 @@ KREA_PROFILE = _ArchProfile(
 #: here.
 KREA_REQUESTS = ("auto", "krea2")
 
+#: Qwen-Image-2.1 (``comfy/ldm/qwen_image21/model.py:234``) — a single-stream
+#: MMDiT with 32 blocks of ONE attention call each and a **block-causal** stream
+#: (the caption is a segment of its own, the image another — ``model.py:311-339``).
+#:
+#: ``seq_pad_multiple`` is 0: 2.1 pads nothing (``model.py:311-339`` builds the
+#: joint stream with no padding at all).  The pixel factor is MEASURED — the
+#: latent format downsamples 16x and 2.1 does not patchify on top of it
+#: (``comfy/latent_formats.py:957-960``, ``model.py:260``) — while the trained
+#: extent in tokens is ASSUMED (no checkpoint in the dev environment,
+#: ``src/area_qwen21.py``).
+#:
+#: ``bridge_shape_aware`` is True for the Krea-2 reason: the paper's square
+#: ``(rho*w)^2`` bridge count over-provisions on a non-square canvas, and a
+#: Qwen-Image-2.1 canvas is whatever the user asked for.
+QWEN21_PROFILE = _ArchProfile(
+    "qwen21", QWEN21_BACKBONE, QWEN21_PX_PER_PATCH, 0,
+    "Qwen-Image-2.1 (QwenImage21Transformer2DModel) diffusion model",
+    native_tokens=QWEN21_NATIVE_TOKENS,
+    bridge_shape_aware=True,
+)
+
+#: The ``model_type`` requests a Qwen-Image-2.1 backbone accepts.  Everything
+#: else is a contradiction and raises: the resolver pins the backbone by CLASS
+#: NAME first (``src/model_detect.py:50-51``), so ``resolve_model_type`` cannot
+#: report the contradiction for a 2.1 model — the requested string has to be
+#: checked here.
+QWEN21_REQUESTS = ("auto", "qwen21")
+
 
 def _mro_names(diffusion_model) -> tuple[str, ...]:
     """Class names on the model's MRO — the backbone's identity."""
@@ -220,6 +262,19 @@ def resolve_area_arch(diffusion_model, requested_type: str = "auto") -> Optional
     """
     mro = _mro_names(diffusion_model)
     detected_type = resolve_model_type(diffusion_model, requested_type)
+
+    if QWEN21_BACKBONE in mro:
+        # A Qwen-Image-2.1 backbone (``comfy/ldm/qwen_image21/model.py:234``).
+        # The resolver pins it by CLASS NAME (``src/model_detect.py:50-51``), so
+        # a 2.1 model resolves to "qwen21" whatever the node asked for — the
+        # contradiction has to be read off the REQUESTED string.
+        if requested_type not in QWEN21_REQUESTS:
+            raise ValueError(
+                f"AReA was asked for {requested_type!r} but this model is a "
+                "Qwen-Image-2.1 (QwenImage21Transformer2DModel) diffusion model. "
+                "Set the node's model_type to 'qwen21' (or leave it on 'auto')."
+            )
+        return QWEN21_PROFILE
 
     if KREA_BACKBONE in mro:
         # A Krea-2 backbone (``comfy/ldm/krea2/model.py:234``).  The resolver
@@ -278,6 +333,19 @@ def resolve_area_arch(diffusion_model, requested_type: str = "auto") -> Optional
             "cannot be trusted. Load a Krea-2 checkpoint, or set the node's "
             "model_type to 'flux' / 'zimage' (or leave it on 'auto')."
         )
+    if detected_type == "qwen21":
+        # The node asked for Qwen-Image-2.1 (an explicit "qwen21" pin
+        # short-circuits the resolver, ``src/model_detect.py:58-59``) but the
+        # backbone is not a ``QwenImage21Transformer2DModel`` — the same class
+        # of contradiction as the Krea-2 probe below.
+        raise ValueError(
+            "AReA was asked for 'qwen21' but this model's backbone is not a "
+            "QwenImage21Transformer2DModel (comfy/ldm/qwen_image21/model.py:234), "
+            "so AReA's Qwen-Image-2.1 geometry (the block-causal joint "
+            "[text | image] stream, the 16 px token grid) cannot be trusted. "
+            "Load a Qwen-Image-2.1 checkpoint, or set the node's model_type to "
+            "'flux' / 'zimage' (or leave it on 'auto')."
+        )
     if detected_type == "zimage":
         # The rope_embedder probe claims Z-Image but the backbone disagrees —
         # a pin on a non-Lumina2 model, or an upstream rename of NextDiT.
@@ -290,9 +358,9 @@ def resolve_area_arch(diffusion_model, requested_type: str = "auto") -> Optional
         )
     if detected_type != "flux":
         raise ValueError(
-            "AReA supports FLUX, Z-Image and Krea-2, but the resolved model "
-            f"type is {detected_type!r}. Load an unmodified (non-quantized) "
-            "FLUX, Z-Image or Krea-2 model, or use SPA / DyPE / SEGA for this "
-            "architecture."
+            "AReA supports FLUX, Z-Image, Krea-2 and Qwen-Image-2.1, but the "
+            f"resolved model type is {detected_type!r}. Load an unmodified "
+            "(non-quantized) FLUX, Z-Image, Krea-2 or Qwen-Image-2.1 model, or "
+            "use SPA / DyPE / SEGA for this architecture."
         )
     return FLUX_PROFILE
