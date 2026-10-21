@@ -94,6 +94,8 @@ __all__ = [
     "QWEN21_TRAINED_RESOLUTION_PX",
     "QWEN21_VAE_DOWNSCALE",
     "Qwen21Layout",
+    "Qwen21RopeRecorder",
+    "capture_qwen21_table",
     "qwen21_centred_axis",
     "qwen21_coarse_key_ids",
     "qwen21_coarse_query_ids",
@@ -652,5 +654,152 @@ def qwen21_slice_table(table: torch.Tensor, start: int, end: int) -> torch.Tenso
     same rows, in the same order, with the same phases.
     """
     return table[:, :, int(start):int(end)]
+
+
+# ---------------------------------------------------------------------------
+# The rope capture — the model's own table, once per forward
+# ---------------------------------------------------------------------------
+
+
+class Qwen21RopeRecorder:
+    """Per-forward capture of the ONE rope table the model's own embedder built.
+
+    2.1 builds its table ONCE per forward — ``self.pe_embedder(ids)`` over the
+    whole joint stream (``comfy/ldm/qwen_image21/model.py:338``) — and applies
+    it itself BEFORE the seam (``model.py:99-100``), so the seam receives
+    rotated q/k and NO table.  Phase I has to pool *unrotated* keys, which
+    means the model's own table has to be inverted
+    (:func:`src.area_rope.unrotate_table`).
+
+    **The first table wins, and it is never overwritten.**  The coarse Phase I
+    tables are built through the very SAME embedder (so a chained DyPE/SEGA
+    embedder composes), which means the capture hook would see them too.  Two
+    mechanisms keep that from polluting the forward:
+
+    * :meth:`paused` suspends the capture around a coarse build — the pause
+      guard;
+    * a table that arrives anyway (an embedder call the wiring did not know
+      about) is IGNORED: the first table stays, and the extra one is only
+      counted (:attr:`extra_tables`, :attr:`ambiguous`).
+
+    The recorder stores tensors only; it never rebinds a module symbol.  It is
+    armed and reset per forward (the SPA discipline,
+    ``src/spa.py:1385-1476``), so no table leaks across models or steps.
+    """
+
+    __slots__ = ("_extra", "_paused", "_table", "armed")
+
+    def __init__(self) -> None:
+        self._table: Optional[torch.Tensor] = None
+        self._extra = 0
+        self._paused = 0
+        # The caller's arming window: the recorder only records while the
+        # wiring has armed it, so an embedder call outside the forward of
+        # interest (a refiner pass, a chained embedder's own call) is ignored.
+        self.armed = False
+
+    def reset(self) -> None:
+        """Forget this forward's table — called at the start of each forward."""
+        self._table = None
+        self._extra = 0
+
+    def record(self, table: torch.Tensor) -> None:
+        """Capture one table, if this forward's table has not been seen yet.
+
+        ``table`` is what the embedder's forward hook sees: an ``EmbedND``
+        result ``[b, 1, n, axes, 2, 2]`` (``comfy/ldm/flux/layers.py:14-29``).
+        It is normalised to the head-shared layout on the way in, so every
+        accessor reads the sequence length off axis 2.
+
+        The FIRST table of the forward is kept; any later one is counted and
+        dropped — it never replaces the model's own table (the recorder is
+        paused around the coarse builds, so a second table means the wiring
+        missed a pause).
+        """
+        if not self.armed or self._paused:
+            return
+        if not torch.is_tensor(table) or table.dim() < 3:
+            raise ValueError(
+                "AReA: the Qwen-Image-2.1 rope recorder was handed %s, which "
+                "is not an EmbedND table ([b, 1, n, axes, 2, 2]). A pe_embedder "
+                "forward hook must record the embedder's output."
+                % type(table).__name__
+            )
+        if self._table is None:
+            self._table = head_shared(table)
+        else:
+            self._extra += 1
+
+    @property
+    def table(self) -> Optional[torch.Tensor]:
+        """This forward's table — the model's OWN, or ``None`` if none was seen."""
+        return self._table
+
+    @property
+    def extra_tables(self) -> int:
+        """How many tables arrived AFTER the first one and were dropped."""
+        return self._extra
+
+    @property
+    def ambiguous(self) -> bool:
+        """Whether an extra table arrived (informational — it is NOT a refusal).
+
+        The recorder never refuses and never overwrites: the model's own table
+        is the first one and it stays.  This flag only says that the forward
+        produced more than one table, which the wiring may log.
+        """
+        return self._extra > 0
+
+    @contextmanager
+    def paused(self):
+        """Suspend the capture for the duration of the block.
+
+        The coarse Phase I tables are built through the model's OWN embedder
+        (``src/area_qwen21.py``'s :func:`coarse_ropes_qwen21`) — so without
+        this guard the capture would record them as extra tables of the
+        forward.  The pause is re-entrant and always unwinds.
+        """
+        self._paused += 1
+        try:
+            yield self
+        finally:
+            self._paused -= 1
+
+
+#: The recorder of each captured embedder, keyed by ``id(pe_embedder)`` — so
+#: :func:`coarse_ropes_qwen21` can find the recorder to pause without the
+#: caller having to pass it.  One entry per INSTALLED model.
+_RECORDERS: dict[int, Qwen21RopeRecorder] = {}
+
+
+def capture_qwen21_table(pe_embedder) -> tuple:
+    """The rope capture of one model: ``(hook, recorder)`` (plan §4).
+
+    ``pe_embedder`` is the model's own embedder
+    (``comfy/ldm/qwen_image21/model.py:257`` — a FLUX-layout ``EmbedND`` with
+    ``axes_dim = (16, 56, 56)``, so the table is ``[b, 1, n, 64, 2, 2]``); the
+    returned ``hook`` is registered on it right here and carries the
+    ``RemovableHandle`` it must be torn down by on ``hook.handle``, so the
+    wiring (``src/area.py``) registers nothing and removes what it was given.
+
+    The recorder only records while it is ARMED, so an embedder call outside
+    the forward of interest (a refiner pass, a chained embedder's own call) is
+    ignored.  A foreign output — anything that is not an ``EmbedND`` table — is
+    reported once and dropped, so a forward keeps running plain attention
+    instead of crashing the sampler.
+    """
+    recorder = Qwen21RopeRecorder()
+
+    def hook(module, args, output):
+        try:
+            recorder.record(output)
+        except ValueError as exc:
+            _warn_once("qwen21-record", "AReA: %s", exc)
+
+    hook.handle = None
+    if hasattr(pe_embedder, "register_forward_hook"):
+        hook.handle = pe_embedder.register_forward_hook(hook)
+    _RECORDERS[id(pe_embedder)] = recorder
+    return hook, recorder
 
 
