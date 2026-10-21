@@ -184,6 +184,7 @@ from .area_qwen21 import (
     Qwen21RopeRecorder,
     capture_qwen21_table,
     coarse_ropes_qwen21,
+    qwen21_detail_map,
     qwen21_head_geometry,
     qwen21_layout,
     qwen21_latent_grid,
@@ -1828,7 +1829,10 @@ def _make_qwen21_wrapper(orig):
                                     skip_reshape, skip_output_reshape, kw)
         cls = type(q) if hasattr(q, "take") else None
         q_t, k_t, v_t = _take(q), _take(k), _take(v)
-        out = _qwen21_attention(rt, ctx, layout, q_t, k_t, v_t, heads)
+        if ctx.phase == "coarse":
+            out = _qwen21_attention(rt, ctx, layout, q_t, k_t, v_t, heads)
+        else:
+            out = _qwen21_fine(rt, ctx, layout, q_t, k_t, v_t, heads)
         if out is None:
             # The engine took the containers and then declined to compute: the
             # pristine symbol gets FRESH containers around the same tensors.
@@ -2045,6 +2049,131 @@ def _qwen21_attention(rt: _AreaRuntime, ctx: AreaContext, layout, q, k, v, heads
     return out.permute(0, 2, 1, 3).reshape(b, n, heads * dim)
 
 
+def _qwen21_fine(rt: _AreaRuntime, ctx: AreaContext, layout, q, k, v, heads):
+    """The Phase II computation of one Qwen-Image-2.1 image segment, or ``None``.
+
+    q/k/v are the taken ``[b, n, heads*dim]`` tensors of the IMAGE segment:
+    the queries are the ``h*w`` image rows and the keys are the JOINT set —
+    the caption AND the image (``comfy/ldm/qwen_image21/model.py:206-208``).
+
+    **The caption contributes KEYS and VALUES only.**  2.1's eligible call has
+    no text queries at all, so the engine is called with ``text_keys_only=True``
+    (the S7 keyword): the caption stays VISIBLE to the image queries and the
+    text answer is empty — the model concatenates the per-segment answers on
+    dim 1 (``model.py:212``), and the caption's own answer comes from the
+    DELEGATED caption segment.
+
+    **The paper's caption placement** (the design's H7): the GTCN caption
+    anchor assumes a caption at the spatial origin, and 2.1's caption rides a
+    DIAGONAL at the model's own running counter (``model.py:323``) — so no
+    embedder is passed, the caption keeps its own true positions, and the
+    bridge keys keep their true positions too (the horizon-saturation branch
+    lives inside the ``rope_embedder is not None`` branch of
+    :func:`~src.area_attn.windowed_attention`, so it never runs here and
+    ``img_axis0`` is not used for 2.1 at all).
+    """
+    table = rt.recorder.table if rt.recorder is not None else None
+    if table is None or table.shape[2] != layout.k_len:
+        _warn_once(
+            "qwen21-fine-table",
+            "AReA: the captured Qwen-Image-2.1 rope table covers %s tokens but "
+            "the joint stream is %d, so the seam's rotation cannot be undone. "
+            "This call runs plain attention.",
+            "no" if table is None else int(table.shape[2]), layout.k_len,
+        )
+        return None
+    if rt.hidden is None:
+        # N9 — no image embedder output, so there is no detail map and no
+        # Phase II.  Phase I only, never a faked map.
+        _warn_once(
+            "qwen21-no-detail",
+            "AReA: this Qwen-Image-2.1 forward carries no img_in output, so "
+            "there is no detail map and Phase II is disabled. This call runs "
+            "plain attention.",
+        )
+        return None
+    try:
+        energy = qwen21_detail_map(rt.hidden, ctx.h, ctx.w)
+    except ValueError as exc:
+        _warn_once("qwen21-detail", "AReA: %s", exc)
+        return None
+    rt.block += 1
+    t = layout.txt_len
+    heads_t = _qwen21_to_heads(q, k, v, heads)
+    if heads_t is None:
+        return None
+    q_h, k_h, v_h = heads_t
+    # The model rotated the WHOLE joint stream with its own table and sliced
+    # afterwards, so the keys arrive ROTATED at their true positions (the
+    # caption at its diagonal ids, the image at its centred ones) and the
+    # bridge's ranking needs them UNROTATED.
+    k_unrot = unrotate1(k_h, qwen21_slice_table(table, 0, layout.k_len))
+    fine = _area_fine_layout(rt, ctx, k_h[:, :, t:], hook_name="diffusion_model.img_in",
+                             energy=energy)
+    if fine is None:
+        return None
+    out_txt, out_img = windowed_attention(
+        # no text queries at all: the caption is keys and values only
+        q_h[:, :, :0],
+        k_h[:, :, :t], v_h[:, :, :t],
+        q_h, k_h[:, :, t:], v_h[:, :, t:],
+        # the bridge ranks UNROTATED keys (bridge.py:10-24)
+        k_unrot[:, :, t:], fine,
+        # 2.1's caption rides a diagonal, so the GTCN caption anchor does not
+        # apply: the paper's own placement, the bridge keys at their true
+        # positions, and no img_axis0 (the image's axis 0 is the model's own
+        # running counter, ``model.py:330-332``).
+        rope_embedder=None,
+        cap_len=t,
+        caption_rope=None,
+        img_axis0=None,
+        text_keys_only=True,
+    )
+    # comfy's own flatten: heads then head-dim, sequence back on axis 1
+    # (comfy/ldm/modules/attention.py:309-314).
+    b, n = out_img.shape[0], out_img.shape[2]
+    dim = out_img.shape[3]
+    return out_img.permute(0, 2, 1, 3).reshape(b, n, heads * dim)
+
+
+def _qwen21_img_in_hook(module, args, output):
+    """Capture the image embedding — the Phase II detail map's input.
+
+    ``dm.img_in`` is 2.1's image embedder (``comfy/ldm/qwen_image21/model.py:
+    260``): a plain ``Linear`` over the latent's channels, applied to the
+    flattened latent (``model.py:328``), so its output is ``[b, h*w, dim]`` —
+    the image tokens in the model's own layout, which is the layout
+    :func:`~src.area_attn.detail_map` reads.
+
+    **The hook fires ONCE PER IMAGE, not once per forward** (D6):
+    ``build_sequence`` embeds every reference latent and then the target, and
+    the target is appended LAST (``model.py:319``).  So the hook keeps the
+    LAST call and counts them; more than one call means the forward carries
+    reference latents, the image tokens are then not one rectangular canvas,
+    and the detail map would be a map of the wrong image — so the capture is
+    dropped and the forward runs plain attention (the seam's own length
+    guard refuses that call anyway).
+    """
+    rt = _QRUNTIME
+    if rt is None or rt.ctx is None or rt.ctx.phase != "fine":
+        return
+    rt.img_in_calls += 1
+    if rt.img_in_calls > 1:
+        _warn_once(
+            "qwen21-ref-latents",
+            "AReA: this Qwen-Image-2.1 forward embeds %d images (comfy/ldm/"
+            "qwen_image21/model.py:319 embeds every reference latent and then "
+            "the target), so the image tokens are not one rectangular canvas "
+            "and AReA's Phase II detail map would be a map of the wrong "
+            "image. This forward runs plain attention — render a "
+            "reference-free image for AReA.",
+            rt.img_in_calls,
+        )
+        rt.hidden = None
+        return
+    rt.hidden = output
+
+
 def _qwen21_seam_is_live(dm, wrapper) -> bool:
     """Does the model's own backend module still call OUR seam symbol?
 
@@ -2130,7 +2259,18 @@ def _qwen21_install_seam(m, dm):
         handles = []
         hook, recorder = capture_qwen21_table(embedder)
         handles.append(hook.handle)
-        # The Phase II detail map's source is not hooked yet.
+        # The Phase II detail map's source: 2.1's own image embedder.  A model
+        # without one is Phase-I-only (N9) — the fine steps then delegate.
+        img_in = getattr(dm, "img_in", None)
+        if img_in is not None and hasattr(img_in, "register_forward_hook"):
+            handles.append(img_in.register_forward_hook(_qwen21_img_in_hook))
+        else:
+            _warn_once(
+                "no-qwen21-img-in",
+                "AReA: this Qwen-Image-2.1 model has no diffusion_model.img_in "
+                "to hook, so there is no detail map and Phase II is disabled — "
+                "Phase I only. Every fine step runs plain attention.",
+            )
         _QSEAM["recorder"] = recorder
         _QSEAM["hook"] = tuple(handles)
     _QSEAM["consumers"] += 1

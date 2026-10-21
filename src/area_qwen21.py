@@ -100,6 +100,7 @@ __all__ = [
     "qwen21_centred_axis",
     "qwen21_coarse_key_ids",
     "qwen21_coarse_query_ids",
+    "qwen21_detail_map",
     "qwen21_from_heads",
     "qwen21_head_geometry",
     "qwen21_image_ids",
@@ -655,6 +656,54 @@ def qwen21_slice_table(table: torch.Tensor, start: int, end: int) -> torch.Tenso
     same rows, in the same order, with the same phases.
     """
     return table[:, :, int(start):int(end)]
+
+
+# ---------------------------------------------------------------------------
+# The detail map — the Phase II source, on 2.1's own 2-D grid
+# ---------------------------------------------------------------------------
+
+
+def qwen21_detail_map(hidden: torch.Tensor, h: int, w: int) -> np.ndarray:
+    """The Phase II detail map over 2.1's OWN 2-D token grid.
+
+    **The grid IS the latent's ``(H, W)``** (D7): 2.1 does not patchify
+    (``img_in`` is a plain ``Linear`` over the latent's channels,
+    ``comfy/ldm/qwen_image21/model.py:260``) and its latent format is
+    2-dimensional (``comfy/latent_formats.py:959``), so there is no division
+    and no unsqueeze — the opposite of Krea-2's ``krea_squeeze_latent``
+    (``src/area_krea.py:179-223``), which exists because Krea-2's latent is
+    5-D and comfy unsqueezes it.
+
+    ``hidden`` is the captured ``img_in`` output: ``[b, h*w, dim]`` — the image
+    tokens in the model's own layout, which is the layout
+    :func:`~src.area_attn.detail_map` reads.
+
+    Raises:
+        ValueError: when the capture is not this canvas's image-token grid (a
+            reference latent, a padded row, another canvas) — the map would
+            then be a map of the wrong image, which is worse than no map.
+    """
+    if not torch.is_tensor(hidden):
+        raise ValueError(
+            "AReA: the Qwen-Image-2.1 detail-map source must be a tensor, but "
+            "got %s. This forward runs plain attention." % type(hidden).__name__
+        )
+    if hidden.dim() != 3:
+        raise ValueError(
+            f"AReA: the Qwen-Image-2.1 detail-map source must be 3-D "
+            f"[b, h*w, dim], but it is {hidden.dim()}-D with shape "
+            f"{tuple(hidden.shape)}. This forward runs plain attention."
+        )
+    expected = int(h) * int(w)
+    if int(hidden.shape[1]) != expected:
+        raise ValueError(
+            f"AReA: the Qwen-Image-2.1 detail-map source holds "
+            f"{int(hidden.shape[1])} image tokens, but a {int(h)}x{int(w)} "
+            f"canvas owns {expected} (comfy/ldm/qwen_image21/model.py:327 "
+            "reads the grid off the latent's own shape). This forward runs "
+            "plain attention."
+        )
+    return detail_map(hidden, int(h), int(w))
 
 
 # ---------------------------------------------------------------------------

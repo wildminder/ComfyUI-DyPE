@@ -291,6 +291,21 @@ def test_the_delegated_call_is_byte_identical(seam):
     assert kwargs["transformer_options"] == {"block_index": 3}
 
 
+def test_a_fine_step_delegates_untouched(seam):
+    """Phase II is not installed yet (S8): a fine step runs plain attention."""
+    backend, calls, _pristine = seam
+    dm = _model()
+    rt = _runtime(dm, phase="fine")
+    area._QRUNTIME = rt
+    try:
+        table, q, k, v = _tensors(dm)
+        out = _image_call(backend, table, q, k, v)
+    finally:
+        area._QRUNTIME = None
+    assert len(calls) == 1
+    assert out.shape == (1, H * W, dm.heads * dm.head_dim)
+
+
 def test_the_seam_is_live_for_the_backend_module(seam):
     """The install proves the seam is live before it claims the model."""
     backend, _calls, _pristine = seam
