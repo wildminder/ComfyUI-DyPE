@@ -536,11 +536,22 @@ def _area_schedule(rt: _AreaRuntime, h: int, w: int, total: int, phase1: int,
     schedule = rt.schedules.get(key)
     if schedule is None:
         cfg = rt.config
+        # Qwen-Image-2.1 only: the Phase II side is priced by its TRUE
+        # clipped area and has to keep the bridge alive.  On a canvas far from
+        # square (512x2000 px -> a 125x32 grid) the reference's square price
+        # rejects EVERY side, so the schedule falls back to its floor — the
+        # literal vertical cut — and the side the truthful price picks would
+        # starve the bridge (R = 0).  The frozen profiles keep the reference's
+        # square price, bit for bit.
+        clipped = rt.profile is QWEN21_PROFILE
         schedule = build_schedule(h, w, total, max(0, int(phase1)), cfg.native,
                                   txt_len=txt_len,
                                   window_start=cfg.window_start,
                                   window_hold_steps=cfg.window_hold_steps,
-                                  delay=cfg.delay)
+                                  delay=cfg.delay,
+                                  clipped=clipped,
+                                  halo=cfg.halo if clipped else 0,
+                                  bridge_ratio=cfg.bridge_ratio if clipped else 0.0)
         rt.schedules[key] = schedule
     return schedule
 
@@ -595,7 +606,7 @@ def _phase1_count(rt: _AreaRuntime, opts: dict) -> int:
                 "AReA: phase1_mode is 'bootstrap' but phase1_steps is %d, which "
                 "bootstrap ignores — Phase I runs no steps (Appendix F replaces "
                 "it with a native-resolution pre-pass, see the plan "
-                ".dev/docs/plans/2026-10-18-area-zimage-bootstrap.md).",
+                "the bootstrap recipe.",
                 int(cfg.phase1_steps),
             )
         return 0
@@ -698,7 +709,7 @@ def _area_fine_layout(rt: _AreaRuntime, ctx: AreaContext, k_img: torch.Tensor,
             hidden = k_img.transpose(1, 2).reshape(*k_img.shape[:1], k_img.shape[2], -1)
         energy = detail_map(hidden, h, w)
     w_min = min(cfg.native, max(h, w))
-    # Window integrity on short (distilled) schedules (area-fix2 mechanism 3):
+    # Window integrity on short (distilled) schedules (the short-schedule window-integrity rule):
     # an 8-step model has not composed anything yet at sigma ~ 0.8, so the DWT
     # energy map fires on noise and fragments the canvas into 44x44 quadrants
     # that each hallucinate their own subject — keep the base windows whole
@@ -2188,12 +2199,21 @@ def _qwen21_fine(rt: _AreaRuntime, ctx: AreaContext, layout, q, k, v, heads):
 
     **The paper's caption placement** (the design's H7): the GTCN caption
     anchor assumes a caption at the spatial origin, and 2.1's caption rides a
-    DIAGONAL at the model's own running counter (``model.py:323``) — so no
-    embedder is passed, the caption keeps its own true positions, and the
-    bridge keys keep their true positions too (the horizon-saturation branch
-    lives inside the ``rope_embedder is not None`` branch of
-    :func:`~src.area_attn.windowed_attention`, so it never runs here and
-    ``img_axis0`` is not used for 2.1 at all).
+    DIAGONAL at the model's own running counter (``model.py:323``) — so the
+    caption anchor stays OFF (``caption_anchor=False``) and the caption keeps
+    its own true positions.
+
+    **The bridge's frame**: the model's OWN embedder IS passed, so the
+    registers are re-roped by the same rope the image tokens carry — but at
+    their TRUE positions: 2.1 opts out of the horizon saturation
+    (``bridge_saturate=False``), whose Z-Image rationale (theta=256 wraps a
+    100+ token hop into noise) does not hold for 2.1's theta=10000, and the
+    compression only MANUFACTURED the far-half copy it was meant to prevent.
+    The frame is the model's own: axis 0 is 2.1's running counter, which for
+    the reference-free image segment IS the caption's length
+    (``img_axis0=float(t)``, ``model.py:330-332``), and the spatial axes are
+    the CENTRED ones, so the grid's 0-based positions are shifted into that
+    frame by ``img_origin`` (``model.py:330-332``).
     """
     table = rt.recorder.table if rt.recorder is not None else None
     if table is None or table.shape[2] != layout.k_len:
@@ -2235,6 +2255,21 @@ def _qwen21_fine(rt: _AreaRuntime, ctx: AreaContext, layout, q, k, v, heads):
                              energy=energy)
     if fine is None:
         return None
+    # The bridge's re-roping calls the model's OWN embedder, so the capture is
+    # paused around it: the model's own table stays the forward's table (the
+    # recorder keeps the FIRST one) and the bridge's table is not counted as an
+    # extra one.
+    _embedder = getattr(rt.dm, "pe_embedder", None)
+    if _embedder is not None and rt.recorder is not None:
+        # the RAW embedder is bound in its OWN local: the closure below reads
+        # ``_embedder`` at call time, and ``_embedder`` is REBOUND to the
+        # wrapper — a closure over the rebound name would call itself.
+        _raw_embedder = _embedder
+
+        def _paused_embedder(ids):
+            with rt.recorder.paused():
+                return _raw_embedder(ids)
+        _embedder = _paused_embedder
     out_txt, out_img = windowed_attention(
         # no text queries at all: the caption is keys and values only
         q_h[:, :, :0],
@@ -2243,14 +2278,32 @@ def _qwen21_fine(rt: _AreaRuntime, ctx: AreaContext, layout, q, k, v, heads):
         # the bridge ranks UNROTATED keys (bridge.py:10-24)
         k_unrot[:, :, t:], fine,
         # 2.1's caption rides a diagonal, so the GTCN caption anchor does not
-        # apply: the paper's own placement, the bridge keys at their true
-        # positions, and no img_axis0 (the image's axis 0 is the model's own
-        # running counter, ``model.py:330-332``).
-        rope_embedder=None,
+        # apply: the paper's own placement, and the model's OWN embedder so
+        # the bridge keys are re-roped at their TRUE positions (the horizon
+        # saturation is switched off below).  img_axis0 is the model's own
+        # axis 0 for an image token — the running counter, which for the
+        # reference-free image segment IS the caption's length
+        # (``model.py:330-332``).
+        rope_embedder=_embedder,
         cap_len=t,
         caption_rope=None,
-        img_axis0=None,
+        img_axis0=float(t),
         text_keys_only=True,
+        # The bridge HORIZON (the horizon-saturation mechanism) is OFF for 2.1: the
+        # registers keep their TRUE positions, so the bridge keys carry the
+        # model's own rotation of those tokens.  The saturation was built for
+        # Z-Image's rope (theta=256 wraps a 100+ token hop into noise), while
+        # 2.1's theta is 10000 — a 63-92 token hop is a well-defined phase —
+        # and the compression only MANUFACTURED the far-half copy: it pulled
+        # the other half's tokens inside the window's own horizon, so the far
+        # half was read as local.  2.1's image tokens ride the model's own
+        # running counter (axis 0 = the caption's length) and its CENTRED
+        # spatial axes, so the true positions are expressed in that frame.
+        # The GTCN caption anchor stays OFF: 2.1's caption rides a diagonal,
+        # so the anchor table does not apply to it.
+        bridge_saturate=False,
+        caption_anchor=False,
+        img_origin=(float(layout.h - layout.h // 2), float(layout.w - layout.w // 2)),
     )
     # comfy's own flatten: heads then head-dim, sequence back on axis 1
     # (comfy/ldm/modules/attention.py:309-314).
@@ -2683,7 +2736,7 @@ def _area_resolve_forward(rt: _AreaRuntime, params: dict) -> AreaContext:
     phase1 = _phase1_count(rt, opts)
     cap = None
     if is_short_schedule(total):
-        # The "+2 healing rule" (area-fix2): an Euler step only displaces the
+        # The "+2 healing rule" (the healing rule): an Euler step only displaces the
         # latent by 15-25% of its trajectory, so fewer than two fine steps
         # cannot overwrite the 32 px footprint Phase I bakes in — the ripple
         # would survive to the final step.  Cap the coarse prefix so at least
@@ -2692,7 +2745,7 @@ def _area_resolve_forward(rt: _AreaRuntime, params: dict) -> AreaContext:
         if phase1 > max_allowed_phase1:
             _warn_once(
                 "area-heal-cap",
-                "AReA-Z: phase1_steps (%d) capped to %d on a %d-step schedule. "
+                "AReA: phase1_steps (%d) capped to %d on a %d-step schedule. "
                 "Euler trajectory dynamics require at least 2 fine steps to completely "
                 "heal the coarse pooling footprint.",
                 phase1, max_allowed_phase1, total,
@@ -2709,7 +2762,7 @@ def _area_resolve_forward(rt: _AreaRuntime, params: dict) -> AreaContext:
     ctx.phase, ctx.size, ctx.step, ctx.h, ctx.w = phase, size, step, h, w
     # The schedule length rides on the context so the layout builder can tell a
     # short (distilled) schedule from a long one without peeking into caches
-    # (area-fix2 mechanism 3).
+    # (the short-schedule window-integrity rule).
     ctx.total = int(total) if total is not None else 0
     # The Phase II ordinal (how many fine steps ran before this one) and how many
     # of its leading steps the bridge floor exempts from the cost cap.  The floor
@@ -2840,7 +2893,7 @@ def apply_area_to_model(
     the leading steps whose noise level is still at or above
     ``phase1_sigma`` (``theory.md:240-246``) so the switch follows the schedule.
     Both default to ``"auto"``, which resolves PER BACKBONE right after the profile is known
-    (AReA-Z, ``.dev/area-debug/area-fix.txt`` §3-File 3): Z-Image runs the
+    (the per-backbone defaults): Z-Image runs the
     norm-preserving centroid pooling and the schedule-aware sigma handoff
     (``phase1_sigma``, default ``ZIMAGE_SIGMA_STAR``), FLUX keeps the reference's
     constants exactly — ``subsample`` pooling and ``steps`` mode with
@@ -2851,6 +2904,13 @@ def apply_area_to_model(
     position — the pack's measured Z-Image 32 px ripple, which the Krea-2 run
     reproduces) and the ``steps`` mode, so the user's ``phase1_steps`` knob
     stays authoritative.
+    Qwen-Image-2.1 runs the MEDOID pooling and the schedule-aware sigma
+    handoff.  The medoid is 2.1's own rule: Phase I's output is
+    ``softmax(q·K)·V``, so the centroid's synthetic key behind a BLENDED value
+    puts two contents behind one position — the doubled/imploded face — while
+    the medoid keeps ONE REAL TOKEN's key AND value.  The sigma handoff is
+    Z-Image's: 2.1 is a distilled Turbo-class model on a short schedule, where
+    the FLUX step count would flood Phase I (see the resolution below).
     ``phase1_steps`` is clamped to ``[0, total]`` and ``0`` means "all Phase II"
     (the reference's ``config.phase1_steps``, ported without its
     ``phase1_steps=0`` assert).  ``pooling`` is one of :data:`POOLING`
@@ -2919,7 +2979,7 @@ def apply_area_to_model(
     width = _snap_to_multiple(width, px_per_patch)
     height = _snap_to_multiple(height, px_per_patch)
 
-    # AReA-Z defaults (.dev/area-debug/area-fix.txt §3-File 3): "auto" resolves per
+    # the per-backbone defaults: "auto" resolves per
     # backbone — Z-Image runs the norm-preserving centroid pooling and the
     # schedule-aware sigma handoff, FLUX keeps the reference's constants exactly.
     # Krea-2 joins Z-Image on the POOLING: "subsample" keeps one token of every
@@ -2927,14 +2987,44 @@ def apply_area_to_model(
     # block's f^2 queries — which the reference's floor division put on ONE rope
     # position — then receive nearly the same output, i.e. a piecewise-constant
     # field with the block's period (32 px at f = 2).  That is the pack's
-    # measured Z-Image ripple (area-fix.txt Flaw 3) and the Krea-2 run
+    # measured Z-Image ripple (the measured Z-Image ripple) and the Krea-2 run
     # reproduces it; the norm-preserving centroid keys and the averaged values
-    # remove it (area-fix.txt mechanism 2).  FLUX keeps "subsample" — its path
+    # remove it (the centroid-key mechanism).  FLUX keeps "subsample" — its path
     # is byte-frozen.
+    # Qwen-Image-2.1 runs the MEDOID, which is neither of those rules: its
+    # Phase I output is ``softmax(q·K)·V`` (``src/area.py:2176-2178``), so the
+    # centroid's synthetic KEY — a direction that can belong to no token of
+    # the block — stands behind a BLENDED value, and the block's own contents
+    # come back averaged behind ONE position: the doubled/imploded face 2.1's
+    # runs show.  The medoid keeps ONE REAL TOKEN's key AND value, so the
+    # pooled cell carries a single content, and it is the REPRESENTATIVE
+    # choice too (on a three-vs-one block it keeps the majority, where
+    # "subsample" kept the minority).  The semantics are pinned in
+    # ``tests/test_area_qwen21_pooling.py``.
     if pooling == "auto":
-        pooling = "subsample" if profile is FLUX_PROFILE else "mean"
+        if profile is FLUX_PROFILE:
+            pooling = "subsample"
+        elif profile is QWEN21_PROFILE:
+            pooling = "medoid"
+        else:
+            pooling = "mean"
     if phase1_mode == "auto":
-        phase1_mode = "sigma" if profile is ZIMAGE_PROFILE else "steps"
+        # Qwen-Image-2.1 joins Z-Image on the HANDOFF, not only on the pooling.
+        # 2.1 is a distilled Turbo-class model with a short schedule, exactly the
+        # Z-Image condition: with "steps" the knob is a raw count of the FRONT of
+        # the schedule, so an 8-step table with phase1_steps = 2 runs a quarter of
+        # the run fully pooled and phase1_steps = 8 runs it ENTIRELY pooled.  The
+        # _warn_regime advisory stays silent there (it fires above a third of the
+        # steps), so the user gets a registry of duplicated content and inward-
+        # collapsing layout with no warning.  sigma mode counts the leading steps
+        # whose noise level is still at or above phase1_sigma, which on a Turbo
+        # table resolves ~1 coarse step — the regime the user's own sweep found
+        # acceptable — and hands over to the fine windows where detail matters.
+        # FLUX keeps "steps"; its 28-step schedule never floods and its path is
+        # byte-frozen.
+        phase1_mode = (
+            "sigma" if profile in (ZIMAGE_PROFILE, QWEN21_PROFILE) else "steps"
+        )
 
     m._area_config = AreaConfig(
         phase1_steps=max(0, int(phase1_steps)),

@@ -406,10 +406,11 @@ class TestWindowSizesCeiling:
         fine schedule stays within the first rung's budget in the roomy regime."""
         for txt_len in (0, TEXT):
             sched = build_schedule(h, w, steps, phase1, NATIVE, txt_len=txt_len)
-            cap = window_step_cost(h, w, sched.windows[0], txt_len)
+            # the schedule prices the reference's SQUARE window by default
+            cap = window_step_cost(h, w, sched.windows[0], txt_len, clipped=False)
             assert cap < 1.0 or sched.windows[0] >= max(h, w)
             for size in sched.windows:
-                assert window_step_cost(h, w, size, txt_len) <= cap + 1e-12
+                assert window_step_cost(h, w, size, txt_len, clipped=False) <= cap + 1e-12
 
     def test_rungs_shrink_and_end_at_w_min(self):
         for h, w in _grids():
@@ -439,15 +440,17 @@ class TestWindowSizesCaveat:
                 if start - floor_ < n - 1:
                     continue        # cramped: the geometric path ignores cost entirely
                 ideal = _geometric_sizes(n, start, floor_)
-                cap = window_step_cost(h, w, start, TEXT)
+                # the schedule prices the reference's SQUARE window by default
+                cap = window_step_cost(h, w, start, TEXT, clipped=False)
                 prev = None
                 for i, chosen in enumerate(sched.windows):
                     lo = floor_ + n - i - 1                       # room left for the rest
                     hi = start if prev is None else min(int(ideal[i]), prev - 1)
                     hi = max(hi, lo)
                     options = range(lo, hi + 1)
-                    cheapest = min(options, key=lambda s: window_step_cost(h, w, s, TEXT))
-                    over = window_step_cost(h, w, chosen, TEXT) > cap + 1e-12
+                    cheapest = min(options,
+                                   key=lambda s: window_step_cost(h, w, s, TEXT, clipped=False))
+                    over = window_step_cost(h, w, chosen, TEXT, clipped=False) > cap + 1e-12
                     if over:
                         assert chosen == cheapest, (h, w, steps, phase1, i, chosen, cheapest)
                     prev = chosen
@@ -458,9 +461,10 @@ class TestWindowSizesCaveat:
         past the ceiling rather than inflated past each other."""
         sched = build_schedule(68, 100, 8, 2, NATIVE)
         assert sched.windows[0] == 69
-        cap = window_step_cost(68, 100, 69, 0)
+        # the schedule prices the reference's SQUARE window by default
+        cap = window_step_cost(68, 100, 69, 0, clipped=False)
         forced = 67                                    # rung 2: no admissible size fits the cap
-        assert window_step_cost(68, 100, forced, 0) > cap
+        assert window_step_cost(68, 100, forced, 0, clipped=False) > cap
         assert forced in sched.windows
         assert list(sched.windows) == sorted(sched.windows, reverse=True)
 

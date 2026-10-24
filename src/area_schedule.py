@@ -1,7 +1,7 @@
 """AReA per-step schedule and Phase II window math — port of ``area/schedule.py``.
 
 Literal port of the reference's ``schedule.py``
-(``.dev/data/area/AReA/area/schedule.py``) plus the pure-math tiling primitives
+(the reference schedule implementation) plus the pure-math tiling primitives
 of its ``tiling.py``: the window box, the clipped-box/geometry helpers and the
 coverage/dedupe predicates.  The tensor-producing tiling (DWT detail map,
 jittered starts, adaptive splits, halo rings, merge weights) lives in
@@ -43,12 +43,21 @@ Deviations from the reference, all deliberate and pinned by
   tile the grid exactly (the last block on a partial axis is a *partial*
   block) and the caller is told the grid was *adjusted*.  The canvas, the
   token stream and the latent are untouched by the adjustment.
+* The Phase II cost model gained a **clipped price** and a **bridge reserve**
+  (the true clipped price): a window's price
+  is its **true** (canvas-clipped) area, and the side choice rejects a side
+  that would starve the bridge/halo budget.  The cost primitives
+  (:func:`fit_extra_keys`, :func:`windowed_step_cost`, :func:`bridge_registers`)
+  live HERE and are re-exported from :mod:`src.area_attn` — the import graph
+  runs one way only.  Every new parameter defaults to the reference's
+  behaviour, so the frozen profiles stay byte-identical; only the
+  Qwen-Image-2.1 profile opts in.
 """
 from __future__ import annotations
 
 import math
 from dataclasses import dataclass
-from typing import Sequence
+from typing import Optional, Sequence
 
 import numpy as np
 import torch
@@ -177,14 +186,112 @@ def window_count(h: int, w: int, size: int) -> int:
     return len(even_starts(h, size)) * len(even_starts(w, size))
 
 
-def window_step_cost(h: int, w: int, size: int, txt_len: int = 0) -> float:
+def base_windows(h: int, w: int, size: int) -> list[Window]:
+    """The base window boxes of side ``size`` — the evenly-started tiling.
+
+    The same boxes :func:`src.area_attn.adaptive_tiling` builds before it splits
+    or jitters them, so a cost computed on them is the cost of the layout the
+    Phase II step actually runs (the jitter keeps the axis' end windows pinned,
+    so on an axis with two windows the tiling is exactly this one).
+    """
+    rows, cols = even_starts(h, size), even_starts(w, size)
+    return [Window(r, c, min(h - 1, r + size - 1), min(w - 1, c + size - 1))
+            for r in rows for c in cols]
+
+
+# ---------------------------------------------------------------------------
+# Phase II: the cost model (the primitives both phases price a step with)
+# ---------------------------------------------------------------------------
+
+
+def fit_extra_keys(windows: list[Window], h: int, w: int, txt_len: int, registers: int,
+                   halo: int) -> tuple[int, int]:
+    """Bridge count and Halo width that keep one Phase II step at or below full attention.
+
+    Each window runs ``T + n`` queries (text and its image tokens) against ``T + n``
+    keys plus its Halo ring and ``R`` bridge tokens, so the step costs
+    ``sum (T+n)(T+n+ring+R)`` against ``(T + h*w)^2``.  The Halo is priced at its
+    full width, the most any window can draw.  The bridge is cut first, to the
+    largest count that fits; the Halo narrows only if the step is still above full
+    attention without any bridge tokens.
+    """
+    full = float(txt_len + h * w) ** 2
+    rows = [float(txt_len + win.area) for win in windows]
+
+    def local(depth: int) -> float:
+        return sum(q * (q + ring_size(win, depth, h, w)) for q, win in zip(rows, windows))
+
+    room = full - local(halo)
+    if room >= registers * sum(rows):
+        return registers, halo
+    if room >= 0:
+        return int(room // sum(rows)), halo
+    depth = next((d for d in range(halo, -1, -1) if local(d) <= full), 0)
+    return 0, depth
+
+
+def windowed_step_cost(windows: list[Window], h: int, w: int, txt_len: int, registers: int,
+                       halo: int) -> float:
+    """One Phase II step in units of one full-attention pass, before any trimming.
+
+    The same pricing :func:`fit_extra_keys` applies — each window runs ``T + n``
+    queries (text and its image tokens) against ``T + n`` keys plus its Halo ring
+    and ``R`` bridge tokens, summed over the windows and divided by the full
+    ``(T + h*w)^2`` — with the Halo priced at its FULL width, the most any window
+    can draw.  :func:`fit_extra_keys` keeps that at or below 1.0; the bridge floor
+    (``src/area.py``) is the deliberate exception, and this is the number it
+    reports so the exemption is visible rather than silent.
+    """
+    full = float(txt_len + h * w) ** 2
+    rows = [float(txt_len + win.area) for win in windows]
+    total = sum(q * (q + ring_size(win, halo, h, w) + registers)
+                for q, win in zip(rows, windows))
+    return total / full
+
+
+def bridge_registers(size: int, bridge_ratio: float, h: Optional[int] = None,
+                     w: Optional[int] = None) -> int:
+    """R of the bridge: ``round(rho * w)^2`` tokens per window, 0 when the bridge is off.
+
+    The square formula is the paper's (``R = (rho * w)^2`` registers for a
+    SQUARE window of side ``w``, App. E).  A window is clipped by the canvas,
+    so on a canvas NARROWER than the window side it holds ``side x width``
+    tokens instead of ``side^2`` — and the square formula then hands the bridge
+    ``side / width`` times the share of the window's content the paper's ratio
+    (``rho^2``) asks for.  With the canvas's ``h`` and ``w`` the count follows
+    the window's ACTUAL shape — ``round(rho * min(side, h)) x
+    round(rho * min(side, w))`` — and the bridge-to-content ratio is the
+    designed one on every aspect.  Without them (the FLUX and Z-Image paths)
+    the value is the square one, bit for bit.
+    """
+    if bridge_ratio <= 0:
+        return 0
+    side = int(size)
+    if h is None or w is None:
+        return max(1, int(round(float(bridge_ratio) * side))) ** 2
+    rows = max(1, int(round(float(bridge_ratio) * min(side, int(h)))))
+    cols = max(1, int(round(float(bridge_ratio) * min(side, int(w)))))
+    return rows * cols
+
+
+def window_step_cost(h: int, w: int, size: int, txt_len: int = 0, clipped: bool = True) -> float:
     """C(w) of Eq. 7: one windowed step in units of one full-attention pass.
 
     Every window runs its ``txt_len`` text tokens as queries and keys, so it
-    costs ``(size^2 + T)^2`` against ``(h*w + T)^2`` for full attention.
+    costs ``(area + T)^2`` against ``(h*w + T)^2`` for full attention.
+
+    ``clipped`` (the default) prices the window's **TRUE** area — the canvas
+    clips a window that is wider than the canvas, so it holds
+    ``min(size, h) x min(size, w)`` tokens, not ``size^2``.  The reference's
+    square price (``clipped=False``) over-prices such a window by
+    ``size / min(size, axis)``: at 125x32 the side-64 window really costs
+    0.5861 of a full pass and is priced 2.0912 (3.568x), so under the square
+    price NO side qualifies and the schedule degenerates to its floor.  On a
+    SQUARE canvas the two prices are identical, bit for bit.
     """
     t = float(txt_len)
-    return window_count(h, w, size) * (float(size) ** 2 + t) ** 2 / (float(h * w) + t) ** 2
+    area = float(min(int(size), int(h)) * min(int(size), int(w))) if clipped else float(size) ** 2
+    return window_count(h, w, size) * (area + t) ** 2 / (float(h * w) + t) ** 2
 
 
 def grid_divisors(h: int, w: int) -> list[int]:
@@ -289,16 +396,54 @@ def pooling_ramp(f0: int, steps: int, h: int, w: int, f_min: int = F_MIN,
     return plan
 
 
-def start_window(h: int, w: int, lo: int, txt_len: int = 0) -> int:
-    """w_start of Eq. 8: the largest window whose step is cheaper than full attention.
+def reserves_bridge(h: int, w: int, size: int, txt_len: int, halo: int,
+                    bridge_ratio: float) -> bool:
+    """Whether a window of side ``size`` leaves the bridge alive.
+
+    The bridge is the ONLY channel between two windows, so a side whose step
+    cannot afford even ONE bridge token per window leaves the windows blind to
+    each other: :func:`fit_extra_keys` then returns ``R = 0`` and narrows the
+    Halo (at 125x32 the side 86 -> R = 0, halo = 0; at 256x256 the side 180 ->
+    R = 0, halo = 1).  The verdict is "the step leaves room for one bridge
+    token per window at the FULL Halo width" — ``R = min(registers, room //
+    sum(rows))``, so ``R >= 1`` exactly when the room covers one token per
+    window.  The register COUNT does not change the verdict (only that the
+    bridge is declared at all), and the Halo survives whenever the room does.
+    """
+    if bridge_ratio <= 0 or halo <= 0:
+        return True
+    registers = bridge_registers(size, bridge_ratio, h, w)
+    if registers <= 0:
+        return True
+    count, kept = fit_extra_keys(base_windows(h, w, size), h, w, txt_len, registers, halo)
+    return count >= 1 and kept >= halo
+
+
+def start_window(h: int, w: int, lo: int, txt_len: int = 0, clipped: bool = False,
+                 halo: int = 0, bridge_ratio: float = 0.0) -> int:
+    """w_start of Eq. 8: the largest window whose step is cheaper than full attention
+    AND that keeps the bridge alive.
 
     ``lo`` is the floor — Phase II must not start below the pooled grid Phase I
     handed over (``extent // f_last``).  Falls back to ``lo`` when no size below
     the full grid is both cheaper than full attention and split into >1 window.
+
+    ``clipped`` prices the window's true (clipped) area — the canvas clips a
+    window wider than the canvas, and the square price over-prices it (R3).
+    It is OFF by default: the reference's square model is the schedule's
+    contract until a profile asks for the truthful one (the frozen profiles
+    stay byte-identical).  ``halo`` and ``bridge_ratio`` are the budget the
+    side must RESERVE: a side whose step would starve the bridge (``R = 0``)
+    is not chosen while a side that keeps it alive exists (R4).
     """
     for size in range(max(h, w), lo - 1, -1):
-        if window_step_cost(h, w, size, txt_len) < 1.0 and window_count(h, w, size) > 1:
-            return size
+        if window_step_cost(h, w, size, txt_len, clipped) >= 1.0:
+            continue
+        if window_count(h, w, size) <= 1:
+            continue
+        if not reserves_bridge(h, w, size, txt_len, halo, bridge_ratio):
+            continue
+        return size
     return lo
 
 
@@ -325,7 +470,7 @@ def _geometric_sizes(steps: int, start: int, floor: int) -> list[int]:
 
 
 def window_sizes(h: int, w: int, steps: int, start: int, floor: int, txt_len: int = 0,
-                 hold: int = 0) -> list[int]:
+                 hold: int = 0, clipped: bool = False) -> list[int]:
     """Eqs. 10 and 11: geometric shrink from w_start to w_min, each rung snapped down so it
     never costs more than the first one and sizes strictly decrease.
 
@@ -336,25 +481,32 @@ def window_sizes(h: int, w: int, steps: int, start: int, floor: int, txt_len: in
     20-step geometric ramp would have spread over the whole phase
     (``docs/2026-10-18-area-zimage-adaptation-research.md`` §4-A4).  ``hold=0``
     reproduces the reference's ramp exactly.
+
+    ``clipped`` is the same price the start side was chosen with — the rungs
+    are capped against the START rung's cost, so the two must agree.  It is
+    OFF by default (the reference's square model).
     """
     if steps <= 0:
         return []
     hold = max(0, min(int(hold), max(0, steps - 2)))
     if hold:
-        return [start] * hold + window_sizes(h, w, steps - hold, start, floor, txt_len)
+        return [start] * hold + window_sizes(h, w, steps - hold, start, floor, txt_len,
+                                             0, clipped)
     ideal = _geometric_sizes(steps, start, floor)
     if start - floor < steps - 1:
         return ideal
-    cap = window_step_cost(h, w, start, txt_len)
+    cap = window_step_cost(h, w, start, txt_len, clipped)
     sizes: list[int] = []
     for i, target in enumerate(ideal):
         lo = floor + steps - i - 1
         hi = start if not sizes else min(int(target), sizes[-1] - 1)
         hi = max(hi, lo)
-        pick = next((s for s in range(hi, lo - 1, -1) if window_step_cost(h, w, s, txt_len) <= cap + 1e-12),
+        pick = next((s for s in range(hi, lo - 1, -1)
+                     if window_step_cost(h, w, s, txt_len, clipped) <= cap + 1e-12),
                     None)
         if pick is None:
-            pick = min(range(lo, hi + 1), key=lambda s: window_step_cost(h, w, s, txt_len))
+            pick = min(range(lo, hi + 1),
+                       key=lambda s: window_step_cost(h, w, s, txt_len, clipped))
         sizes.append(pick)
     return sizes
 
@@ -397,6 +549,7 @@ class AreaSchedule:
 def build_schedule(
     h: int, w: int, steps: int, phase1_steps: int, native: int, w_min: int | None = None,
     txt_len: int = 0, window_start: int = 0, window_hold_steps: int = 0, delay: int = 0,
+    clipped: bool = False, halo: int = 0, bridge_ratio: float = 0.0,
 ) -> AreaSchedule:
     """Schedule for an ``h x w`` patch grid over ``steps`` denoising steps.
 
@@ -424,6 +577,15 @@ def build_schedule(
     divisor >= 2 the factor is the extent rule's, the ramp snaps to the legal
     set (:func:`legal_factors`) and the last pooling block on a partial axis is
     a partial block — the canvas and the token stream are unchanged.
+
+    ``clipped`` / ``halo`` / ``bridge_ratio`` are the Phase II COST MODEL
+    (the true clipped price): ``clipped`` prices the window's true (clipped) area instead of
+    the reference's square one, and ``halo`` / ``bridge_ratio`` are the budget
+    the side choice must reserve — a side whose step would starve the bridge
+    (``fit_extra_keys`` -> ``R = 0``) is not chosen while a side that keeps it
+    alive exists.  All three are OFF by default, so the reference's schedule is
+    the default; the engine asks for the truthful model on the profiles whose
+    canvas is far from square (``src/area.py``).
     """
     phase1_steps = max(0, min(int(phase1_steps), int(steps)))
     extent = max(h, w)
@@ -447,7 +609,9 @@ def build_schedule(
             # already starts where the geometry paper calibrated it, so the two
             # knobs are ignored there (never applied, never clamped away).
             window_start, window_hold_steps = 0, 0
-        start = (start_window(h, w, lo, txt_len) if int(window_start) <= 0
+        start = (start_window(h, w, lo, txt_len, clipped, halo, bridge_ratio)
+                 if int(window_start) <= 0
                  else min(max(int(window_start), w_min), extent))
-        windows = window_sizes(h, w, phase2_steps, start, w_min, txt_len, window_hold_steps)
+        windows = window_sizes(h, w, phase2_steps, start, w_min, txt_len,
+                               window_hold_steps, clipped)
     return AreaSchedule((h, w), tuple(factors), tuple(windows))

@@ -10,7 +10,7 @@ image self-attention with a time-dependent attention graph: the first
 ``phase1_sigma``) steps pool image K/V to one token per ``f x f`` block and run
 cross-scale attention (Phase I), the remaining steps run windowed attention
 whose windows follow the image's Haar-DWT detail map, each extended by a
-randomized Halo ring and a global-KV bridge (area-fix3).  At or below the
+randomized Halo ring and a global-KV bridge .  At or below the
 native 1024 px extent it is a provable no-op.
 """
 
@@ -72,10 +72,12 @@ class AReA(io.ComfyNode):
     (QwenImage21Transformer2DModel) — share the same 16 px
     patch grid, so one width/height pair serves any of them.  ``phase1_mode``
     and ``pooling`` default to ``auto``, which the engine resolves per
-    backbone: on Z-Image the switch is the schedule-aware ``sigma`` mode (the
-    leading steps still at or above ``phase1_sigma``) and pooling is the
-    norm-preserving ``mean`` mode, while FLUX keeps the reference's ``steps``
-    constant and ``subsample`` pooling.  Three knobs tune short (distilled)
+    backbone: on Z-Image and Qwen-Image-2.1 the switch is the schedule-aware
+    ``sigma`` mode (the leading steps still at or above ``phase1_sigma``),
+    while FLUX and Krea-2 keep the reference's ``steps`` constant; pooling
+    resolves to the reference's ``subsample`` on FLUX, the norm-preserving
+    ``mean`` on Z-Image and Krea-2, and the ``medoid`` on Qwen-Image-2.1 (one
+    real token's key AND value per block).  Three knobs tune short (distilled)
     schedules only and are ignored on a long one: ``bridge_floor_steps``
     exempts the leading fine steps from the cost cap (they keep the paper's
     full bridge and halo), ``window_start`` / ``window_hold_steps`` reshape the
@@ -128,7 +130,7 @@ class AReA(io.ComfyNode):
                     "phase1_mode",
                     options=["auto", "steps", "sigma", "bootstrap"],
                     default="auto",
-                    tooltip="How the Phase I -> Phase II switch is expressed. 'auto' = resolved per backbone: 'sigma' on Z-Image (the leading steps still at or above phase1_sigma run Phase I, so the switch follows the schedule) and 'steps' on FLUX and Krea-2. 'steps' = the leading phase1_steps steps run Phase I (the reference's mode). 'sigma' = the leading steps whose noise level is still at or above phase1_sigma run Phase I, so the switch follows the schedule rather than a fixed count (8 of 28 sits at a sigma of roughly 0.88 on a shift-3.0 flow). 'bootstrap' = the paper's Appendix F mode: no Phase I at all, windowed Phase II from the first step; the early steps must have composed the canvas in a separate native-resolution pass whose latent was upscaled and re-noised to phase1_sigma (see the README pattern).",
+                    tooltip="How the Phase I -> Phase II switch is expressed. 'auto' = resolved per backbone: 'sigma' on Z-Image and Qwen-Image-2.1 (the leading steps still at or above phase1_sigma run Phase I, so the switch follows the schedule) and 'steps' on FLUX and Krea-2. 'steps' = the leading phase1_steps steps run Phase I (the reference's mode). 'sigma' = the leading steps whose noise level is still at or above phase1_sigma run Phase I, so the switch follows the schedule rather than a fixed count (8 of 28 sits at a sigma of roughly 0.88 on a shift-3.0 flow). 'bootstrap' = the paper's Appendix F mode: no Phase I at all, windowed Phase II from the first step; the early steps must have composed the canvas in a separate native-resolution pass whose latent was upscaled and re-noised to phase1_sigma (see the README pattern).",
                 ),
                 io.Float.Input(
                     "phase1_sigma",
@@ -139,7 +141,7 @@ class AReA(io.ComfyNode):
                     "pooling",
                     options=["auto"] + list(POOLING),
                     default="auto",
-                    tooltip="Phase I pooling: which token of each f x f image block the pooled key/value comes from. 'auto' = resolved per backbone: 'mean' on Z-Image, 'subsample' on FLUX. 'subsample' = block centre. 'mean' = block average for values, and for keys the block-mean direction rescaled to the mean member norm (the centroid keeps every token contributing while the norm keeps the attention temperature at the un-pooled one). 'medoid' = the token closest to the block-mean key. 'random' = a token drawn per (seed, step, block). Keys must be pooled BEFORE the position rotation, so all four keep the survivors in the query's frame.",
+                    tooltip="Phase I pooling: which token of each f x f image block the pooled key/value comes from. 'auto' = resolved per backbone: 'subsample' on FLUX, 'mean' on Z-Image and Krea-2, 'medoid' on Qwen-Image-2.1. 'subsample' = block centre. 'mean' = block average for values, and for keys the block-mean direction rescaled to the mean member norm (the centroid keeps every token contributing while the norm keeps the attention temperature at the un-pooled one). 'medoid' = the token closest to the block-mean key — on Qwen-Image-2.1 it keeps ONE real token's key AND value, so the pooled cell carries a single content instead of a synthetic key over a blended value. 'random' = a token drawn per (seed, step, block). Keys must be pooled BEFORE the position rotation, so all four keep the survivors in the query's frame.",
                 ),
                 io.Int.Input(
                     "halo",

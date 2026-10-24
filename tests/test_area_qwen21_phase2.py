@@ -14,8 +14,10 @@ What is pinned here:
   IMAGE, and the map is computed on 2.1's own 2-D token grid;
 * the Phase II answer has the IMAGE segment's shape and the caption's keys
   reach the image queries;
-* the bridge keys keep their true positions and the bridge count is
-  shape-aware (the Krea-2 lesson);
+* the bridge keys keep their TRUE positions — the 2.1 profile opts OUT of
+  the horizon saturation, so the registers are re-roped at their own cells
+  (the ids the model used for those tokens) and the hop is NOT compressed —
+  and the bridge count is shape-aware (the Krea-2 lesson);
 * Phase II can be switched off (no ``img_in``) without touching Phase I, byte
   for byte.
 
@@ -35,10 +37,11 @@ import torch
 import test_area_grid_fallback as fallback
 import test_area_node as flux
 import test_area_zimage_seam as zimage
-from src import area
+from src import area, area_attn
 from src.area import apply_area_to_model, restore_area_attention_hook
 from src.area_arch import FLUX_PROFILE, KREA_PROFILE, ZIMAGE_PROFILE
-from src.area_attn import apply_rope1, bridge_registers, detail_map, windowed_attention
+from src.area_attn import (D_MAX_HORIZON, apply_rope1, bridge_registers, detail_map,
+                           select_registers, token_importance, windowed_attention)
 from src.area_krea import coarse_ropes_krea, krea_layout
 from src.area_schedule import coarse_grid
 from src.area_qwen21 import (
@@ -134,6 +137,40 @@ def _flat(x):
     return x.transpose(1, 2).reshape(b, n, heads * dim)
 
 
+def _unrotated_image_keys(dm, table, k, txt_len=TXT_LEN, h=H, w=W):
+    """The image segment's keys in the UNROTATED frame — the frame the engine ranks."""
+    k_h = qwen21_to_heads(_flat(k[:, :, :txt_len + h * w]), dm.heads)
+    k_unrot = unrotate1(k_h, qwen21_slice_table(table, 0, txt_len + h * w))
+    return k_unrot[:, :, txt_len:]
+
+
+def _profile_kwargs(seam, monkeypatch):
+    """``(dm, kwargs)`` — the kwargs the 2.1 SEAM passes to the engine.
+
+    The profile's own frame, taken from the seam itself: a pin that reads
+    them here fails when the profile changes its mind, not only when the
+    engine's branch changes.
+    """
+    backend, _calls, _pristine = seam
+    dm = _model()
+    rt = _runtime(dm, phase="fine", hidden=_hidden(dm))
+    area._QRUNTIME = rt
+    seen = {}
+    real = area.windowed_attention
+
+    def spy(*args, **kwargs):
+        seen.update(kwargs)
+        return real(*args, **kwargs)
+
+    monkeypatch.setattr(area, "windowed_attention", spy)
+    try:
+        table, q, k, v = _tensors(dm)
+        _image_call(backend, table, q, k, v)
+    finally:
+        area._QRUNTIME = None
+    return dm, seen
+
+
 def _image_call(backend, table, q, k, v, txt_len=TXT_LEN, h=H, w=W):
     """The IMAGE segment's seam call — the eligible one."""
     n = txt_len + h * w
@@ -216,21 +253,54 @@ def test_the_caption_keys_reach_the_image_queries(seam):
     assert not torch.allclose(out, out2, atol=1e-6)
 
 
-def test_the_bridge_keys_keep_their_true_positions(seam):
-    """The bridge keys are the model's OWN rotated keys, at their true positions.
+def test_the_2_1_fine_call_turns_the_bridge_saturation_off(seam, monkeypatch):
+    """The 2.1 seam passes ``bridge_saturate=False``.
 
-    The reference is the engine called the way the design prescribes: the
-    paper's caption placement (``rope_embedder=None`` — so the bridge is NOT
-    re-roped by the horizon-saturation branch), the caption's own rotated keys
-    and the model's own rotated image keys.
+    The horizon saturation (the horizon-saturation mechanism) was built for Z-Image's
+    rope: theta=256 makes a 100+ token hop wrap into pseudorandom noise, so
+    the register's offset is compressed into the trained extent.  2.1's theta
+    is 10000, where the hop is a well-defined phase — and the compression
+    MANUFACTURESD the far-half copy (it pulled the other half's tokens inside
+    the window's own horizon, so the far half was read as local).  The profile
+    therefore opts out, and the rest of the 2.1 frame is untouched.
+    """
+    _dm, seen = _profile_kwargs(seam, monkeypatch)
+    assert seen.get("bridge_saturate") is False
+    # the rest of the 2.1 frame: the caption rides a diagonal (no anchor),
+    # the caption is keys and values only, and the image's own running
+    # counter and centred axes are the ones the model itself uses.
+    assert seen.get("caption_anchor") is False
+    assert seen.get("text_keys_only") is True
+    assert seen.get("img_axis0") == float(TXT_LEN)
+    assert seen.get("img_origin") == (float(H - H // 2), float(W - W // 2))
+
+
+def test_the_bridge_keys_keep_their_true_positions(seam, monkeypatch):
+    """The bridge keys are the model's OWN keys at the registers' true positions.
+
+    The reference is the engine called the way the seam calls it: the model's
+    OWN embedder, the horizon saturation OFF (the registers keep their true
+    positions), the GTCN caption anchor OFF (2.1's caption rides a diagonal)
+    and the image's own running counter as axis 0.
     """
     backend, _calls, _pristine = seam
     dm = _model()
     rt = _runtime(dm, phase="fine", hidden=_hidden(dm))
     area._QRUNTIME = rt
+    roped = []
+    real_apply = area_attn.apply_rope1
+
+    def spy(x, freqs):
+        out = real_apply(x, freqs)
+        roped.append(out)
+        return out
+
+    monkeypatch.setattr(area_attn, "apply_rope1", spy)
     try:
         table, q, k, v = _tensors(dm)
         out = _image_call(backend, table, q, k, v)
+        seam_roped = list(roped)
+        roped.clear()
         # the same layout the seam used, and the reference computation
         q_h = qwen21_to_heads(_flat(q[:, :, TXT_LEN:]), dm.heads)
         k_h = qwen21_to_heads(_flat(k[:, :, :TXT_LEN + H * W]), dm.heads)
@@ -243,8 +313,10 @@ def test_the_bridge_keys_keep_their_true_positions(seam):
             k_h[:, :, :TXT_LEN], v_h[:, :, :TXT_LEN],
             q_h, k_h[:, :, TXT_LEN:], v_h[:, :, TXT_LEN:],
             k_unrot[:, :, TXT_LEN:], fine,
-            rope_embedder=None, cap_len=TXT_LEN, caption_rope=None,
-            img_axis0=None, text_keys_only=True,
+            rope_embedder=dm.pe_embedder, cap_len=TXT_LEN, caption_rope=None,
+            img_axis0=float(TXT_LEN), text_keys_only=True,
+            bridge_saturate=False, caption_anchor=False,
+            img_origin=(float(H - H // 2), float(W - W // 2)),
         )
     finally:
         area._QRUNTIME = None
@@ -252,6 +324,197 @@ def test_the_bridge_keys_keep_their_true_positions(seam):
     dim = ref_img.shape[3]
     ref = ref_img.permute(0, 2, 1, 3).reshape(b, n, dm.heads * dim)
     assert torch.allclose(out, ref, atol=1e-5)
+    # ... and the bridge keys THEMSELVES are the model's own keys at those
+    # registers: the true positions, not a compressed re-rope of them
+    assert seam_roped, "the bridge was not re-roped at all"
+    fine = rt.ctx.data["layout"]
+    score = token_importance(k_unrot[:, :, TXT_LEN:])
+    for keys_roped, group in zip(seam_roped, fine.groups):
+        g = int(group.tokens.shape[0])
+        reg = select_registers(score, group.tokens, fine.registers, fine.h, fine.w)
+        keys = keys_roped.reshape(g, b, dm.heads, -1, dim).permute(1, 2, 0, 3, 4)
+        model_keys = k_h[:, :, TXT_LEN:][:, :, reg.reshape(-1)].reshape(
+            b, dm.heads, g, -1, dim)
+        assert torch.allclose(keys, model_keys, atol=1e-5)
+
+
+def test_the_bridge_ids_carry_the_registers_true_positions(seam):
+    """The bridge's key ids carry the registers' TRUE rows and columns.
+
+    The saturation is off for this profile, so the registers are re-roped
+    where they really are on the canvas: the ids handed to the model's own
+    embedder are the registers' own cells — in 2.1's centred frame, with the
+    model's own running counter on axis 0 — so they are the ids the MODEL
+    used for those tokens, and the bridge keys carry the model's own
+    true-position rotation.  The caption is NOT re-roped (2.1 rides a
+    diagonal).
+    """
+    backend, _calls, _pristine = seam
+    dm = _model()
+    rt = _runtime(dm, phase="fine", hidden=_hidden(dm))
+    area._QRUNTIME = rt
+    seen = []
+    handle = dm.pe_embedder.register_forward_hook(
+        lambda module, args, output: seen.append(args[0].detach().clone()))
+    try:
+        table, q, k, v = _tensors(dm)
+        _image_call(backend, table, q, k, v)
+        fine = rt.ctx.data["layout"]
+    finally:
+        handle.remove()
+        area._QRUNTIME = None
+    # the embedder was called for the BRIDGE only — never for a caption anchor
+    bridge_ids = [ids for ids in seen if ids.dim() == 3 and ids.shape[1] == fine.registers]
+    assert bridge_ids, "the bridge was not re-roped at all"
+    assert not [ids for ids in seen if ids.dim() == 3 and ids.shape[1] == TXT_LEN], \
+        "the caption was re-roped: 2.1 rides a diagonal and takes no anchor"
+    for ids in bridge_ids:
+        assert ids.shape[2] == 3
+    # the frame the engine ranked the registers with
+    score = token_importance(_unrotated_image_keys(dm, table, k))
+    org_r, org_c = float(H - H // 2), float(W - W // 2)
+    # the engine re-ropes once per GROUP, and each window draws its own halo
+    # width, so a group holds one window at this scale
+    for ids_g, group in zip(bridge_ids, fine.groups):
+        reg = select_registers(score, group.tokens, fine.registers, fine.h, fine.w)
+        for j, wid in enumerate(group.window_ids.tolist()):
+            # axis 0 is the model's own running counter: the caption's length
+            assert (ids_g[j, :, 0] == float(TXT_LEN)).all()
+            # the spatial axes are the registers' TRUE cells, centred
+            true_rows = (reg[j] // W).to(torch.float32) - org_r
+            true_cols = (reg[j] % W).to(torch.float32) - org_c
+            assert torch.equal(ids_g[j, :, 1], true_rows)
+            assert torch.equal(ids_g[j, :, 2], true_cols)
+            # ... and those ids ARE the model's own ids for those tokens, so
+            # the bridge keys ride the model's own true-position rotation
+            model_rows = table[0, 0, TXT_LEN + reg[j]]
+            assert torch.allclose(dm.pe_embedder(ids_g[j:j + 1])[0, 0], model_rows, atol=1e-6)
+
+
+def test_the_bridge_re_rope_does_not_pollute_the_rope_capture(seam):
+    """The bridge's re-roping must not arrive as an EXTRA rope table.
+
+    The bridge re-ropes its registers through the MODEL'S OWN embedder
+    (``src/area.py``), so the capture hook sees those calls as well.  The
+    seam pauses the capture around them, so the forward's table stays the
+    model's own and the bridge's tables are NOT counted as extra ones.
+
+    Without the pause the recorder's own diagnostic — "a table that arrived
+    anyway means the wiring missed a pause" (``src/area_qwen21.py``) — is
+    permanently lit for every 2.1 Phase II step and can no longer detect a
+    REAL missed pause.
+    """
+    from src.area_qwen21 import _RECORDERS, capture_qwen21_table
+
+    backend, _calls, _pristine = seam
+    dm = _model()
+    hook, recorder = capture_qwen21_table(dm.pe_embedder)
+    recorder.reset()
+    recorder.armed = True
+    rt = area._AreaRuntime(
+        area.AreaConfig(native=4, pooling="mean", halo=2, bridge_ratio=0.5, seed=0),
+        dm, area.QWEN21_PROFILE,
+    )
+    rt.recorder = recorder
+    ctx = area.AreaContext()
+    ctx.phase, ctx.size, ctx.step = "fine", WINDOW, 0
+    ctx.h, ctx.w, ctx.txt_len, ctx.total = H, W, TXT_LEN, 20
+    ctx.fine_step, ctx.floor_steps = 0, 0
+    rt.ctx = ctx
+    rt.hidden = _hidden(dm)
+    calls = []
+    handle = dm.pe_embedder.register_forward_hook(
+        lambda module, args, output: calls.append(tuple(args[0].shape)))
+    area._QRUNTIME = rt
+    try:
+        table, q, k, v = _tensors(dm)
+        _image_call(backend, table, q, k, v)
+    finally:
+        handle.remove()
+        area._QRUNTIME = None
+        if hook.handle is not None:
+            hook.handle.remove()
+        # the registry is keyed by the embedder's id — do not leave a stale
+        # entry behind for the next model
+        _RECORDERS.pop(id(dm.pe_embedder), None)
+    # the bridge WAS re-roped through the model's own embedder ...
+    assert len(calls) > 1, "the bridge was not re-roped at all"
+    # ... and the capture was PAUSED around it: no extra table, no ambiguity
+    assert recorder.extra_tables == 0
+    assert recorder.ambiguous is False
+    # the forward's table is still the model's own — the FIRST one
+    assert recorder.table is not None
+    assert recorder.table.shape[2] == TXT_LEN + H * W
+
+
+def test_the_2_1_bridge_hop_is_not_compressed(seam, monkeypatch):
+    """On the user's 512x2000 canvas the register hop leaves the trained
+    extent — and 2.1 KEEPS it there.
+
+    125x32 tokens (2000/16 x 512/16), a 64-side window: each window's bridge
+    registers are drawn from the OTHER half of the canvas, up to 125 tokens
+    away.  The saturation (the horizon-saturation mechanism) compressed that hop into the
+    trained 64-token extent — which on 2.1 MANUFACTURED the far-half copy it
+    was meant to prevent (the far half was read as local).  The profile opts
+    out, so the registers are re-roped at their own cells and the hop stays
+    the real one.  This is the property the mock's 8x8 grid cannot show (its
+    hop is ~4 tokens), so the canvas is the real one — and the frame is the
+    PROFILE's own, so the pin fails when the profile flips back.
+    """
+    from src.area_attn import build_fine_layout
+    from src.area_schedule import Window, even_starts
+
+    dm, kwargs = _profile_kwargs(seam, monkeypatch)
+    assert kwargs["bridge_saturate"] is False
+
+    h, w, side = 125, 32, 64
+    gen = torch.Generator().manual_seed(7)
+    heads, dim = dm.heads, dm.head_dim
+    q = torch.randn(1, heads, h * w, dim, generator=gen)
+    k = torch.randn(1, heads, h * w, dim, generator=gen)
+    v = torch.randn(1, heads, h * w, dim, generator=gen)
+    windows = [Window(r0, 0, min(h - 1, r0 + side - 1), w - 1)
+               for r0 in even_starts(h, side)]
+    layout = build_fine_layout(windows, h, w, halo=2, registers=512, seed=0, step=0,
+                               dtype=torch.float32, device="cpu")
+    seen = []
+    handle = dm.pe_embedder.register_forward_hook(
+        lambda module, args, output: seen.append(args[0].detach().clone()))
+    try:
+        windowed_attention(
+            q[:, :, :0], k[:, :, :0], v[:, :, :0],
+            q, k, v, k, layout,
+            rope_embedder=dm.pe_embedder, cap_len=kwargs["cap_len"], caption_rope=None,
+            img_axis0=kwargs["img_axis0"], text_keys_only=kwargs["text_keys_only"],
+            bridge_saturate=kwargs["bridge_saturate"],
+            caption_anchor=kwargs["caption_anchor"],
+            img_origin=(float(h - h // 2), float(w - w // 2)),
+        )
+    finally:
+        handle.remove()
+    assert seen, "the bridge was not re-roped at all"
+    org_r, org_c = float(h - h // 2), float(w - w // 2)
+    score = token_importance(k)
+    true_hop = 0.0
+    for ids_g, group in zip(seen, layout.groups):
+        reg = select_registers(score, group.tokens, layout.registers, h, w)
+        for j, wid in enumerate(group.window_ids.tolist()):
+            win = layout.windows[wid]
+            centre_r = (win.r0 + win.r1) * 0.5 - org_r
+            centre_c = (win.c0 + win.c1) * 0.5 - org_c
+            # the TRUE offset the register has on the canvas...
+            true_rows = (reg[j] // w).to(torch.float32) - org_r
+            true_cols = (reg[j] % w).to(torch.float32) - org_c
+            # ... and the offset the engine re-roped it at: THE SAME ONE, so
+            # nothing compresses the hop into the trained horizon
+            assert torch.equal(ids_g[j, :, 1], true_rows)
+            assert torch.equal(ids_g[j, :, 2], true_cols)
+            true_hop = max(true_hop, (true_rows - centre_r).abs().max().item(),
+                           (true_cols - centre_c).abs().max().item())
+    # the hop really does leave the trained extent: 2.1 reads the far half at
+    # its true distance instead of at a compressed one
+    assert true_hop > D_MAX_HORIZON
+
 
 
 def test_the_bridge_count_is_shape_aware(seam):

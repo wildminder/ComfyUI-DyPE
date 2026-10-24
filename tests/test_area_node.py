@@ -38,7 +38,7 @@ from src.area_attn import (
     windowed_step_cost,
 )
 from src.area_schedule import build_schedule, initial_factor, pooling_ramp
-from src.area_zimage import ZIMAGE_SIGMA_STAR
+from src.area_zimage import ZIMAGE_SIGMA_STAR, sigma_prefix_count
 
 try:
     from comfy.model_patcher import ModelPatcher
@@ -171,6 +171,24 @@ class NextDiT(torch.nn.Module):
         self.pad_tokens_multiple = 32
         self.masked_pad_multiple = None
         self.rope_embedder = torch.nn.Linear(4, 4)
+
+
+class QwenImage21Transformer2DModel:  # noqa: N801 - the class NAME is the backbone's identity
+    """The resolver pins the backbone by the diffusion model's CLASS NAME
+    (``src/area_arch.py:266`` walks the MRO), so this mock only has to BEAR the
+    name for the apply-time resolution to run without the real module.  2.1 has
+    no ``patch_size`` of its own (one token per latent position); the value here
+    only feeds this mock."""
+
+    patch_size = 2
+
+
+def _mock_qwen21_model():
+    m = ModelPatcher()
+    m.model.diffusion_model = QwenImage21Transformer2DModel()
+    m.model.model_sampling = types.SimpleNamespace()
+    m.model.model_config = types.SimpleNamespace()
+    return m
 
 
 def mock_zimage_model() -> ModelPatcher:
@@ -592,7 +610,7 @@ class TestTheEffectiveCoarseCount:
 
 
 # ---------------------------------------------------------------------------
-# The auto defaults, resolved per backbone (AReA-Z, area-fix §3-File 3)
+# The auto defaults, resolved per backbone (the per-backbone defaults)
 # ---------------------------------------------------------------------------
 
 
@@ -600,7 +618,7 @@ class TestTheEffectiveCoarseCount:
 class TestAutoDefaults:
     """``pooling = "auto"`` / ``phase1_mode = "auto"`` resolve per backbone.
 
-    Z-Image runs the AReA-Z adaptation — the norm-preserving centroid pooling
+    Z-Image runs the AReA adaptation — the norm-preserving centroid pooling
     and the schedule-aware sigma handoff — while FLUX keeps the reference's
     constants exactly (``apply_area_to_model`` resolves after the profile is
     known, before the engine config freezes concrete modes).
@@ -625,11 +643,78 @@ class TestAutoDefaults:
         assert cfg.phase1_steps == PHASE1 == 8
 
     def test_zimage_auto_resolves_to_the_adaptation_knobs(self):
-        """Z-Image runs the AReA-Z defaults: mean pooling, sigma handoff."""
+        """Z-Image runs the the per-backbone defaults: mean pooling, sigma handoff."""
         cfg = self._config(mock_zimage_model())
         assert cfg.pooling == "mean"
         assert cfg.phase1_mode == "sigma"
         assert cfg.phase1_sigma == ZIMAGE_SIGMA_STAR == 0.89
+
+    def test_qwen21_auto_resolves_to_the_distilled_regime(self):
+        """Qwen-Image-2.1 joins Z-Image on the SIGMA handoff, not FLUX's steps.
+
+        2.1 is a distilled Turbo-class model on a short schedule, so the FLUX
+        step-count regime floods Phase I: an 8-step table with phase1_steps = 2
+        runs a quarter of the run fully pooled and phase1_steps = 8 runs all of
+        it, which is the user's reported duplication and inward collapse.  With
+        FLUX's constant there the _warn_regime advisory is silent too (it fires
+        above a third of the steps), so the run degrades with no warning at all.
+
+        The POOLING is 2.1's own: the medoid, not Z-Image's centroid — see
+        ``TestAutoDefaults.test_the_auto_pooling_is_resolved_per_backbone``.
+        """
+        cfg = self._config(_mock_qwen21_model(), "qwen21")
+        assert cfg.pooling == "medoid"
+        assert cfg.phase1_mode == "sigma"
+        assert cfg.phase1_sigma == ZIMAGE_SIGMA_STAR
+
+    def test_the_auto_pooling_is_resolved_per_backbone(self):
+        """``pooling = "auto"`` is a PER-BACKBONE default, and 2.1's is medoid.
+
+        FLUX keeps the reference's ``subsample`` (byte-frozen), Z-Image and
+        Krea-2 keep the norm-preserving centroid (``mean``, pinned for Krea-2
+        in ``tests/test_area_krea_ripple.py``), and Qwen-Image-2.1 runs the
+        MEDOID: Phase I's output is ``softmax(q·K)·V``, so the centroid's
+        blended VALUE (and its synthetic key, which belongs to no token) puts
+        two contents behind one position — the doubled/imploded face.  The
+        medoid keeps ONE real token's key AND value.
+
+        The semantics are pinned in ``tests/test_area_qwen21_pooling.py``.
+        """
+        assert self._config(mock_flux_model()).pooling == "subsample"
+        assert self._config(mock_zimage_model()).pooling == "mean"
+        assert self._config(_mock_qwen21_model(), "qwen21").pooling == "medoid"
+
+    def test_a_short_turbo_table_resolves_one_coarse_step_in_sigma_mode(self):
+        """The regime the user's own sweep found acceptable, measured.
+
+        A Turbo-style sigma table enters at ~1.0 and drops fast, so counting the
+        noisy prefix at or above phase1_sigma resolves ~1 coarse step of the
+        8-step schedule — not the 2..8 the "steps" knob was handing the model.
+        """
+        cfg = self._config(_mock_qwen21_model(), "qwen21")
+        table = torch.tensor([1.0, 0.875, 0.75, 0.625, 0.5, 0.375, 0.25, 0.125, 0.0])
+        got = sigma_prefix_count(table[:-1], cfg.phase1_sigma)
+        assert 1 <= got <= 2, f"sigma mode resolves {got} coarse steps of 8"
+
+    def test_qwen21_explicit_steps_still_restores_the_flux_regime(self):
+        """The escape hatch: an explicit ``phase1_mode="steps"`` is honoured.
+
+        The auto-default moving 2.1 to the sigma handoff must not make the knob
+        dead: a user who wants the reference's step-count regime back (or is
+        bisecting the regression) gets it, and ``phase1_steps`` then means what
+        it always meant.  ``pooling`` is independent and stays ``"medoid"`` on
+        the 2.1 half either way.
+        """
+        flux_steps = self._config(_mock_qwen21_model(), "qwen21",
+                                  phase1_mode="steps", phase1_steps=2)
+        assert flux_steps.phase1_mode == "steps"
+        assert flux_steps.phase1_steps == 2
+        assert flux_steps.pooling == "medoid"
+        # an explicit phase1_steps on the AUTO mode does NOT silently become a
+        # step count: sigma mode owns the handoff and the knob is decorative
+        auto = self._config(_mock_qwen21_model(), "qwen21", phase1_steps=7)
+        assert auto.phase1_mode == "sigma"
+        assert auto.phase1_steps == 7
 
     def test_explicit_knobs_pass_through_unchanged_on_both_backbones(self):
         flux = self._config(mock_flux_model(), "flux", pooling="medoid", phase1_mode="sigma")
@@ -643,7 +728,8 @@ class TestAutoDefaults:
     def test_auto_never_lands_in_the_config(self):
         """A half-resolved pair still resolves: "auto" never reaches AreaConfig."""
         for model, expected in ((mock_flux_model(), "subsample"),
-                                (mock_zimage_model(), "mean")):
+                                (mock_zimage_model(), "mean"),
+                                (_mock_qwen21_model(), "medoid")):
             for pooling, phase1_mode in (("auto", "auto"), ("auto", "steps"),
                                          ("subsample", "auto")):
                 cfg = self._config(model, "auto", pooling=pooling, phase1_mode=phase1_mode)

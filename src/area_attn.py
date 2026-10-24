@@ -51,7 +51,12 @@ Deviations from the reference, all deliberate and pinned by the Phase 2 tests:
 * :func:`windowed_step_cost` exposes the pricing of :func:`fit_extra_keys`
   without applying it, for the engine's bridge-floor exemption (which deliberately
   runs above the cap on a short schedule's leading fine steps).  ``fit_extra_keys``
-  itself is untouched, so the cost-capped path is byte-identical.
+  itself is untouched, so the cost-capped path is byte-identical.  Both live in
+  :mod:`src.area_schedule` now — the Phase II COST MODEL is pure schedule math,
+  and the Phase II side choice has to price a window before this module's
+  tensors exist.  They are re-exported here under the same names, so every
+  call site (and every test) keeps working; the import graph runs ONE way only
+  (``area_attn`` imports FROM ``area_schedule``, never the reverse).
 
 Determinism: nothing here reads the global RNG.  Every stream is a
 ``numpy.random.default_rng`` keyed by ``(seed, step, salt)`` through
@@ -71,11 +76,14 @@ from .area_schedule import (
     Window,
     _dedupe,
     _grown_box,
+    bridge_registers,
     coarse_grid,
     even_starts,
+    fit_extra_keys,
     ring_size,
     step_rng,
     window_tokens,
+    windowed_step_cost,
 )
 
 POOLING = ("subsample", "mean", "medoid", "random")
@@ -361,7 +369,7 @@ def pool_keys_values(key: torch.Tensor, value: torch.Tensor, txt_len: int, h: in
     ``subsample`` keeps the block centre, ``mean`` averages the VALUES and keeps
     the norm-preserving CENTROID keys (:func:`_norm_preserved_keys` — the block-mean
     direction at the mean member norm, so neither a Dirac comb nor a flattened
-    temperature; M2 in ``.dev/area-debug/area-fix.txt``), ``medoid`` keeps the
+    temperature; the centroid-key mechanism), ``medoid`` keeps the
     token whose key is closest to the block-mean key, and ``random`` keeps a token
     drawn per ``(seed, step, block)``.  Keys must be unrotated — pooling after
     RoPE would rotate the survivors away from the query's frame — and K and V
@@ -429,79 +437,9 @@ class FineLayout:
     registers: int                       # R bridge tokens per window (0 = no bridge)
 
 
-def fit_extra_keys(windows: list[Window], h: int, w: int, txt_len: int, registers: int,
-                   halo: int) -> tuple[int, int]:
-    """Bridge count and Halo width that keep one Phase II step at or below full attention.
-
-    Each window runs ``T + n`` queries (text and its image tokens) against ``T + n``
-    keys plus its Halo ring and ``R`` bridge tokens, so the step costs
-    ``sum (T+n)(T+n+ring+R)`` against ``(T + h*w)^2``.  The Halo is priced at its
-    full width, the most any window can draw.  The bridge is cut first, to the
-    largest count that fits; the Halo narrows only if the step is still above full
-    attention without any bridge tokens.
-    """
-    full = float(txt_len + h * w) ** 2
-    rows = [float(txt_len + win.area) for win in windows]
-
-    def local(depth: int) -> float:
-        return sum(q * (q + ring_size(win, depth, h, w)) for q, win in zip(rows, windows))
-
-    room = full - local(halo)
-    if room >= registers * sum(rows):
-        return registers, halo
-    if room >= 0:
-        return int(room // sum(rows)), halo
-    depth = next((d for d in range(halo, -1, -1) if local(d) <= full), 0)
-    return 0, depth
-
-
-def windowed_step_cost(windows: list[Window], h: int, w: int, txt_len: int, registers: int,
-                       halo: int) -> float:
-    """One Phase II step in units of one full-attention pass, before any trimming.
-
-    The same pricing :func:`fit_extra_keys` applies — each window runs ``T + n``
-    queries (text and its image tokens) against ``T + n`` keys plus its Halo ring
-    and ``R`` bridge tokens, summed over the windows and divided by the full
-    ``(T + h*w)^2`` — with the Halo priced at its FULL width, the most any window
-    can draw.  :func:`fit_extra_keys` keeps that at or below 1.0; the bridge floor
-    (``src/area.py``) is the deliberate exception, and this is the number it
-    reports so the exemption is visible rather than silent.
-    """
-    full = float(txt_len + h * w) ** 2
-    rows = [float(txt_len + win.area) for win in windows]
-    total = sum(q * (q + ring_size(win, halo, h, w) + registers)
-                for q, win in zip(rows, windows))
-    return total / full
-
-
 def tiling_rng(seed: int, step: int) -> np.random.Generator:
     """The keyed stream of one step's adaptive splits (the backbone's salt)."""
     return step_rng(seed, step, TILING_SALT)
-
-
-def bridge_registers(size: int, bridge_ratio: float, h: Optional[int] = None,
-                     w: Optional[int] = None) -> int:
-    """R of the bridge: ``round(rho * w)^2`` tokens per window, 0 when the bridge is off.
-
-    The square formula is the paper's (``R = (rho * w)^2`` registers for a
-    SQUARE window of side ``w``, App. E).  A window is clipped by the canvas,
-    so on a canvas NARROWER than the window side it holds ``side x width``
-    tokens instead of ``side^2`` — and the square formula then hands the bridge
-    ``side / width`` times the share of the window's content the paper's ratio
-    (``rho^2``) asks for.  With the canvas's ``h`` and ``w`` the count follows
-    the window's ACTUAL shape — ``round(rho * min(side, h)) x
-    round(rho * min(side, w))`` — and the bridge-to-content ratio is the
-    designed one on every aspect.  Without them (the FLUX and Z-Image paths)
-    the value is the square one, bit for bit.
-    """
-    if bridge_ratio <= 0:
-        return 0
-    side = int(size)
-    if h is None or w is None:
-        return max(1, int(round(float(bridge_ratio) * side))) ** 2
-    rows = max(1, int(round(float(bridge_ratio) * min(side, int(h)))))
-    cols = max(1, int(round(float(bridge_ratio) * min(side, int(w)))))
-    return rows * cols
 
 
 def build_fine_layout(windows: list[Window], h: int, w: int, halo: int, registers: int,
@@ -539,13 +477,13 @@ def build_fine_layout(windows: list[Window], h: int, w: int, halo: int, register
 # frequency 1.0 rad per token, so a bridge hop of the canvas' own diameter (100+ tokens
 # at 2048 px) wraps the rotation ~16 times and turns the query-key dot product into
 # pseudorandom noise — distant features leak into empty regions and hallucinate there
-# (area-fix2 mechanism 2).  56 tokens stays inside the trained 64-token extent.
+# (the horizon-saturation mechanism).  56 tokens stays inside the trained 64-token extent.
 D_MAX_HORIZON = 56.0
 
 
 def saturate_bridge_positions(reg_indices: torch.Tensor, win: Window, h: int, w: int,
                               device) -> tuple[torch.Tensor, torch.Tensor]:
-    """The saturated ``(rows, cols)`` of one window's bridge tokens (area-fix2 mechanism 2).
+    """The saturated ``(rows, cols)`` of one window's bridge tokens (the horizon-saturation mechanism).
 
     The register's true offset from the window centre is compressed through a smooth
     ``D_MAX * tanh(delta / D_MAX)``: the direction survives — and the axis ratio too,
@@ -561,6 +499,21 @@ def saturate_bridge_positions(reg_indices: torch.Tensor, win: Window, h: int, w:
     sat_r = win_r_center + D_MAX_HORIZON * torch.tanh(delta_r / D_MAX_HORIZON)
     sat_c = win_c_center + D_MAX_HORIZON * torch.tanh(delta_c / D_MAX_HORIZON)
     return sat_r, sat_c
+
+
+def bridge_true_positions(reg_indices: torch.Tensor, w: int) -> tuple[torch.Tensor, torch.Tensor]:
+    """The TRUE ``(rows, cols)`` of one window's bridge tokens on the grid.
+
+    The counterpart of :func:`saturate_bridge_positions`: the register keeps
+    the cell it occupies on the canvas, so its hop from the window's centre is
+    the REAL one.  A backbone whose rope horizon covers that hop reads the far
+    side at its true distance instead of at a compressed one — the frame
+    Qwen-Image-2.1 takes (theta=10000, where a 63-92 token hop is a
+    well-defined phase and not the wrapped noise the saturation was built for).
+    """
+    reg_r = (reg_indices // w).to(torch.float32)
+    reg_c = (reg_indices % w).to(torch.float32)
+    return reg_r, reg_c
 
 
 def _group_window_ids(group: WindowGroup, layout: FineLayout) -> list[int]:
@@ -590,7 +543,7 @@ def _group_window_ids(group: WindowGroup, layout: FineLayout) -> list[int]:
 def caption_window_ids(layout: FineLayout, t: int, device) -> torch.Tensor:
     """``[n_windows, t, 3]`` — the caption's rope ids, anchored to EACH window.
 
-    **GTCN, Phase II (area-fix3, ``.dev/area-debug/area-fix3.txt``).**  Lumina2
+    **GTCN, Phase II (the GTCN Phase II mechanism).**  Lumina2
     puts every caption token at the spatial origin (``(t, 0, 0)``,
     ``comfy/ldm/lumina/model.py:664-667``), so a window far from the origin
     meets the prompt through a rope phase the model was never trained on — at
@@ -639,7 +592,9 @@ def windowed_attention(q_txt: torch.Tensor, k_txt: torch.Tensor, v_txt: torch.Te
                        q_img: torch.Tensor, k_img: torch.Tensor, v_img: torch.Tensor,
                        k_img_unrotated: torch.Tensor, layout: FineLayout,
                        rope_embedder=None, cap_len: int = 32, caption_rope=None,
-                       img_axis0: Optional[float] = None, text_keys_only: bool = False
+                       img_axis0: Optional[float] = None, text_keys_only: bool = False,
+                       bridge_saturate: bool = True, caption_anchor: bool = True,
+                       img_origin: Optional[tuple[float, float]] = None
                        ) -> tuple[torch.Tensor, torch.Tensor]:
     """Attention inside each window, its keys extended by the Halo ring and the bridge tokens.
 
@@ -649,18 +604,33 @@ def windowed_attention(q_txt: torch.Tensor, k_txt: torch.Tensor, v_txt: torch.Te
     over windows: every window re-runs the same text queries and keys, so averaging
     is the refusal to let window count leak into the text stream.
 
-    ``rope_embedder`` (with ``cap_len``) turns on two Z-Image-only rope
-    mechanisms; without one (the FLUX call) the paper's behaviour is kept
-    untouched, bit for bit:
+    ``rope_embedder`` (with ``cap_len``) is the BACKBONE'S OWN rope embedder:
+    with one, the bridge's keys are re-roped through it — and the caption too,
+    when the caption anchor is on.  Without one (the FLUX call) the paper's
+    behaviour is kept untouched, bit for bit.
 
-    * the bridge ROPE HORIZON SATURATION (area-fix2 mechanism 2): the bridge keys
-      are taken from the UNROTATED keys and re-roped at the saturated positions
-      instead of riding the true-position rotation, so no query meets a distant
-      key through more rope phase than the model was trained on;
-    * the GTCN's CAPTION ANCHORING (area-fix3): the caption is re-roped at each
-      window's own origin, so the prompt stays inside the model's trained
-      phase even for a window far from the canvas' top-left corner — see
-      :func:`caption_window_ids` for the route and its evidence.
+    Two mechanisms ride on it.  Both were built for Z-Image, but NEITHER is
+    Z-Image-only any more: each is a per-backbone switch whose DEFAULT is
+    Z-Image's behaviour, so the Z-Image golden cannot move.
+
+    * the bridge ROPE HORIZON SATURATION (the horizon-saturation mechanism, the default
+      ``bridge_saturate=True``): the bridge keys are taken from the UNROTATED
+      keys and re-roped at the saturated positions instead of riding the
+      true-position rotation, so no query meets a distant key through more
+      rope phase than the model was trained on.  A backbone whose rope horizon
+      covers the REAL hop opts out (``bridge_saturate=False``): the registers
+      are then re-roped at their TRUE positions, so the bridge keys carry the
+      model's own true-position rotation — Qwen-Image-2.1 does (theta=10000,
+      where a 63-92 token hop is a well-defined phase);
+    * the GTCN's CAPTION ANCHORING (the GTCN mechanism, the default
+      ``caption_anchor=True``): the caption is re-roped at each window's own
+      origin, so the prompt stays inside the model's trained phase even for a
+      window far from the canvas' top-left corner — see
+      :func:`caption_window_ids` for the route and its evidence.  A backbone
+      whose caption does NOT ride the spatial axes opts out
+      (``caption_anchor=False``): Qwen-Image-2.1's caption rides a DIAGONAL
+      at the model's own running counter (``model.py:323``), so there is no
+      per-window spatial origin to anchor it to.
 
     ``caption_rope`` is that anchor table, ALREADY built: the caller may pass it
     (the Z-Image seam builds it once per step and shares it between the step's
@@ -676,6 +646,19 @@ def windowed_attention(q_txt: torch.Tensor, k_txt: torch.Tensor, v_txt: torch.Te
     (Krea-2's image tokens carry axis 0 = 0,
     ``comfy/ldm/krea2/model.py:291-294``).  The default reproduces today's
     behaviour byte for byte, so the Z-Image golden cannot move.
+
+    ``caption_anchor`` switches the CAPTION ANCHORING mechanism off (see the
+    bullet above) — for a backbone whose caption does not ride the spatial
+    axes, so that there is no per-window origin to anchor it to.
+
+    ``img_origin`` is the SHIFT between the grid's own 0-based positions and
+    the frame the backbone's image tokens ride: the bridge's rows and columns
+    are shifted by it before they are handed to the embedder.  A backbone
+    whose image tokens ride CENTRED spatial axes needs the shift —
+    Qwen-Image-2.1's own centred ramp is ``index - (size - size // 2)``
+    (``comfy/ldm/qwen_image21/model.py:330-331``), so the seam passes
+    ``(h - h // 2, w - w // 2)``; ``None`` keeps the grid's own 0-based frame
+    (Z-Image / Krea-2), so their goldens cannot move.
 
     ``text_keys_only`` splits the ONE length this function used to couple the
     text queries and the text keys by (``t = q_txt.shape[2]``) into the two
@@ -707,14 +690,14 @@ def windowed_attention(q_txt: torch.Tensor, k_txt: torch.Tensor, v_txt: torch.Te
     out_txt = torch.zeros(b, heads, t_q, dim, dtype=q_img.dtype, device=q_img.device)
     score = token_importance(k_img_unrotated) if layout.registers > 0 else None
 
-    # GTCN Phase II (area-fix3): the caption's anchor table, ONE call for the
+    # GTCN Phase II (the GTCN mechanism): the caption's anchor table, ONE call for the
     # whole layout — one row per window, the caption at that window's origin.
     # The table's t axis is zero (an identity rotation), so the model's own t
     # rotation of the caption survives and only the window-origin rotation is
     # added — see ``caption_window_ids``.  Without an embedder (the FLUX call)
     # the caption keeps the paper's own positions, bit for bit.
     cap_rope = None
-    if rope_embedder is not None:
+    if rope_embedder is not None and caption_anchor:
         if caption_rope is None:
             # ``area_zimage`` imports this module, so the helper is imported
             # here (the same discipline the bridge branch below uses) — the
@@ -744,17 +727,36 @@ def windowed_attention(q_txt: torch.Tensor, k_txt: torch.Tensor, v_txt: torch.Te
         if score is not None:
             reg = select_registers(score, group.tokens, layout.registers, layout.h, layout.w)
             if rope_embedder is not None:
-                # Horizon saturation (area-fix2 mechanism 2): the bridge KEYS are re-roped
-                # from their saturated positions, so no query meets a distant key through
-                # more rope phase than the model's trained extent.  The VALUES are the
-                # registers' own either way, and a caller without an embedder (FLUX) keeps
-                # the paper's true-position keys untouched.
-                sat_rows, sat_cols = [], []
+                # The bridge FRAME — the positions the registers are re-roped
+                # at.  There are two of them:
+                #
+                # * SATURATED (the horizon-saturation mechanism, the DEFAULT): the
+                #   register's offset from the window centre is compressed
+                #   through ``D_MAX * tanh(delta / D_MAX)``, so no query meets
+                #   a distant key through more rope phase than the model was
+                #   trained on.  Z-Image's rationale — theta=256 wraps a 100+
+                #   token hop into pseudorandom noise — and its goldens are
+                #   frozen on it.
+                # * TRUE (``bridge_saturate=False``): the register keeps the
+                #   cell it occupies on the canvas.  Qwen-Image-2.1's theta is
+                #   10000, where a 63-92 token hop is a well-defined phase —
+                #   and the compression only MANUFACTURED the far-half copy it
+                #   was meant to prevent: it pulled the other half's tokens
+                #   inside the window's own horizon, so the far half was read
+                #   as local.
+                #
+                # The VALUES are the registers' own either way, and a caller
+                # without an embedder (FLUX) keeps the paper's true-position
+                # keys untouched.
+                rows, cols = [], []
                 for j, win_index in enumerate(_group_window_ids(group, layout)):
-                    sat_r, sat_c = saturate_bridge_positions(
-                        reg[j], layout.windows[win_index], layout.h, layout.w, q_img.device)
-                    sat_rows.append(sat_r)
-                    sat_cols.append(sat_c)
+                    if bridge_saturate:
+                        r, c = saturate_bridge_positions(
+                            reg[j], layout.windows[win_index], layout.h, layout.w, q_img.device)
+                    else:
+                        r, c = bridge_true_positions(reg[j], layout.w)
+                    rows.append(r)
+                    cols.append(c)
                 ids = torch.zeros(g, layout.registers, 3, device=q_img.device,
                                   dtype=torch.float32)
                 # The bridge keys are re-roped at the backbone's own axis-0
@@ -764,8 +766,12 @@ def windowed_attention(q_txt: torch.Tensor, k_txt: torch.Tensor, v_txt: torch.Te
                 # backbone whose image tokens carry the frame index instead
                 # (Krea-2: axis 0 = 0) passes its own value.
                 ids[:, :, 0] = float(cap_len + 1) if img_axis0 is None else float(img_axis0)
-                ids[:, :, 1] = torch.stack(sat_rows)
-                ids[:, :, 2] = torch.stack(sat_cols)
+                # The positions live in the grid's OWN 0-based frame; a
+                # backbone whose image tokens ride CENTRED spatial axes
+                # (Qwen-Image-2.1) needs them shifted into that frame.
+                org_r, org_c = (0.0, 0.0) if img_origin is None else img_origin
+                ids[:, :, 1] = torch.stack(rows) - float(org_r)
+                ids[:, :, 2] = torch.stack(cols) - float(org_c)
                 # ``area_zimage`` imports this module, so the helper is imported
                 # here — the FLUX path never reaches this branch and never
                 # imports it.
@@ -915,7 +921,7 @@ def adaptive_tiling(energy: np.ndarray, h: int, w: int, size: int, w_min: int, t
     cols = jittered_starts(w, size, rng) if rng is not None else even_starts(w, size)
     boxes = [Window(r, c, min(h - 1, r + size - 1), min(w - 1, c + size - 1)) for r in rows for c in cols]
     if not allow_splits:
-        # Window integrity (area-fix2 mechanism 3): the DWT energy map reads noise as
+        # Window integrity (the short-schedule window-integrity rule): the DWT energy map reads noise as
         # detail before an 8-step distilled model has composed anything, and its
         # quadrants are 11% of the canvas each — small enough to hallucinate a whole
         # subject of their own.  A short schedule therefore keeps the base windows.
