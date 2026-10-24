@@ -527,7 +527,7 @@ def _purge_calibration_memory() -> None:
 # Memory-bounded calibration: per-block gradient checkpointing
 # ---------------------------------------------------------------------------
 #
-# Root cause of the calibration OOM (see .dev/docs/oom.md): a single end-to-end
+# Root cause of the calibration OOM (see the calibration OOM note): a single end-to-end
 # backward retains O(layers) of autograd ACTIVATION memory (~0.81 GiB/layer on
 # Krea2 → ~22 GiB for 28 layers > 16 GiB device).  The attention chunk leaves
 # themselves are negligible (~0.3 GiB total).
@@ -659,7 +659,7 @@ def _uninstall_block_checkpointing(installed: List[Tuple]) -> None:
 def _flush_gpu_allocator() -> None:
     """Best-effort GPU allocator flush before a calibration run.
 
-    Mitigates the aimdo fragmentation caveat (.dev/docs/oom.md): a long-lived
+    Mitigates the aimdo fragmentation caveat (the calibration OOM note): a long-lived
     ComfyUI session accumulates reserved-but-freed blocks that can fragment
     the large contiguous allocations calibration needs.  ``empty_cache``
     returns unused cached memory to the driver.
@@ -1034,7 +1034,7 @@ def collect_scope_scores_for_model(
     # MEMORY-BOUNDED CALIBRATION: install per-block gradient checkpointing on
     # the diffusion model (if a block list is found).  This bounds peak
     # NON-ATTENTION activation memory to ~one block instead of O(layers) — the
-    # root cause of the calibration OOM (.dev/docs/oom.md).  ``use_reentrant=False``
+    # root cause of the calibration OOM (the calibration OOM note).  ``use_reentrant=False``
     # so the forward runs WITH grad (the forward attention leaves stay in the
     # graph and receive ``.grad``) and the backward recompute is grad-enabled.
     # If no block list is found (toy models / unusual architectures) we simply
@@ -1051,7 +1051,7 @@ def collect_scope_scores_for_model(
             "(memory-bounded calibration).", len(ckpt_installed),
         )
     # Best-effort allocator flush to mitigate aimdo fragmentation before the
-    # large contiguous allocations calibration needs (.dev/docs/oom.md).
+    # large contiguous allocations calibration needs (the calibration OOM note).
     _flush_gpu_allocator()
 
     try:

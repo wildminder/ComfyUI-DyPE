@@ -373,7 +373,7 @@ def qwen21_coarse_query_ids(pos: int, h: int, w: int, f: int,
 
     Phase I keeps the queries at full resolution but rides them on the coarse
     grid, so their positions are the model's own CENTRED positions scaled by
-    ``1/f`` — the continuous step (AReA-Z mechanism 1) that the reference's
+    ``1/f`` — the continuous step (the continuous-position mechanism) that the reference's
     floor division breaks.  The axis-0 value stays the model's own counter: the
     image tokens do not move along that axis, so no ``img_axis0`` keyword is
     needed for 2.1.
@@ -876,7 +876,7 @@ def coarse_ropes_qwen21(embedder, layout: Qwen21Layout, f: int, device,
       rope position and injects a one-radian square wave into the velocity
       field at every block boundary — the pack's measured Z-Image ripple).
 
-    The block positions are CONTINUOUS (AReA-Z mechanism 1): every query keeps
+    The block positions are CONTINUOUS (the continuous-position mechanism): every query keeps
     its own position scaled by ``1/f`` and the pooled key sits at its block's
     GEOMETRIC CENTROID — the mean of the block's query positions — so the
     phase step across a boundary equals the one inside the block and the

@@ -463,7 +463,7 @@ class TestCoarseRopes:
 
 
 # ---------------------------------------------------------------------------
-# The continuous coarse positions (M1 — area-fix Flaw 2)
+# The continuous coarse positions (M1 — the block-position flaw)
 # ---------------------------------------------------------------------------
 
 
@@ -491,7 +491,7 @@ class TestContinuousCoarseRope:
     The reference gave every ``f x f`` block one integer rope coordinate and
     jumped a whole unit at each boundary — at Z-Image's ``theta = 256`` that is
     about 1 rad (~57 degrees) per two tokens, a 32 px square wave in the
-    velocity field (``.dev/area-debug/area-fix.txt`` Flaw 2).  Here each query
+    velocity field (the block-position flaw).  Here each query
     keeps ``r / f`` and each pooled key sits at ``R + (f - 1) / (2f)``: the
     block's tokens stay distinct and the phase step across a boundary equals the
     one inside the block.  ``f == 1`` degenerates exactly.
@@ -728,7 +728,7 @@ class TestPhaseRegimeAdvisory:
     (``src/area.py:144``).  Measured on Z-Image Turbo's 8-step schedule it makes
     every step Phase I — pooled K/V everywhere, no fine windowed steps to restore
     local detail, periodic ripple/mosaic + swirls (the I-Max Turbo failure class,
-    ``.dev/docs/2026-10-08-imax-zimage-guidance-bug.md``).  Advisory only: a
+    the guidance-bug note).  Advisory only: a
     28-step FLUX schedule never trips it, and a large phase-1 share is the user's
     choice, kept by the explicit knob (same discipline as I-Max's advisory).
     """

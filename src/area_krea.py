@@ -59,7 +59,7 @@ the pack's own rope helpers) only, like every other adapter in the pack.
   at the origin and every image token carries ``(0, row, col)`` with axis 0
   the FRAME index (``model.py:291-294``, ``:346``) — so the Phase I tables
   carry FLUX's SHAPE of ids, but the block positions are **CONTINUOUS**
-  (AReA-Z mechanism 1): the reference's floor division collapses every
+  (the continuous-position mechanism): the reference's floor division collapses every
   ``f x f`` block onto one rope position and injects a one-radian square wave
   into the velocity field at every block boundary — the pack's measured
   Z-Image 32 px ripple, which the Krea-2 run reproduces.  The tables are built
@@ -166,7 +166,7 @@ KREA_PX_PER_PATCH = KREA_VAE_DOWNSCALE * KREA_PATCH
 #: token grid is 64 tokens, the same number the pack uses for FLUX, Z-Image and
 #: (assumed) Qwen-Image (``src/spa.py:86-91``).  Every rope distance the model
 #: ever saw is inside it, so a canvas wider than this is compressed back into
-#: it (the GTCN's canvas extent ratio, area-fix3).
+#: it (the GTCN's canvas extent ratio, the GTCN mechanism).
 KREA_NATIVE_TOKENS = 64
 
 #: The trained canvas in PIXELS — ASSUMED (1024 px, the pack's hypothesis).
@@ -512,14 +512,13 @@ def coarse_ropes_krea(
     axis 0 the FRAME index (``comfy/ldm/krea2/model.py:291-294``, ``:346``,
     ``:361``).
 
-    **The block positions are CONTINUOUS (AReA-Z mechanism 1).**  The
+    **The block positions are CONTINUOUS (the continuous-position mechanism).**  The
     reference floor-divides a query's position into its block's INTEGER
     coordinate, so all ``f x f`` tokens of a block share ONE rope position and
     the phase jumps by a whole unit at every block boundary — a square wave
     whose period is the block (32 px at ``f = 2``) injected into the velocity
-    field.  That is the pack's own measured Z-Image ripple (``.dev/area-debug/
-    area-fix.txt`` Flaw 2, and the 32 px periodic energy of
-    ``.dev/docs/2026-10-17-area-zimage-ripple-diagnosis.md``), and the user's
+    field.  That is the pack's own measured Z-Image ripple (the block-position
+    flaw, and the 32 px periodic energy of the measured ripple), and the user's
     Krea-2 run reproduces it ("the ripple artifacts appear (the same as
     z-image)").  Here every query keeps its own position scaled by ``1/f`` and
     the pooled key sits at its block's GEOMETRIC CENTROID, ``R + (f - 1) / (2f)``
@@ -535,7 +534,7 @@ def coarse_ropes_krea(
     that argument only covers the low bands, and the artefact lives in the top
     one.  The port the plan deferred (``§11.7``) is therefore what this does.
 
-    **GTCN — the canvas extent ratio (area-fix3).**  The coordinates below are
+    **GTCN — the canvas extent ratio (the GTCN mechanism).**  The coordinates below are
     already block units (a compression by the pooling factor ``f``), so the
     factor that actually compresses the canvas is ``max(f, s)`` per axis, with
     ``s = max(1, h / 64)`` the canvas' extent ratio against the trained
@@ -576,7 +575,7 @@ def coarse_ropes_krea(
     nh, nw = coarse_grid(layout.h, layout.w, f)
     ff = float(f)
 
-    # GTCN (area-fix3) — the canvas extent ratio, per axis.
+    # GTCN (the GTCN mechanism) — the canvas extent ratio, per axis.
     s_y = max(1.0, float(layout.h) / float(KREA_NATIVE_TOKENS))
     s_x = max(1.0, float(layout.w) / float(KREA_NATIVE_TOKENS))
     norm_y = ff / max(ff, s_y)

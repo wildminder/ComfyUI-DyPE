@@ -1,4 +1,4 @@
-"""AReA-Z round 2 (``.dev/area-debug/area-fix2.txt``) — mock-based, GPU-free.
+"""AReA round 2 (the second hardening round) — mock-based, GPU-free.
 
 The three new mechanisms, pinned BEHAVIOURALLY: every test below drives the
 real engine code (the resolver, the layout builder, the windowed attention) and
@@ -458,7 +458,7 @@ class TestBridgeSaturationWiring:
         calls: list = []
 
         def recording_embedder(ids):
-            # EVERY call is recorded: the caption's anchor table (area-fix3) is
+            # EVERY call is recorded: the caption's anchor table (the GTCN mechanism) is
             # built once before the group loop, the bridge's table once per
             # group inside it.  The bridge's tables are therefore the calls
             # AFTER the first — selected by that ROLE, never by a predicate on
@@ -562,7 +562,7 @@ class TestBridgeSaturationWiring:
 
         def recording_embedder(ids):
             seen.setdefault("ids", []).append(ids.detach().clone())
-            # The FIRST call is the caption's anchor table (area-fix3), built
+            # The FIRST call is the caption's anchor table (the GTCN mechanism), built
             # once before the group loop; every call AFTER it is the bridge's
             # own table, one per group.  The role is decided by the call
             # ORDER — a predicate on the t axis would filter out the very

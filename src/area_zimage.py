@@ -126,8 +126,8 @@ ZIMAGE_AXES = 3
 #: The model's TRAINED extent, in tokens — 1024 px over the 16 px patch grid
 #: (``src/area.py``'s ``NATIVE_PATCHES``, the same 64).  Every rope distance
 #: the model ever saw is inside it, so a canvas wider than this is compressed
-#: back into it: the GTCN's canvas extent ratio (area-fix3,
-#: ``.dev/area-debug/area-fix3.txt``).
+#: back into it: the GTCN's canvas extent ratio (the GTCN mechanism,
+#: ``the caption-anchoring round``).
 ZIMAGE_TRAINED_TOKENS = 64
 
 #: Z-Image pads the caption AND the image token count to a multiple of 32
@@ -559,7 +559,7 @@ def coarse_ropes_zimage(
     (``ceil(h/f) x ceil(w/f)`` — the ceil only differs from ``(h/f) x (w/f)``
     on a grid the blocks do not tile, where the last block is partial), so both
     are measured in the same units — CONTINUOUSLY
-    (AReA-Z mechanism 1, ``.dev/area-debug/area-fix.txt`` Flaw 2): the reference
+    (the continuous-position mechanism, the block-position flaw): the reference
     floor-divided the query's position into its block's integer coordinate, so
     every ``f x f`` block shared one rope position and the phase jumped by a
     whole unit at every block boundary — at Z-Image's low rope theta (256, vs
@@ -577,7 +577,7 @@ def coarse_ropes_zimage(
     ``cap_len + 1``, with its row/col on the other two axes (``pos_ids_x``,
     ``model.py:421-437``).
 
-    **GTCN — the canvas extent ratio (area-fix3, ``.dev/area-debug/area-fix3.txt``).**
+    **GTCN — the canvas extent ratio (the GTCN mechanism, ``the caption-anchoring round``).**
     Lumina2 puts EVERY caption token at the spatial origin (``(t, 0, 0)``,
     ``model.py:664-667``), so the rope distance between an image token and the
     prompt is the token's own distance from the origin — and at Z-Image's theta

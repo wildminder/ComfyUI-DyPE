@@ -1,6 +1,6 @@
 """Tests for memory-bounded HAP calibration (per-block gradient checkpointing).
 
-Covers the OOM fix (``.dev/docs/oom.md``): the calibration backward retained
+Covers the OOM fix (``the calibration OOM note``): the calibration backward retained
 O(layers) of autograd ACTIVATION memory (~0.81 GiB/layer on Krea2).  The fix
 wraps each transformer block in ``torch.utils.checkpoint(..., use_reentrant=False)``
 so peak activation memory is bounded to ~one block, and records the

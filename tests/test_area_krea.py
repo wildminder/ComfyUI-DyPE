@@ -398,7 +398,7 @@ class TestKreaCoarseTables:
     def test_coarse_query_table_covers_text_plus_full_grid(self):
         """The query table keeps the caption AND every image token.
 
-        The block positions are CONTINUOUS (AReA-Z mechanism 1): every token
+        The block positions are CONTINUOUS (the continuous-position mechanism): every token
         keeps its own position scaled by ``1/f`` instead of collapsing onto
         its block's integer coordinate (the floor division, plan Q9), so the
         phase does not jump by a whole unit at every block boundary.

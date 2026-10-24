@@ -3,7 +3,7 @@
 Steps 1-2 of plan 2026-09-03:
 - Butterworth low-pass mask + FFT frequency split (the loop-parity test is
   the fidelity tripwire against the authors' reference implementation,
-  .dev/data/HiFlow/HiFlow/utils.py);
+  the reference HiFlow utils);
 - stage sigma slicing + alignment scales (paper alpha_t = beta_t = t/tau).
 """
 
@@ -71,7 +71,7 @@ class TestButterworthFilter:
     def test_matches_loop_reference(self):
         """Vectorized mask == the authors' Python double-loop formula verbatim.
 
-        Loop body copied from .dev/data/HiFlow/HiFlow/utils.py
+        Loop body copied from the reference HiFlow utils
         (butterworth_low_pass_filter_2d): d_square uses (2h/H - 1) terms with
         h the row index and H the full height.
         """

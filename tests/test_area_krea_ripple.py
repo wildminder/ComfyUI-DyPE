@@ -3,9 +3,9 @@
 **The bug this file reproduces.**  The Krea-2 path ran the reference's FLUX
 recipe for Phase I: the query's position was FLOOR-DIVIDED into its block's
 integer coordinate (``row // f``), and the pooling was the reference's
-``subsample``.  Together those are the two flaws the pack's own AReA-Z
+``subsample``.  Together those are the two flaws the pack's own AReA
 analysis identified as the cause of the Z-Image 32 px ripple
-(``.dev/area-debug/area-fix.txt`` Flaw 2 and Flaw 3):
+(the block-position flaw and Flaw 3):
 
 * **Flaw 2 — the integer stair-step.**  All ``f x f`` tokens of a block shared
   ONE rope position, and the phase jumped by a whole unit at every block
@@ -25,7 +25,7 @@ artifacts appear (the same as z-image)") and the 32 px period is exactly the
 "vertically extended by duplicating the same conceptual element" offset the
 report describes.  Plan Q9 had scoped the Z-Image refinement OUT of the
 Krea-2 adapter and recorded it as an explicit follow-up
-(``.dev/docs/plans/2026-10-20-area-krea-adaptation.md`` §11.7) — this file
+(the Krea-2 adaptation note) — this file
 pins that follow-up.
 
 **The canvas.**  512 x 2000 px -> a **125 x 32** token grid (``gcd == 1``, so
@@ -111,7 +111,7 @@ def _krea_ids(h: int = GRID_H, w: int = GRID_W, f: int = F):
 
 @pytest.mark.unit
 class TestKreaCoarseStairStep:
-    """The Phase I rope must not be a square wave (area-fix.txt Flaw 2)."""
+    """The Phase I rope must not be a square wave (the block-position flaw)."""
 
     def test_the_phase_advance_per_token_is_uniform(self):
         """REPRODUCTION: the advance is 1/f rad per token — at EVERY token.
@@ -190,7 +190,7 @@ class TestKreaCoarseStairStep:
 
 @pytest.mark.unit
 class TestKreaCanvasExtentRatio:
-    """GTCN — the canvas extent ratio (area-fix3) on the Krea coarse table."""
+    """GTCN — the canvas extent ratio (the GTCN mechanism) on the Krea coarse table."""
 
     def test_the_multiplier_is_inert_inside_the_trained_extent(self):
         """The block units already hold the canvas inside the trained extent.
@@ -225,7 +225,7 @@ class TestKreaCanvasExtentRatio:
 
 @pytest.mark.unit
 class TestKreaPooling:
-    """The Dirac comb (area-fix.txt Flaw 3) — the pooling Krea-2 runs."""
+    """The Dirac comb (the Dirac-comb flaw) — the pooling Krea-2 runs."""
 
     def test_the_krea_default_pooling_is_the_centroid(self, krea_backend):
         """Krea-2 pools with the norm-preserving centroid, not ``subsample``."""

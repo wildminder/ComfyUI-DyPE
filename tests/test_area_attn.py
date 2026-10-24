@@ -127,7 +127,7 @@ class TestPoolKeysValues:
         """M2: ``mean`` keys are the block-mean DIRECTION at the mean MEMBER NORM.
 
         The centroid direction keeps every token of the block contributing (no
-        Dirac comb, ``.dev/area-debug/area-fix.txt`` Flaw 3) while the restored
+        Dirac comb, the block-position design note Flaw 3) while the restored
         member norm keeps the attention temperature at the un-pooled one; the
         VALUES stay the plain block mean.
         """

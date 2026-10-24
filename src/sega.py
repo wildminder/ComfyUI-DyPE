@@ -6,7 +6,7 @@ spectrum.  All functions are pure (no model dependencies) and fully testable
 in isolation.
 
 Reference: SEGA paper (arXiv:2605.22668) and reference implementation in
-``.dev/data/SEGA/sega/``.
+``the reference SEGA implementation``.
 """
 
 from __future__ import annotations

@@ -2,7 +2,7 @@
 Tests for the HAP runtime (``src/hap.py``).
 
 Covers plan phases P0 (probes), P1 (ScopePlan + band math), P2 (backends +
-runtime facade). See ``docs/plans/2026-08-15-hrdit-full-hap-implementation.md``.
+runtime facade). See ``the HAP implementation plan``.
 
 All tests are CPU-safe; FlexAttention-specific tests are CUDA-gated and
 auto-skip elsewhere.
@@ -212,7 +212,7 @@ class TestScopePlan:
 
         Uses the SHIPPED plan (configs/scope_plan_flux.json) — version-
         controlled and present in CI. (An identical copy lives under the
-        gitignored .dev/data research tree; do not reference that path.)"""
+        gitignored local research tree; do not reference that path.)"""
         import pathlib
 
         path = (

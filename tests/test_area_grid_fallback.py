@@ -77,7 +77,7 @@ GOLDENS = {
     "flux160_coarse": "52ed0106c10bd149ea66b16728efd973",
     # Z-Image: the seam file's own 65x65 canvas, coarse and fine step.
     "zimage65_coarse": "394b3e8a2529bb35436fbaea4618d808",
-    # The FINE golden moved with area-fix3 (the GTCN): the Phase II caption
+    # The FINE golden moved with the GTCN mechanism (the GTCN): the Phase II caption
     # anchoring re-ropes the caption at each window's own origin, so the fine
     # step's answer changes.  Reverting the anchoring reproduces the previous
     # value exactly, which is what makes this a GTCN-only delta.  The COARSE

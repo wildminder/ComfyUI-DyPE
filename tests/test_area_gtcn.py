@@ -1,4 +1,4 @@
-"""AReA-Z — the Global Text-Coordinate Normalization (area-fix3, ``area-fix3.txt``).
+"""AReA — the Global Text-Coordinate Normalization (the caption-anchoring round).
 
 Lumina2 puts EVERY caption token at the spatial origin (``(t, 0, 0)``,
 ``comfy/ldm/lumina/model.py:664-667``), so the rope distance between an image
@@ -19,7 +19,7 @@ The fix has two halves, and this file pins both:
 
 The pins are deliberately mutation-resistant: reverting the Phase I scaling or
 the Phase II anchoring makes them FAIL (the mutation checks are described in
-``.dev/docs/2026-10-19-area-gtcn-fix3-design.md``).
+the caption-anchoring design note).
 
 The FLUX path is untouched by both halves — only the Z-Image seam passes a rope
 embedder — so the byte-identity goldens of ``tests/test_area_grid_fallback.py``
@@ -446,7 +446,7 @@ class TestPhaseIICaptionAnchoring:
         assert torch.equal(captured[0][:, :, TXT:, :], k_img)
 
     def test_the_bridge_branch_still_uses_the_groups_own_window(self):
-        """The area-fix2 saturation is untouched: the group's own window."""
+        """The the horizon saturation is untouched: the group's own window."""
         windows = (Window(0, 0, 31, 31), Window(0, 32, 23, 63))
         layout = build_fine_layout(list(windows), 32, 64, 0, 4, 0, 0,
                                    torch.float32, "cpu")

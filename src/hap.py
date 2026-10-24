@@ -4,11 +4,11 @@ HAP (Head-Adaptive attention Pruning) runtime for HRDiT.
 Implements the speed half of HRDiT (paper 2608.07003): per-head block-sparse
 attention scopes derived from an offline-calibrated scope plan.
 
-Reference implementation: ``.dev/data/HRDit/HRDiT/hrdit/hap.py``.
-Theory: ``.dev/data/HRDit/HRDiT-theory-code.md`` sections 6-8.
+Reference implementation: ``the reference HAP implementation``.
+Theory: ``the HAP theory note`` sections 6-8.
 
 This module is built incrementally per
-``docs/plans/2026-08-15-hrdit-full-hap-implementation.md``:
+``the HAP implementation plan``:
 
 - P0 (this file, initial): constants + FlexAttention availability probe.
 - P1: ``ScopePlan`` + band-mask math + dense mask oracle + cost model.

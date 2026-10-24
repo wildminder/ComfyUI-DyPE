@@ -1,4 +1,4 @@
-"""QA round 2 — an INDEPENDENT re-derivation of the area-fix3 (GTCN) criteria.
+"""QA round 2 — an INDEPENDENT re-derivation of the the GTCN mechanism (GTCN) criteria.
 
 The engineer's own pins live in ``tests/test_area_gtcn.py``.  This file does
 not trust them: it re-checks the acceptance criteria of the QA brief against
@@ -419,7 +419,7 @@ class TestPhaseIIAnchoring:
         assert torch.equal(captured[0][1][:, :, TXT:, :], k[:, :, TXT:, :])
 
     def test_the_bridge_saturation_still_uses_the_groups_own_window(self, monkeypatch):
-        """area-fix2's bridge: the group's own window, inside the horizon."""
+        """the saturation's bridge: the group's own window, inside the horizon."""
         windows = (Window(0, 0, 31, 31), Window(0, 32, 23, 63))
         layout = build_fine_layout(list(windows), 32, 64, 0, 4, 0, 0,
                                    torch.float32, "cpu")

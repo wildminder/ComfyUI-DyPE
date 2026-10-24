@@ -67,7 +67,7 @@ FLUX_GOLDENS = {
 }
 
 #: The Z-Image golden hashes — the same canvas, coarse and fine step.  The
-#: FINE one moved with area-fix3 (the GTCN's caption anchoring); it is pinned
+#: FINE one moved with the GTCN mechanism (the GTCN's caption anchoring); it is pinned
 #: at its post-fix3 value.
 ZIMAGE_GOLDENS = {
     "zimage65_coarse": "394b3e8a2529bb35436fbaea4618d808",
